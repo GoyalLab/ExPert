@@ -1,0 +1,20 @@
+# overall parameters
+cores: 5        # how many cores to use
+cache: true     # cache downloaded files or reload
+qc: true        # apply quality control to cells (recommended)
+hvg: true       # only use highly variable genes of each dataset (recommended)
+correction_method: 'harmony'    # batch effect correction method, can be either 'harmony' or 'bbknn'
+
+# file specifications
+data: 'resources/datasets/data'
+log: 'logs'
+dataset_meta: 'resources/datasets/meta/filtered_datasets.csv'
+output_dir: 'results'
+
+# list of all datasets to combine (with download links), generated from filtered_datasets.csv
+datasets:
+ "AdamsonWeissman2016_GSM2406675_10X001": "https://zenodo.org/record/7041849/files/AdamsonWeissman2016_GSM2406675_10X001.h5ad"
+ "AdamsonWeissman2016_GSM2406677_10X005": "https://zenodo.org/record/7041849/files/AdamsonWeissman2016_GSM2406677_10X005.h5ad"
+ "DatlingerBock2017": "https://zenodo.org/record/7041849/files/DatlingerBock2017.h5ad"
+ "DatlingerBock2021": "https://zenodo.org/record/7041849/files/DatlingerBock2021.h5ad"
+ "DixitRegev2016": "https://zenodo.org/record/7041849/files/DixitRegev2016.h5ad"
