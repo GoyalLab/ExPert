@@ -46,23 +46,27 @@ def quality_control_filter(adata, percent_threshold=20, nmads=5, mt_nmads=3, mt_
 
 
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
-def normalize(adata):
+def prepare_dataset(adata, name='Unknown', qc=True, scale=True, n_hvg=2000, subset=False):
+    # apply quality control measures
+    if qc:
+        logging.info(f"Quality control for dataset {name}")
+        adata = quality_control_filter(adata)
+    logging.info(f"Normalizing dataset {name}")
     sc.pp.normalize_total(adata)
     sc.pp.log1p(adata)
 
-
-def hvg_filter(adata):
-    sc.pp.highly_variable_genes(adata)  # calculate highly variable genes
-    return adata[:, adata.var.highly_variable]
-
-
-def prepare_dataset(adata, name='Unknown', qc=True, hvg=True):
-    if qc:
-        logging.info(f"Quality control for dataset {name}")
-        adata = quality_control_filter(adata)                                   # QC
-    logging.info(f"Normalizing dataset {name}")
-    normalize(adata)                                                            # normalize
-    if hvg:
-        logging.info(f"Reducing dataset {name} to highly variable genes")
-        hvg_filter(adata)                                                       # HVG filter
+    logging.info(f"Determining highly variable genes for dataset {name}")
+    if isinstance(n_hvg, float):
+        if n_hvg > 1:
+            raise ValueError('Percentage param "n_hvg" must be <= 1, or total number of genes')
+        # take percentage of total genes in dataset instead of fixed number
+        perc = n_hvg
+        n_hvg = int(adata.n_vars * n_hvg)
+        logging.info(f"Number of highly variable genes to use: {n_hvg} ({perc}* {adata.n_vars})")
+    # Calculate highly variable genes
+    sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset)
+    # center and scale the expression
+    if scale:
+        logging.info(f"Scaling and centering dataset {name}")
+        sc.pp.scale(adata, )
     return adata

@@ -3,6 +3,7 @@ import scanpy as sc
 from tqdm import tqdm
 import os
 import logging
+import pandas as pd
 
 
 def setup_logger(log_file):
@@ -73,3 +74,18 @@ def get_dataset(url, dataset_name, output_path, cache=True):
     print(f"Reading dataset {dataset_name}")
     data = sc.read_h5ad(output_path)
     return data
+
+
+def make_obs_names_unique(df, agg='mean'):
+    numeric_cols = df.dtypes[df.dtypes != 'object'].index
+    obj_cols = df.dtypes[df.dtypes == 'object'].index
+    # collapse all numeric cols with an aggregation method (e.g. mean)
+    if agg == 'mean':
+        numerics = df[numeric_cols].groupby(level=0, axis=1).mean()
+    elif agg == 'median':
+        numerics = df[numeric_cols].groupby(level=0, axis=1).median()
+    else:
+        raise ValueError(f"Unknown aggregation {agg}, choose between 'mean', 'median'")
+    # choose the first non-nan value for duplicated object columns
+    meta = df[obj_cols].groupby(df[obj_cols].columns, axis=1).apply(lambda x: x.bfill(axis=1).iloc[:, 0])
+    return pd.concat([meta, numerics], axis=1)
