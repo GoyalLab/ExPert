@@ -9,7 +9,7 @@ subset_hvg: false  # Directly subset dataset to highly variable genes (not recom
 # merge options
 hvg: true                     # only use highly variable genes of each dataset (recommended)
 zero_padding: false           # Fill missing genes with 0 counts (optional if total hvg number high)
-correction_method: 'scanorama'      # batch effect correction method, can be one of 'scanorama', or 'skip' (scanorama recommended)
+correction_method: 'skip'      # batch effect correction method, can be one of 'scanorama', or 'skip' (scanorama recommended)
 
 # file specifications
 data: 'resources/datasets/data'
