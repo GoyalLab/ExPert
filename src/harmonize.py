@@ -90,7 +90,7 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scal
         # scale merged dataset
         if scale:
             # scale data after merge
-            sc.pp.scale(merged, layer='scaled')
+            sc.pp.scale(merged)
     else:
         # select scaled data if available
         if scale:
