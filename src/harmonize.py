@@ -76,7 +76,7 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scal
     if method != 'skip':
         # reduce datasets to common genes
         common_genes = list(set.intersection(*(set(adata.var_names) for adata in ds_list)))
-        logging.info(f'Found {len(common_genes)} between datasets while merging')
+        logging.info(f'Found {len(common_genes)} common genes between datasets while merging')
         ds_list = [d[:, common_genes] for d in ds_list]
         # apply batch effect normalization over different datasets and adjust original counts
         if method == 'scanorama':
@@ -90,6 +90,7 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scal
         # scale merged dataset
         if scale:
             # scale data after merge
+            logging.info('Scaling and centering merged dataset')
             sc.pp.scale(merged)
     else:
         # select scaled data if available
