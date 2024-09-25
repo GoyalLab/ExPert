@@ -4,9 +4,11 @@ Snakemake pipeline to extract and combine multiple pertub-seq-like experiments. 
 To run the full pipeline:
 1. Create mamba (conda) env with environment.yml
 
-`mamba create -f environment.yml`
+`mamba env create -f environment.yml`
 
 `mamba activate ExPert`
-2. Run pipeline
+
+2. (Optional) Check config/config.yaml to adjust parameters
+3. Run pipeline
 
 `snakemake --cores all`

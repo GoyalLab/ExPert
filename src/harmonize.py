@@ -9,6 +9,10 @@ import scanorama
 
 
 def _scanorama(ds_list):
+    # prepare data
+    ds_list = [d.copy() for d in ds_list]
+    for ds in ds_list:
+        ds.X = ds.X.tocsr()
     # Perform batch correction using Scanorama
     logging.info('Running scanorama')
     corrected = scanorama.correct_scanpy(ds_list)
@@ -78,7 +82,7 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scal
         if method == 'scanorama':
             ds_list = _scanorama(ds_list)
         else:
-            raise ValueError(f'Method must be {correction_methods()}; got {method}')
+            raise ValueError(f'Method must be one of {correction_methods()}; got {method}')
         # concatenate corrected datasets
         logging.info('Merging datasets')
         merged = ad.concat(ds_list, label='dataset', keys=ds_keys)
