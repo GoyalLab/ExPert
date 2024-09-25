@@ -1,24 +1,19 @@
 import os
 
 import pandas as pd
-import scanpy as sc
-import harmonypy as hm
-import bbknn
 import logging
 import anndata as ad
 import numpy as np
+import scanpy as sc
+import scanorama
 
 
-def _harmony(d):
-    if 'X_pca' not in d.obsm.keys():
-        logging.info('Performing PCA...')
-        sc.pp.pca(d)
-    logging.info('Starting Harmony...')
-    ho = hm.run_harmony(d.obsm['X_pca'], d.obs, 'dataset')
-    # Replace the PCA coordinates with Harmony-corrected ones
-    d.obsm['X_pca_harmony'] = ho.Z_corr.T
-    sc.pp.neighbors(d, use_rep='X_pca_harmony')
-    logging.info('Finished Harmony.')
+def _scanorama(ds_list):
+    # Perform batch correction using Scanorama
+    logging.info('Running scanorama')
+    corrected = scanorama.correct_scanpy(ds_list)
+    logging.info('Finished scanorama')
+    return corrected
 
 
 def _filter(d, dataset_name, hvg_pool, zero_pad=True):
@@ -58,28 +53,52 @@ def _read_datasets(data_files, pool, hvg_filter=True, zero_pad=True):
     logging.info(f'Finished reading {len(ds_dict)} datasets')
     return ds_dict
 
+def correction_methods():
+    return ['scanorama', 'skip']
+
 def _check_methods(m):
-    if m not in ['harmony', 'bbknn', 'skip']:
-        raise ValueError('Method must be "harmony", "bbknn", or "skip"')
+    methods = correction_methods()
+    if m not in methods:
+        raise ValueError(f'Method must be {methods}; got {m}')
 
 
-def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True):
+def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scale=True, cores=-1):
     _check_methods(method)
     # read datasets to one dict
     ds_dict = _read_datasets(data_files, hvg_pool.index, hvg_filter=hvg, zero_pad=zero_pad)
-    # collapse to a merged AnnData
-    merged = ad.concat(ds_dict, label='dataset')
-    # add var data (highly variable gene information)
-    merged.var = pd.concat([merged.var, hvg_pool], axis=1, join='inner')
-    # apply batch effect normalization on different datasets in PCA space
+    # extract names and according AnnDatas
+    ds_list = [*ds_dict.values()]
+    ds_keys = [*ds_dict.keys()]
     if method != 'skip':
-        # Perform PCA on merged set
-        sc.pp.pca(merged)
-        # Calculate neighbors
-        sc.pp.neighbors(merged, use_rep='X_pca')
-        # harmonize datasets
-        if method == 'harmony':
-            _harmony(merged)
-        elif method == 'bbknn':
-            bbknn.bbknn(merged, batch_key='dataset')
+        # reduce datasets to common genes
+        common_genes = list(set.intersection(*(set(adata.var_names) for adata in ds_list)))
+        logging.info(f'Found {len(common_genes)} between datasets while merging')
+        ds_list = [d[:, common_genes] for d in ds_list]
+        # apply batch effect normalization over different datasets and adjust original counts
+        if method == 'scanorama':
+            ds_list = _scanorama(ds_list)
+        else:
+            raise ValueError(f'Method must be {correction_methods()}; got {method}')
+        # concatenate corrected datasets
+        logging.info('Merging datasets')
+        merged = ad.concat(ds_list, label='dataset', keys=ds_keys)
+        logging.info('Finished merge')
+        # scale merged dataset
+        if scale:
+            # scale data after merge
+            sc.pp.scale(merged, layer='scaled')
+    else:
+        # select scaled data if available
+        if scale:
+            logging.info('Setting scaled data as default in datasets')
+            for ds in ds_list:
+                logging.info(f'Scaling dataset {ds.uns["dataset_name"]} before merge')
+                sc.pp.scale(ds)
+        # collapse to a merged AnnData object
+        logging.info('Merging datasets')
+        merged = ad.concat(ds_dict, label='dataset')
+        logging.info('Finished merge')
+    # add summarized var data (highly variable gene information)
+    merged.var = pd.concat([merged.var, hvg_pool], axis=1, join='inner')
+    logging.info(f'Resulting metaset spans: {merged.shape[0]} combined cells and {merged.shape[1]} common genes')
     return merged

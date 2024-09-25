@@ -73,6 +73,7 @@ def get_dataset(url, dataset_name, output_path, cache=True):
         download_file(url, output_path)
     print(f"Reading dataset {dataset_name}")
     data = sc.read_h5ad(output_path)
+    data.uns["dataset_name"] = dataset_name
     return data
 
 
