@@ -66,4 +66,5 @@ def prepare_dataset(adata, name='Unknown', qc=True, n_hvg=2000, subset=False):
         logging.info(f'Number of highly variable genes to use: {n_hvg} ({perc}* {adata.n_vars})')
     # Calculate highly variable genes
     sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset)
+    logging.info(f'Found {np.sum(adata.var.highly_variable)} highly variable genes out of {adata.n_vars} total genes')
     return adata
