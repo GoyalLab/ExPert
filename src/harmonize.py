@@ -6,13 +6,15 @@ import anndata as ad
 import numpy as np
 import scanpy as sc
 import scanorama
+import scipy.sparse as sp
 
 
 def _scanorama(ds_list):
     # prepare data
     ds_list = [d.copy() for d in ds_list]
     for ds in ds_list:
-        ds.X = ds.X.tocsr()
+        if sp.issparse(ds.X) and not isinstance(ds.X, sp.csr_matrix):
+            ds.X = ds.X.tocsr()
     # Perform batch correction using Scanorama
     logging.info('Running scanorama')
     corrected = scanorama.correct_scanpy(ds_list)

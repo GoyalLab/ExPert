@@ -1,15 +1,15 @@
 # overall options
-cores: 3        # how many cores to use (ideally number of datasets)
+cores: 4        # how many cores to use (ideally number of datasets)
 # preprocessing options
 cache: true     # cache downloaded files or reload
 qc: true        # apply quality control to cells (recommended)
-scale: true     # center and scale (recommended)
+scale: false     # center and scale (recommended)
 n_hvg: 10000     # Total number of highly variable genes to determine (or percentage of genes in dataset)
 subset_hvg: false  # Directly subset dataset to highly variable genes (not recommended, rapidly decreases matching genes in merged set)
 # merge options
 hvg: true                     # only use highly variable genes of each dataset (recommended)
 zero_padding: false           # Fill missing genes with 0 counts (optional if total hvg number high)
-correction_method: 'skip'      # batch effect correction method, can be one of 'scanorama', or 'skip' (scanorama recommended)
+correction_method: 'scanorama'      # batch effect correction method, can be one of 'scanorama', or 'skip' (scanorama recommended)
 
 # file specifications
 data: 'resources/datasets/data'
@@ -19,6 +19,7 @@ output_dir: 'results'
 
 # list of all datasets to combine (with download links), generated from filtered_datasets.csv
 datasets:
- "DatlingerBock2021": "https://zenodo.org/record/7041849/files/DatlingerBock2021.h5ad"
- "AdamsonWeissman2016_GSM2406675_10X001": "https://zenodo.org/record/7041849/files/AdamsonWeissman2016_GSM2406675_10X001.h5ad"
- "AdamsonWeissman2016_GSM2406677_10X005": "https://zenodo.org/record/7041849/files/AdamsonWeissman2016_GSM2406677_10X005.h5ad"
+ "ReplogleWeissman2022_K562_essential": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_K562_essential.h5ad"
+ "NormanWeissman2019_filtered": "https://zenodo.org/record/7041849/files/NormanWeissman2019_filtered.h5ad"
+ "TianKampmann2021_CRISPRa": "https://zenodo.org/record/7041849/files/TianKampmann2021_CRISPRa.h5ad"
+ "TianKampmann2021_CRISPRi": "https://zenodo.org/record/7041849/files/TianKampmann2021_CRISPRi.h5ad"
