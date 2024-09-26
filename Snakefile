@@ -18,9 +18,8 @@ DATASET_NAMES = list(DATASETS.keys())
 DATASET_URLS = DATASETS
 # save used params for execution
 params = ['qc', 'n_hvg', 'subset_hvg', 'hvg', 'zero_padding', 'scale', 'correction_method']
-CONFIG_STR = ';'.join([f'{k}:{v}' for k,v in config.items() if k in params])
-# define output path
-OUTPUT_DIR = os.path.join(config['output_dir'], CONFIG_STR)
+CONFIG_STR = os.path.sep.join(f"{k}/{v}" for k, v in config.items() if k in params)
+OUTPUT_DIR = os.path.join(str(config['output_dir']), CONFIG_STR)
 # define output file
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset.h5ad')
 # HVG pool output
