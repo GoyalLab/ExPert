@@ -106,6 +106,6 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scal
         merged = ad.concat(ds_dict, label='dataset')
         logging.info('Finished merge')
     # add summarized var data (highly variable gene information)
-    merged.var = pd.concat([merged.var, hvg_pool], axis=1, join='inner')
+    # merged.var = pd.concat([merged.var, hvg_pool], axis=1, join='inner')
     logging.info(f'Resulting metaset spans: {merged.shape[0]} combined cells and {merged.shape[1]} common genes')
     return merged
