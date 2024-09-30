@@ -8,6 +8,42 @@ import scanpy as sc
 import scanorama
 import scipy.sparse as sp
 from MulticoreTSNE import MulticoreTSNE as tsne
+import scvi
+
+
+def _pca_reconstruction(adata, n_comps=10, pca_key='X_scANVI'):
+    logging.info(f'Computing PCA reconstruction with {n_comps} components')
+    # Get PCA coordinates and loadings
+    pca_coords = adata.obsm[pca_key][:, :n_comps]
+    pca_loadings = adata.varm['PCs'][:, :n_comps]
+    # Reconstruct the data
+    reconstructed = np.dot(pca_coords, pca_loadings.T)
+    # If the data was scaled before PCA, we need to reverse the scaling
+    if 'mean' in adata.var and 'std' in adata.var:
+        reconstructed = reconstructed * adata.var['std'].values + adata.var['mean'].values
+    logging.info(f'Finished PCA reconstruction with {n_comps} components')
+    return reconstructed
+
+
+def _scANVI(adata, batch_key='dataset', labels_key='celltype'):
+    logging.info('Running SCANVI')
+    scvi.settings.verbosity = 2
+    # Initialize scvi adata, specify dataset and cell type
+    scvi.model.SCVI.setup_anndata(adata, batch_key=batch_key, labels_key=labels_key)
+    # build scVI model
+    scvi_model = scvi.model.SCVI(adata)
+    # train model
+    scvi_model.train(early_stopping=True)
+    # run scANVI that additionally incorporated cell labels
+    model_scanvi = scvi.model.SCANVI.from_scvi_model(
+        scvi_model, labels_key=labels_key, unlabeled_category="unlabelled"
+    )
+    model_scanvi.train()
+    # add trained latent space
+    adata.obsm["X_scANVI"] = model_scanvi.get_latent_representation()
+    logging.info('Finished SCANVI training')
+    # reconstruct normalized gene expression counts and set them as default to avoid adding layers
+    adata.X = _pca_reconstruction(adata)
 
 
 def _scanorama(ds_list):
@@ -62,7 +98,7 @@ def _read_datasets(data_files, pool, hvg_filter=True, zero_pad=True):
     return ds_dict
 
 def correction_methods():
-    return ['scanorama', 'skip']
+    return ['scANVI', 'scanorama', 'skip']
 
 def _check_methods(m):
     methods = correction_methods()
@@ -85,12 +121,13 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scal
         # apply batch effect normalization over different datasets and adjust original counts
         if method == 'scanorama':
             ds_list = _scanorama(ds_list)
-        else:
-            raise ValueError(f'Method must be one of {correction_methods()}; got {method}')
         # concatenate corrected datasets
         logging.info('Merging datasets')
         merged = ad.concat(ds_list, label='dataset', keys=ds_keys)
         logging.info('Finished merge')
+        # normalize expression based on scANVI
+        if method == 'scANVI':
+            _scANVI(merged)
         # scale merged dataset
         if scale:
             # scale data after merge
@@ -100,8 +137,8 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scal
         # select scaled data if available
         if scale:
             logging.info('Setting scaled data as default in datasets')
-            for ds in ds_list:
-                logging.info(f'Scaling dataset {ds.uns["dataset_name"]} before merge')
+            for i, ds in enumerate(ds_list):
+                logging.info(f'Scaling dataset {ds_keys[i]} before merge')
                 sc.pp.scale(ds)
         # collapse to a merged AnnData object
         logging.info('Merging datasets')
