@@ -46,17 +46,15 @@ correction_method = config.get('correction_method', 'scanorama')
 check_method(correction_method, config)
 
 cache = config.get('cache', True)
-qc = config.get('qc', True)
-norm = config.get('norm', True)
-log_norm = config.get('log_norm', True)
-n_hvg = config.get('n_hvg', 10000)
-subset_hvg = config.get('subset_hvg', False)
-hvg = config.get('hvg', True)
-zero_padding = config.get('zero_padding', False)
-scale = config.get('scale', True)
-correction_method = config.get('correction_method', 'scanorama')
-if correction_method not in correction_methods():
-    raise ValueError(f'"correction_method" has to be one of {correction_methods()}')
+qc = config.get('qc', True)                             # Perform QC on cells
+norm = config.get('norm', True)                         # Normalize gene expression (total sum)
+log_norm = config.get('log_norm', True)                 # Log normalize gene expression (log1p)
+n_hvg = config.get('n_hvg', 2000)                       # Number of highly variable genes to include for each dataset
+subset_hvg = config.get('subset_hvg', False)            # Only include highly variable genes of each dataset
+hvg = config.get('hvg', True)                           # Filter metaset genes for high variance
+zero_padding = config.get('zero_padding', False)        # Fill missing genes with 0s to include all genes across the merged metaset
+scale = config.get('scale', True)                       # Center and scale the resulting metaset
+raw_tsne = config.get('raw_tsne', False)                # Calculate tSNE for both the raw and processed dataset
 
 
 ## START OF PIPELINE
