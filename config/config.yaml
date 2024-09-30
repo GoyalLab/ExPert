@@ -1,9 +1,9 @@
 # overall options
-cores: 15        # how many cores to use (ideally number of datasets)
+cores: 12        # how many cores to use (ideally number of datasets)
 # preprocessing options
 cache: true     # cache downloaded files or reload
 qc: true        # apply quality control to cells (recommended)
-scale: true     # center and scale (recommended)
+scale: false     # center and scale (recommended)
 n_hvg: 10000     # Total number of highly variable genes to determine (or percentage of genes in dataset)
 subset_hvg: false  # Directly subset dataset to highly variable genes (not recommended, rapidly decreases matching genes in merged set)
 # merge options
@@ -30,7 +30,7 @@ datasets:
  "TianKampmann2019_iPSC": "https://zenodo.org/record/7041849/files/TianKampmann2019_iPSC.h5ad"
  "GasperiniShendure2019_highMOI": "https://zenodo.org/record/7041849/files/GasperiniShendure2019_highMOI.h5ad"
  "NormanWeissman2019_filtered": "https://zenodo.org/record/7041849/files/NormanWeissman2019_filtered.h5ad"
- "ReplogleWeissman2022_rpe1": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_rpe1.h5ad"
- "ReplogleWeissman2022_K562_essential": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_K562_essential.h5ad"
- "GasperiniShendure2019_atscale": "https://zenodo.org/record/7041849/files/GasperiniShendure2019_atscale.h5ad"
+# "ReplogleWeissman2022_rpe1": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_rpe1.h5ad"
+# "ReplogleWeissman2022_K562_essential": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_K562_essential.h5ad"
+# "GasperiniShendure2019_atscale": "https://zenodo.org/record/7041849/files/GasperiniShendure2019_atscale.h5ad"
 # "ReplogleWeissman2022_K562_gwps": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_K562_gwps.h5ad"

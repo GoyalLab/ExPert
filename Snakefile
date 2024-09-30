@@ -8,7 +8,7 @@ workflow.basedir = os.path.abspath(os.path.dirname(workflow.snakefile))
 os.environ["PYTHONPATH"] = f"{workflow.basedir}:{os.environ.get('PYTHONPATH', '')}"
 
 # specify config file
-configfile: "config/test.yaml"
+configfile: "config/config.yaml"
 # get basic parameters
 DATA = config.get('data', 'resources/datasets/data')
 LOG = config.get('log', 'logs')

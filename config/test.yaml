@@ -19,7 +19,5 @@ output_dir: 'results'
 
 # list of all datasets to combine (with download links), generated from filtered_datasets.csv
 datasets:
- "ReplogleWeissman2022_K562_essential": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_K562_essential.h5ad"
+ "AdamsonWeissman2016_GSM2406677_10X005": "https://zenodo.org/record/7041849/files/AdamsonWeissman2016_GSM2406677_10X005.h5ad"
  "NormanWeissman2019_filtered": "https://zenodo.org/record/7041849/files/NormanWeissman2019_filtered.h5ad"
- "TianKampmann2021_CRISPRa": "https://zenodo.org/record/7041849/files/TianKampmann2021_CRISPRa.h5ad"
- "TianKampmann2021_CRISPRi": "https://zenodo.org/record/7041849/files/TianKampmann2021_CRISPRi.h5ad"
