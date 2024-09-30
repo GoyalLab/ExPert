@@ -7,6 +7,7 @@ import numpy as np
 import scanpy as sc
 import scanorama
 import scipy.sparse as sp
+from MulticoreTSNE import MulticoreTSNE as tsne
 
 
 def _scanorama(ds_list):
@@ -54,6 +55,7 @@ def _read_datasets(data_files, pool, hvg_filter=True, zero_pad=True):
             # apply hvg pool and zero-pad filters to dataset
             if hvg_filter:
                 adata = _filter(adata, name, pool, zero_pad=zero_pad)
+            logging.info(f'Adding {adata.n_obs} cells to merged dataset')
             # save dataset in dictionary
             ds_dict[name] = adata
     logging.info(f'Finished reading {len(ds_dict)} datasets')
@@ -108,4 +110,11 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scal
     # add summarized var data (highly variable gene information)
     # merged.var = pd.concat([merged.var, hvg_pool], axis=1, join='inner')
     logging.info(f'Resulting metaset spans: {merged.shape[0]} combined cells and {merged.shape[1]} common genes')
+    logging.info('Computing PCA')
+    sc.pp.pca(merged)
+    sc.pp.neighbors(merged, use_rep='X_pca')
+    logging.info('Computing tsne')
+    # plot raw dataset with tSNE
+    merged.obsm['X_tsne'] = tsne(n_jobs=cores).fit_transform(merged.obsm['X_pca'])
+    logging.info('Done')
     return merged

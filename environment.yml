@@ -20,10 +20,12 @@ dependencies:
   - amply=0.1.6=pyhd8ed1ab_0.conda
   - anndata=0.9.2=pyhd8ed1ab_0.conda
   - appdirs=1.4.4=pyh9f0ad1d_0
+  - asttokens=2.4.1=pyhd8ed1ab_0.conda
   - async-timeout=4.0.3=pyhd8ed1ab_0.conda
   - attmap=0.13.2=pyhd8ed1ab_0
   - attr=2.5.1=h166bdaf_1
   - attrs=24.2.0=pyh71513ae_0.conda
+  - backcall=0.2.0=pyh9f0ad1d_0
   - bcrypt=4.2.0=py38h4005ec7_0.conda
   - blosc=1.21.6=hef167b5_0.conda
   - boto3=1.35.26=pyhd8ed1ab_0.conda
@@ -49,6 +51,7 @@ dependencies:
   - coin-or-utils=2.11.12=h99da652_1.conda
   - coincbc=2.10.12=1_metapackage.conda
   - colorama=0.4.6=pyhd8ed1ab_0
+  - comm=0.2.2=pyhd8ed1ab_0.conda
   - configargparse=1.7=pyhd8ed1ab_0.conda
   - connection_pool=0.0.3=pyhd3deb0d_0
   - contourpy=1.1.1=py38h7f3f72f_1.conda
@@ -56,12 +59,15 @@ dependencies:
   - cycler=0.12.1=pyhd8ed1ab_0.conda
   - datrie=0.8.2=py38h01eb140_7.conda
   - dbus=1.13.6=h5008d03_3
+  - debugpy=1.8.5=py38h6d02427_0.conda
+  - decorator=5.1.1=pyhd8ed1ab_0
   - defusedxml=0.7.1=pyhd8ed1ab_0
   - docutils=0.20.1=py38h578d9bd_3.conda
   - dpath=2.2.0=pyha770c72_0.conda
   - dropbox=12.0.2=pyhd8ed1ab_0.conda
   - eido=0.2.2=pyhd8ed1ab_0.conda
   - exceptiongroup=1.2.2=pyhd8ed1ab_0.conda
+  - executing=2.1.0=pyhd8ed1ab_0.conda
   - expat=2.6.3=h5888daf_0.conda
   - fbpca=1.0=py_0
   - filechunkio=1.8=py_2
@@ -107,11 +113,15 @@ dependencies:
   - importlib_resources=6.4.5=pyhd8ed1ab_0.conda
   - iniconfig=2.0.0=pyhd8ed1ab_0.conda
   - intervaltree=3.1.0=pyhd8ed1ab_1.conda
+  - ipykernel=6.29.5=pyh3099207_0.conda
+  - ipython=8.12.2=pyh41d4057_0.conda
+  - jedi=0.19.1=pyhd8ed1ab_0.conda
   - jinja2=3.1.4=pyhd8ed1ab_0.conda
   - jmespath=1.0.1=pyhd8ed1ab_0
   - joblib=1.4.2=pyhd8ed1ab_0.conda
   - jsonschema=4.23.0=pyhd8ed1ab_0.conda
   - jsonschema-specifications=2023.12.1=pyhd8ed1ab_0.conda
+  - jupyter_client=8.6.3=pyhd8ed1ab_0.conda
   - jupyter_core=5.7.2=pyh31011fe_1.conda
   - keyutils=1.6.1=h166bdaf_0
   - kiwisolver=1.4.5=py38h7f3f72f_1.conda
@@ -202,6 +212,7 @@ dependencies:
   - markupsafe=2.1.5=py38h01eb140_0.conda
   - matplotlib=3.6.2=py38h578d9bd_0
   - matplotlib-base=3.6.2=py38hb021067_0
+  - matplotlib-inline=0.1.7=pyhd8ed1ab_0.conda
   - mdurl=0.1.2=pyhd8ed1ab_0.conda
   - mpg123=1.32.6=h59595ed_0.conda
   - multidict=6.0.5=py38h01eb140_0.conda
@@ -210,6 +221,7 @@ dependencies:
   - natsort=8.4.0=pyhd8ed1ab_0.conda
   - nbformat=5.10.4=pyhd8ed1ab_0.conda
   - ncurses=6.5=he02047a_1.conda
+  - nest-asyncio=1.6.0=pyhd8ed1ab_0.conda
   - networkx=3.1=pyhd8ed1ab_0.conda
   - nomkl=1.0=h5ca1d4c_0
   - nspr=4.35=h27087fc_0.conda
@@ -223,9 +235,12 @@ dependencies:
   - packaging=24.1=pyhd8ed1ab_0.conda
   - pandas=1.5.0=py38h8f669ce_0
   - paramiko=3.5.0=pyhd8ed1ab_0.conda
+  - parso=0.8.4=pyhd8ed1ab_0.conda
   - patsy=0.5.6=pyhd8ed1ab_0.conda
   - pcre2=10.44=hba22ea6_2.conda
   - peppy=0.40.6=pyhd8ed1ab_0.conda
+  - pexpect=4.9.0=pyhd8ed1ab_0.conda
+  - pickleshare=0.7.5=py_1003
   - pillow=10.4.0=py38h2bc05a7_0.conda
   - pip=24.2=pyh8b19718_1.conda
   - pixman=0.43.2=h59595ed_0.conda
@@ -236,12 +251,16 @@ dependencies:
   - ply=3.11=pyhd8ed1ab_2.conda
   - pooch=1.8.2=pyhd8ed1ab_0.conda
   - prettytable=3.11.0=pyhd8ed1ab_0.conda
+  - prompt-toolkit=3.0.48=pyha770c72_0.conda
+  - prompt_toolkit=3.0.48=hd8ed1ab_0.conda
   - proto-plus=1.23.0=pyhd8ed1ab_0.conda
   - protobuf=4.25.3=py38hb5c7596_0.conda
   - psutil=6.0.0=py38hfb59056_0.conda
   - pthread-stubs=0.4=hb9d3cd8_1002.conda
+  - ptyprocess=0.7.0=pyhd3deb0d_0
   - pulp=2.7.0=py38h578d9bd_1.conda
   - pulseaudio-client=17.0=hb77b528_0.conda
+  - pure_eval=0.2.3=pyhd8ed1ab_0.conda
   - py-cpuinfo=9.0.0=pyhd8ed1ab_0
   - pyasn1=0.6.1=pyhd8ed1ab_1.conda
   - pyasn1-modules=0.4.1=pyhd8ed1ab_0.conda
@@ -267,6 +286,7 @@ dependencies:
   - pytz=2024.2=pyhd8ed1ab_0.conda
   - pyu2f=0.1.5=pyhd8ed1ab_0
   - pyyaml=6.0.2=py38h2019614_0.conda
+  - pyzmq=26.2.0=py38h6c80b9a_0.conda
   - qt-main=5.15.8=h3155989_26.conda
   - re2=2023.09.01=h7f4b329_2.conda
   - readline=8.2=h8228510_1.conda
@@ -292,6 +312,7 @@ dependencies:
   - smmap=5.0.0=pyhd8ed1ab_0
   - snappy=1.2.1=ha2e4443_0.conda
   - sortedcontainers=2.4.0=pyhd8ed1ab_0
+  - stack_data=0.6.2=pyhd8ed1ab_0.conda
   - statsmodels=0.14.1=py38h7f0c24c_0.conda
   - stdlib-list=0.10.0=pyhd8ed1ab_0.conda
   - stone=3.3.2=pyhd8ed1ab_0.conda
@@ -341,6 +362,7 @@ dependencies:
   - yaml=0.2.5=h7f98852_2
   - yarl=1.9.4=py38h01eb140_0.conda
   - yte=1.5.4=pyha770c72_0.conda
+  - zeromq=4.3.5=h75354e8_4.conda
   - zipp=3.20.2=pyhd8ed1ab_0.conda
   - zlib=1.3.1=h4ab18f5_1.conda
   - zlib-ng=2.0.7=h0b41bf4_0.conda
@@ -348,6 +370,7 @@ dependencies:
   - pip:
     - annoy==1.17.3
     - fastjsonschema==2.20.0
+    - multicoretsne==0.1
     - pyqt5==5.15.9
     - tables==3.8.0
     - tzdata==2024.2
