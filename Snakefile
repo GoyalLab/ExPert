@@ -1,5 +1,7 @@
 import os
 from src.harmonize import correction_methods
+from snakemake.io import load_configfile
+
 
 # Get the absolute path to the directory containing the Snakefile
 workflow.basedir = os.path.abspath(os.path.dirname(workflow.snakefile))
@@ -7,14 +9,27 @@ workflow.basedir = os.path.abspath(os.path.dirname(workflow.snakefile))
 # Add the project root to PYTHONPATH
 os.environ["PYTHONPATH"] = f"{workflow.basedir}:{os.environ.get('PYTHONPATH', '')}"
 
-# specify config file
-configfile: "config/config.yaml"
+def load_configs(default_config="config/config.yaml"):
+    # Load default config
+    config = load_configfile(default_config)
+    
+    # Update with any additional config files
+    for cf in workflow.overwrite_configfiles:
+        update_config = load_configfile(cf)
+        config.update(update_config)
+    
+    return config
+
+# Load and merge configs
+config = load_configs()
+
 # get basic parameters
 DATA = config.get('data', 'resources/datasets/data')
 LOG = config.get('log', 'logs')
 # List of datasets to process
 DATASETS = config['datasets']
 DATASET_NAMES = list(DATASETS.keys())
+print(f'Got {len(DATASET_NAMES)} datasets')
 DATASET_URLS = DATASETS
 # save used params for execution
 params = ['qc', 'n_hvg', 'subset_hvg', 'hvg', 'zero_padding', 'scale', 'correction_method']
