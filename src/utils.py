@@ -78,6 +78,8 @@ def get_dataset(url, dataset_name, output_path, cache=True):
 
 
 def make_obs_names_unique(df, agg='mean'):
+    # check number of datasets each hvg is detected
+    df['hv_in'] = df['highly_variable'].sum(axis=1)
     numeric_cols = df.dtypes[df.dtypes != 'object'].index
     obj_cols = df.dtypes[df.dtypes == 'object'].index
     # collapse all numeric cols with an aggregation method (e.g. mean)
