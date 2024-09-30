@@ -1,5 +1,5 @@
 import os
-from src.harmonize import correction_methods
+from src.harmonize import correction_methods, check_method
 from snakemake.io import load_configfile
 
 
@@ -42,8 +42,13 @@ HVG_DIR = os.path.join(OUTPUT_DIR, 'hvg')
 HVG_POOL = os.path.join(OUTPUT_DIR, 'hvg_pool.csv')
 
 ## PARAMETERS (or defaults)
+correction_method = config.get('correction_method', 'scanorama')
+check_method(correction_method, config)
+
 cache = config.get('cache', True)
 qc = config.get('qc', True)
+norm = config.get('norm', True)
+log_norm = config.get('log_norm', True)
 n_hvg = config.get('n_hvg', 10000)
 subset_hvg = config.get('subset_hvg', False)
 hvg = config.get('hvg', True)
@@ -73,6 +78,8 @@ rule process_dataset:
         name = lambda wildcards: wildcards.dataset,
         cache = cache,
         qc = qc,
+        norm= norm,
+        log_norm= log_norm,
         n_hvg = n_hvg,
         subset = subset_hvg
     script:

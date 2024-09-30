@@ -100,14 +100,20 @@ def _read_datasets(data_files, pool, hvg_filter=True, zero_pad=True):
 def correction_methods():
     return ['scANVI', 'scanorama', 'skip']
 
-def _check_methods(m):
+def requires_raw_data():
+    return ['scANVI']
+
+def check_method(m, conf):
     methods = correction_methods()
     if m not in methods:
         raise ValueError(f'Method must be {methods}; got {m}')
+    if m in requires_raw_data():
+        logging.info(f'Method {m} requires raw data, setting preprocess to exclude normalization and log1p')
+        conf['norm'] = False
+        conf['log_norm'] = False
 
 
 def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scale=True, cores=-1):
-    _check_methods(method)
     # read datasets to one dict
     ds_dict = _read_datasets(data_files, hvg_pool.index, hvg_filter=hvg, zero_pad=zero_pad)
     # extract names and according AnnDatas

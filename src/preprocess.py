@@ -46,15 +46,17 @@ def quality_control_filter(adata, percent_threshold=20, nmads=5, mt_nmads=3, mt_
 
 
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
-def prepare_dataset(adata, name='Unknown', qc=True, n_hvg=2000, subset=False):
+def prepare_dataset(adata, name='Unknown', qc=True, norm=True, log=True, n_hvg=2000, subset=False):
     # apply quality control measures
     if qc:
         logging.info(f'Quality control for dataset {name}')
         adata = quality_control_filter(adata)
     logging.info(f'Normalizing dataset {name}')
-    sc.pp.normalize_total(adata)
+    if norm:
+        sc.pp.normalize_total(adata)
     # apply log transformation
-    sc.pp.log1p(adata)
+    if log:
+        sc.pp.log1p(adata)
 
     logging.info(f'Determining highly variable genes for dataset {name}')
     if isinstance(n_hvg, float):
@@ -65,6 +67,6 @@ def prepare_dataset(adata, name='Unknown', qc=True, n_hvg=2000, subset=False):
         n_hvg = int(adata.n_vars * n_hvg)
         logging.info(f'Number of highly variable genes to use: {n_hvg} ({perc}* {adata.n_vars})')
     # Calculate highly variable genes
-    sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset)
+    sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset, layer='norm')
     logging.info(f'Found {np.sum(adata.var.highly_variable)} highly variable genes out of {adata.n_vars} total genes')
     return adata
