@@ -21,12 +21,12 @@ def get_hvg_pool(files, agg='mean'):
     return pool
 
 
-def merge_datasets(dataset_files, hvg_files, merged_set_output, pool_output, method='harmony', hvg=True, zero_pad=True, scale=True, cores=-1, raw_tsne=False):
+def merge_datasets(dataset_files, hvg_files, merged_set_output, pool_output, method='harmony', hvg=True, zero_pad=True, cores=-1, do_tsne=True, raw_tsne=False):
     # collect pool of highly variable genes over all datasets
     pool = get_hvg_pool(hvg_files)
     pool.to_csv(pool_output)
     # read all preprocessed datasets, combine, and correct for batch effects
-    merged = harmonize(dataset_files, pool, method=method, hvg=hvg, zero_pad=zero_pad, scale=scale, cores=cores, include_raw_tsne=raw_tsne)
+    merged = harmonize(dataset_files, pool, method=method, hvg=hvg, zero_pad=zero_pad, cores=cores, do_tsne=do_tsne, include_raw_tsne=raw_tsne)
     # write final dataset to file
     merged.write_h5ad(merged_set_output)
 
@@ -45,8 +45,8 @@ if __name__ == "__main__":
             method=snakemake.params.method,
             hvg=snakemake.params.hvg,
             zero_pad=snakemake.params.zero_pad,
-            scale=snakemake.params.scale,
             cores=snakemake.params.cores,
+            do_tsne=snakemake.params.do_tsne,
             raw_tsne=snakemake.params.raw_tsne
         )
     except NameError:

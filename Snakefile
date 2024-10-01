@@ -54,6 +54,7 @@ subset_hvg = config.get('subset_hvg', False)            # Only include highly va
 hvg = config.get('hvg', True)                           # Filter metaset genes for high variance
 zero_padding = config.get('zero_padding', False)        # Fill missing genes with 0s to include all genes across the merged metaset
 scale = config.get('scale', True)                       # Center and scale the resulting metaset
+do_tsne = config.get('do_tsne', True)                   # Calculate tSNE for merged dataset (can take some time)
 raw_tsne = config.get('raw_tsne', False)                # Calculate tSNE for both the raw and processed dataset
 
 
@@ -76,8 +77,9 @@ rule process_dataset:
         name = lambda wildcards: wildcards.dataset,
         cache = cache,
         qc = qc,
-        norm= norm,
-        log_norm= log_norm,
+        norm = norm,
+        log_norm = log_norm,
+        scale = scale,
         n_hvg = n_hvg,
         subset = subset_hvg
     script:
@@ -103,8 +105,9 @@ rule merge_datasets:
         method = correction_method,
         hvg = hvg,
         zero_pad = zero_padding,
-        scale = scale,
-        cores = config['cores']
+        cores = config['cores'],
+        do_tsne = do_tsne,
+        raw_tsne = raw_tsne
     output:
         merged_set = OUTPUT_FILE,
         pool = HVG_POOL

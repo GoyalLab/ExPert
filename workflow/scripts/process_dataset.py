@@ -3,13 +3,13 @@ from src.preprocess import prepare_dataset
 import logging
 
 
-def process_dataset(dataset_link, dataset_name, output_path, cache=True, qc=True, norm=True, log=True, n_hvg=2000, subset=False):
+def process_dataset(dataset_link, dataset_name, output_path, cache=True, qc=True, norm=True, log=True, scale=True, n_hvg=2000, subset=False):
     # download/cache dataset
     logging.info(f"Downloading/caching dataset {dataset_name}")
     ds = get_dataset(dataset_link, dataset_name, output_path, cache)
     # prepare dataset
     logging.info(f"Preparing dataset {dataset_name}")
-    ds = prepare_dataset(ds, dataset_name, qc=qc, norm=norm, log=log, n_hvg=n_hvg, subset=subset)
+    ds = prepare_dataset(ds, dataset_name, qc=qc, norm=norm, log=log, scale=scale, n_hvg=n_hvg, subset=subset)
     logging.info(f"Finished preparing dataset {dataset_name}")
     ds.write_h5ad(output_path)
 
@@ -28,6 +28,7 @@ if __name__ == "__main__":
             qc=snakemake.params.qc,
             norm=snakemake.params.norm,
             log=snakemake.params.log_norm,
+            scale=snakemake.params.scale,
             n_hvg=snakemake.params.n_hvg
         )
     except NameError:

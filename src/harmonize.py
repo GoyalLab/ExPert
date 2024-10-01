@@ -136,28 +136,60 @@ def check_method(m, conf):
         conf['log_norm'] = True
 
 
-def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scale=True, cores=1, include_raw_tsne=False):
+def reduce_to_common_genes(ds_list):
+    common_genes = list(set.intersection(*(set(adata.var_names) for adata in ds_list)))
+    logging.info(f'Found {len(common_genes)} common genes between datasets while merging')
+    return [d[:, common_genes] for d in ds_list]
+
+
+def merge_datasets(ds_list, ds_keys, label='dataset'):
+    logging.info('Merging datasets')
+    merged = ad.concat(ds_list, label=label, keys=ds_keys)
+    logging.info('Finished merge')
+    return merged
+
+
+def merge_datasets_dict(ds_dict, label='dataset'):
+    logging.info('Merging datasets')
+    merged = ad.concat(ds_dict, label=label)
+    logging.info('Finished merge')
+    return merged
+
+
+def _pca(adata):
+    logging.info('Computing PCA')
+    sc.pp.pca(adata)
+    logging.info('Finished PCA')
+
+
+def _neighbors(adata, pca_key='X_pca'):
+    logging.info('Calculating neighbors')
+    sc.pp.neighbors(adata, use_rep=pca_key)
+    logging.info('Finished neighbors')
+
+
+def _tsne(adata, pca_key='X_pca', obs_key='X_tsne', cores=1):
+    logging.info('Calculating tSNE')
+    adata.obsm[obs_key] = tsne(n_jobs=cores).fit_transform(adata.obsm[pca_key])
+    logging.info('Finished tSNE')
+
+
+def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, cores=1, do_tsne=True, include_raw_tsne=False):
     # read datasets to one dict
     ds_dict = _read_datasets(data_files, hvg_pool.index, hvg_filter=hvg, zero_pad=zero_pad)
     # extract names and according AnnDatas
-    ds_list = [*ds_dict.values()]
-    ds_keys = [*ds_dict.keys()]
+    ds_keys, ds_list = [*ds_dict.keys()], [*ds_dict.values()]
     pca_key = 'X_pca'
 
     if method != 'skip':
         # reduce datasets to common genes
-        common_genes = list(set.intersection(*(set(adata.var_names) for adata in ds_list)))
-        logging.info(f'Found {len(common_genes)} common genes between datasets while merging')
-        ds_list = [d[:, common_genes] for d in ds_list]
+        ds_list = reduce_to_common_genes(ds_list)
         # apply batch effect normalization over different datasets and adjust original counts
         if method == 'scanorama':
             ds_list = _scanorama(ds_list)
         # concatenate corrected datasets
-        logging.info('Merging datasets')
-        merged = ad.concat(ds_list, label='dataset', keys=ds_keys)
-        logging.info('Finished merge')
-        logging.info('Computing PCA')
-        sc.pp.pca(merged)
+        merged = merge_datasets(ds_list, ds_keys)
+        _pca(merged)
         # normalize expression based on merged dataset
         if method == 'scANVI':
             pca_key = 'X_scANVI'
@@ -165,34 +197,19 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, scal
         elif method == 'harmonypy':
             pca_key = 'X_pca_harmony'
             _harmony(merged)
-        # scale merged dataset
-        if scale:
-            # scale data after merge
-            logging.info('Scaling and centering merged dataset')
-            sc.pp.scale(merged)
     else:
-        # select scaled data if available
-        if scale:
-            logging.info('Setting scaled data as default in datasets')
-            for i, ds in enumerate(ds_list):
-                logging.info(f'Scaling dataset {ds_keys[i]} before merge')
-                sc.pp.scale(ds)
         # collapse to a merged AnnData object
-        logging.info('Merging datasets')
-        merged = ad.concat(ds_dict, label='dataset')
-        logging.info('Finished merge')
-        logging.info('Computing PCA')
-        sc.pp.pca(merged)
+        merged = merge_datasets_dict(ds_dict)
+        _pca(merged)
     # add summarized var data (highly variable gene information)
     # merged.var = pd.concat([merged.var, hvg_pool], axis=1, join='inner')
     logging.info(f'Resulting metaset spans: {merged.shape[0]} combined cells and {merged.shape[1]} common genes')
-    logging.info('Calculating neighbors')
-    sc.pp.neighbors(merged, use_rep=pca_key)
-    # Calculate tSNE for entire dataset (also add raw tSNE if correction method is given and option is true)
-    if include_raw_tsne and pca_key!='X_pca':
-        logging.info('Computing raw tsne')
-        merged.obsm['X_tsne_raw'] = tsne(n_jobs=cores).fit_transform(merged.obsm['X_pca'])
-    logging.info('Computing tsne')
-    merged.obsm['X_tsne'] = tsne(n_jobs=cores).fit_transform(merged.obsm[pca_key])
-    logging.info('Done')
+    if do_tsne:
+        # calculate neighbors for tSNE
+        _neighbors(merged)
+        # Calculate tSNE for entire dataset (also add raw tSNE if correction method is given and option is true)
+        if include_raw_tsne and pca_key!='X_pca':
+            logging.info('Computing raw tsne')
+            _tsne(merged, pca_key='X_tsne_raw', cores=cores)
+        _tsne(merged, pca_key=pca_key, cores=cores)
     return merged
