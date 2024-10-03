@@ -1,5 +1,5 @@
 import os
-from src.harmonize import correction_methods, check_method
+from src.harmonize import check_method
 from snakemake.io import load_configfile
 
 
@@ -53,7 +53,7 @@ n_hvg = config.get('n_hvg', 2000)                       # Number of highly varia
 subset_hvg = config.get('subset_hvg', False)            # Only include highly variable genes of each dataset
 hvg = config.get('hvg', True)                           # Filter metaset genes for high variance
 zero_padding = config.get('zero_padding', False)        # Fill missing genes with 0s to include all genes across the merged metaset
-scale = config.get('scale', True)                       # Center and scale the resulting metaset
+scale = config.get('scale', True)                       # Center and scale each dataset
 do_tsne = config.get('do_tsne', True)                   # Calculate tSNE for merged dataset (can take some time)
 raw_tsne = config.get('raw_tsne', False)                # Calculate tSNE for both the raw and processed dataset
 

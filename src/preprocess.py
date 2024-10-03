@@ -59,7 +59,6 @@ def prepare_dataset(adata, name='Unknown', qc=True, norm=True, log=True, scale=T
         logging.info(f'log1p normalizing dataset {name}')
         sc.pp.log1p(adata)
 
-    logging.info(f'Determining highly variable genes for dataset {name}')
     if isinstance(n_hvg, float):
         if n_hvg > 1:
             raise ValueError('Percentage param "n_hvg" must be <= 1, or total number of genes')
@@ -68,7 +67,16 @@ def prepare_dataset(adata, name='Unknown', qc=True, norm=True, log=True, scale=T
         n_hvg = int(adata.n_vars * n_hvg)
         logging.info(f'Number of highly variable genes to use: {n_hvg} ({perc}* {adata.n_vars})')
     # Calculate highly variable genes
-    sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset)
+    logging.info(f'Determining highly variable genes for dataset {name}')
+    if not log:
+        # Don't update the initial data, but base gene filtering on preprocessed data
+        ds = adata.copy()
+        sc.pp.normalize_total(ds)
+        sc.pp.log1p(ds)
+        sc.pp.highly_variable_genes(ds, n_top_genes=n_hvg, subset=subset)
+        adata.var['highly_variable'] = ds.var['highly_variable']
+    else:
+        sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset)
     if scale:
         logging.info(f'Scaling and centering {name}')
         sc.pp.scale(adata)

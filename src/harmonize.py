@@ -41,7 +41,7 @@ def _harmony(adata):
     adata.X = _pca_reconstruction(adata, pca_key=key)
 
 
-def _scANVI(adata, batch_key='dataset', labels_key='celltype'):
+def _scANVI(adata, batch_key='dataset', labels_key='celltype', model_dir='./'):
     logging.info('Running SCANVI')
     scvi.settings.verbosity = 2
     # Initialize scvi adata, specify dataset and cell type
@@ -49,17 +49,23 @@ def _scANVI(adata, batch_key='dataset', labels_key='celltype'):
     # build scVI model
     scvi_model = scvi.model.SCVI(adata)
     # train model
+    logging.info('Training scVI model')
     scvi_model.train(early_stopping=True)
+    logging.info('Finished training scVI model')
     # run scANVI that additionally incorporated cell labels
     model_scanvi = scvi.model.SCANVI.from_scvi_model(
-        scvi_model, labels_key=labels_key, unlabeled_category="unlabelled"
+        scvi_model, unlabeled_category="unlabelled"
     )
+    logging.info('Training scANVI model')
     model_scanvi.train()
+    logging.info('Finished training scANVI model')
+    logging.info(f'Saving scANVI model in {model_dir}')
+    model_scanvi.save("./scanvi", overwrite=True)
     # add trained latent space
     adata.obsm["X_scANVI"] = model_scanvi.get_latent_representation()
     logging.info('Finished SCANVI training')
     # reconstruct normalized gene expression counts and set them as default to avoid adding layers
-    adata.X = _pca_reconstruction(adata)
+    adata.X = model_scanvi.get_normalized_expression(return_numpy=True, library_size=10000)
 
 
 def _scanorama(ds_list):
@@ -130,6 +136,7 @@ def check_method(m, conf):
         logging.info(f'Method {m} requires raw data, setting preprocess to exclude normalization and log1p')
         conf['norm'] = False
         conf['log_norm'] = False
+        conf['scale'] = False
     if m in requires_processed_data():
         logging.info(f'Method {m} requires preprocessed data, setting preprocess to include normalization and log1p')
         conf['norm'] = True
