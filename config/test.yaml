@@ -1,13 +1,13 @@
 # overall options
-cores: 4        # how many cores to use (ideally number of datasets)
+cores: 4                          # how many cores to use (ideally number of datasets)
 # preprocessing options
 norm: false
 log_norm: false
-scale: false     # center and scale
-n_hvg: 2000     # Total number of highly variable genes to determine (or percentage of genes in dataset)
+scale: false
+n_hvg: 2000                       # Total number of highly variable genes to determine (or percentage of genes in dataset)
 # merge options
-zero_padding: true           # Fill missing genes with 0 counts (optional if total hvg number high)
-correction_method: 'scANVI'      # batch effect correction method, can be one of 'scANVI', 'scanorama', or 'skip' (scanorama recommended)
+zero_padding: true                # Fill missing genes with 0 counts (optional if total hvg number high)
+correction_method: 'skip'         # batch effect correction method, can be one of 'scANVI', 'scanorama', or 'skip'
 
 # file specifications
 log: 'logs/test'

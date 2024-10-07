@@ -54,8 +54,9 @@ subset_hvg = config.get('subset_hvg', False)            # Only include highly va
 hvg = config.get('hvg', True)                           # Filter metaset genes for high variance
 zero_padding = config.get('zero_padding', False)        # Fill missing genes with 0s to include all genes across the merged metaset
 scale = config.get('scale', True)                       # Center and scale each dataset
-do_tsne = config.get('do_tsne', True)                   # Calculate tSNE for merged dataset (can take some time)
-raw_tsne = config.get('raw_tsne', False)                # Calculate tSNE for both the raw and processed dataset
+plot = config.get('plot', True)                         # Whether to run plotting options such as tSNE or UMAP, if true, UMAP is default
+do_tsne = config.get('do_tsne', False)                      # Calculate tSNE for merged dataset (can take some time)
+do_umap = config.get('do_umap', True)                       # Calculate UMAP for merged dataset
 
 
 ## START OF PIPELINE
@@ -106,8 +107,9 @@ rule merge_datasets:
         hvg = hvg,
         zero_pad = zero_padding,
         cores = config['cores'],
-        do_tsne = do_tsne,
-        raw_tsne = raw_tsne
+        plot = plot,
+        do_umap = do_umap,
+        do_tsne = do_tsne
     output:
         merged_set = OUTPUT_FILE,
         pool = HVG_POOL

@@ -10,6 +10,7 @@ import harmonypy as hm
 import scipy.sparse as sp
 from MulticoreTSNE import MulticoreTSNE as tsne
 import scvi
+import torch
 
 
 def _pca_reconstruction(adata, n_comps=50, pca_key='X_pca'):
@@ -44,28 +45,32 @@ def _harmony(adata):
 def _scANVI(adata, batch_key='dataset', labels_key='celltype', model_dir='./'):
     logging.info('Running SCANVI')
     scvi.settings.verbosity = 2
+    # Check if CUDA (GPU) is available
+    use_gpu = torch.cuda.is_available()
     # Initialize scvi adata, specify dataset and cell type
     scvi.model.SCVI.setup_anndata(adata, batch_key=batch_key, labels_key=labels_key)
     # build scVI model
     scvi_model = scvi.model.SCVI(adata)
     # train model
     logging.info('Training scVI model')
-    scvi_model.train(early_stopping=True)
+    scvi_model.train(early_stopping=True, use_gpu=use_gpu)
     logging.info('Finished training scVI model')
     # run scANVI that additionally incorporated cell labels
     model_scanvi = scvi.model.SCANVI.from_scvi_model(
         scvi_model, unlabeled_category="unlabelled"
     )
     logging.info('Training scANVI model')
-    model_scanvi.train()
+    model_scanvi.train(use_gpu=use_gpu)
     logging.info('Finished training scANVI model')
     logging.info(f'Saving scANVI model in {model_dir}')
     model_scanvi.save("./scanvi", overwrite=True)
     # add trained latent space
     adata.obsm["X_scANVI"] = model_scanvi.get_latent_representation()
     logging.info('Finished SCANVI training')
+    # set dataset to correct for (ideally select largest dataset)
+    batch_key = adata.obs['dataset'].value_counts().index[0]
     # reconstruct normalized gene expression counts and set them as default to avoid adding layers
-    adata.X = model_scanvi.get_normalized_expression(return_numpy=True, library_size=10000)
+    adata.X = model_scanvi.get_normalized_expression(transform_batch=batch_key)
 
 
 def _scanorama(ds_list):
@@ -175,13 +180,19 @@ def _neighbors(adata, pca_key='X_pca'):
     logging.info('Finished neighbors')
 
 
+def _umap(adata):
+    logging.info('Calculating UMAP')
+    sc.tl.umap(adata)
+    logging.info('Finished UMAP')
+
+
 def _tsne(adata, pca_key='X_pca', obs_key='X_tsne', cores=1):
     logging.info('Calculating tSNE')
     adata.obsm[obs_key] = tsne(n_jobs=cores).fit_transform(adata.obsm[pca_key])
     logging.info('Finished tSNE')
 
 
-def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, cores=1, do_tsne=True, include_raw_tsne=False):
+def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, cores=1, plot=False, do_umap=False, do_tsne=False):
     # read datasets to one dict
     ds_dict = _read_datasets(data_files, hvg_pool.index, hvg_filter=hvg, zero_pad=zero_pad)
     # extract names and according AnnDatas
@@ -211,12 +222,13 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, core
     # add summarized var data (highly variable gene information)
     # merged.var = pd.concat([merged.var, hvg_pool], axis=1, join='inner')
     logging.info(f'Resulting metaset spans: {merged.shape[0]} combined cells and {merged.shape[1]} common genes')
-    if do_tsne:
-        # calculate neighbors for tSNE
-        _neighbors(merged)
-        # Calculate tSNE for entire dataset (also add raw tSNE if correction method is given and option is true)
-        if include_raw_tsne and pca_key!='X_pca':
-            logging.info('Computing raw tsne')
-            _tsne(merged, pca_key='X_tsne_raw', cores=cores)
-        _tsne(merged, pca_key=pca_key, cores=cores)
+    if plot:
+        # calculate neighbors
+        _neighbors(merged, pca_key=pca_key)
+        if do_tsne:
+            # Calculate tSNE
+            _tsne(merged, pca_key=pca_key, cores=cores)
+        if do_umap:
+            _umap(merged)
+
     return merged

@@ -21,12 +21,12 @@ def get_hvg_pool(files, agg='mean'):
     return pool
 
 
-def merge_datasets(dataset_files, hvg_files, merged_set_output, pool_output, method='harmony', hvg=True, zero_pad=True, cores=-1, do_tsne=True, raw_tsne=False):
+def merge_datasets(dataset_files, hvg_files, merged_set_output, pool_output, method='harmony', hvg=True, zero_pad=True, cores=-1, plot=True, do_umap=True, do_tsne=False):
     # collect pool of highly variable genes over all datasets
     pool = get_hvg_pool(hvg_files)
     pool.to_csv(pool_output)
     # read all preprocessed datasets, combine, and correct for batch effects
-    merged = harmonize(dataset_files, pool, method=method, hvg=hvg, zero_pad=zero_pad, cores=cores, do_tsne=do_tsne, include_raw_tsne=raw_tsne)
+    merged = harmonize(dataset_files, pool, method=method, hvg=hvg, zero_pad=zero_pad, cores=cores, plot=plot, do_umap=do_umap, do_tsne=do_tsne)
     # write final dataset to file
     merged.write_h5ad(merged_set_output)
 
@@ -46,8 +46,9 @@ if __name__ == "__main__":
             hvg=snakemake.params.hvg,
             zero_pad=snakemake.params.zero_pad,
             cores=snakemake.params.cores,
-            do_tsne=snakemake.params.do_tsne,
-            raw_tsne=snakemake.params.raw_tsne
+            plot=snakemake.params.plot,
+            do_umap=snakemake.params.do_umap,
+            do_tsne=snakemake.params.do_tsne
         )
     except NameError:
         print("This script is meant to be run through Snakemake.")
