@@ -1,7 +1,6 @@
 import requests
 import scanpy as sc
 from tqdm import tqdm
-import os
 import logging
 import pandas as pd
 
@@ -66,13 +65,8 @@ def download_file(url, output_path):
 
 
 def get_dataset(url, dataset_name, output_path, cache=True):
-    if os.path.exists(output_path) and cache:
-        print(f"Using cached file {output_path}")
-    else:
-        print(f"Downloading {url}")
-        download_file(url, output_path)
     print(f"Reading dataset {dataset_name}")
-    data = sc.read_h5ad(output_path)
+    data = sc.read(output_path, backup_url=url, cache=cache)
     data.uns["dataset_name"] = dataset_name
     return data
 
