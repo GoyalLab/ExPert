@@ -13,10 +13,13 @@ def load_configs(default_config="config/config.yaml"):
     # Load default config
     config = load_configfile(default_config)
     
-    # Update with any additional config files
+    # Update with any additional config files (from --configfile)
     for cf in workflow.overwrite_configfiles:
         update_config = load_configfile(cf)
         config.update(update_config)
+
+    # Update with command-line options (from --config)
+    config.update(workflow.overwrite_config)
     
     return config
 
@@ -32,7 +35,7 @@ DATASET_NAMES = list(DATASETS.keys())
 print(f'Got {len(DATASET_NAMES)} datasets')
 DATASET_URLS = DATASETS
 # save used params for execution
-params = ['qc', 'n_hvg', 'subset_hvg', 'hvg', 'zero_padding', 'scale', 'correction_method']
+params = ['qc', 'norm', 'log_norm', 'n_hvg', 'subset_hvg', 'hvg', 'zero_padding', 'scale', 'correction_method']
 CONFIG_STR = os.path.sep.join(f"{k}/{v}" for k, v in config.items() if k in params)
 OUTPUT_DIR = os.path.join(str(config['output_dir']), CONFIG_STR)
 # define output file
@@ -42,19 +45,19 @@ HVG_DIR = os.path.join(OUTPUT_DIR, 'hvg')
 HVG_POOL = os.path.join(OUTPUT_DIR, 'hvg_pool.csv')
 
 ## PARAMETERS (or defaults)
-correction_method = config.get('correction_method', 'scanorama')
+correction_method = config.get('correction_method', 'scANVI')
 check_method(correction_method, config)
 
-cache = config.get('cache', True)
-qc = config.get('qc', True)                             # Perform QC on cells
-norm = config.get('norm', True)                         # Normalize gene expression (total sum)
-log_norm = config.get('log_norm', True)                 # Log normalize gene expression (log1p)
+cache = config.get('cache', True)                       # Cache datasets if already downloaded
+qc = config.get('qc', False)                            # Perform QC on cells
+norm = config.get('norm', False)                        # Normalize gene expression (total sum)
+log_norm = config.get('log_norm', False)                # Log normalize gene expression (log1p)
 n_hvg = config.get('n_hvg', 2000)                       # Number of highly variable genes to include for each dataset
 subset_hvg = config.get('subset_hvg', False)            # Only include highly variable genes of each dataset
 hvg = config.get('hvg', True)                           # Filter metaset genes for high variance
 zero_padding = config.get('zero_padding', False)        # Fill missing genes with 0s to include all genes across the merged metaset
-scale = config.get('scale', True)                       # Center and scale each dataset
-plot = config.get('plot', True)                         # Whether to run plotting options such as tSNE or UMAP, if true, UMAP is default
+scale = config.get('scale', False)                      # Center and scale each dataset
+plot = config.get('plot', True)                         # Whether to run plotting options such as tSNE or UMAP, if true, UMAP is default (can be plotted with final object using sc.pl.*)
 do_tsne = config.get('do_tsne', False)                      # Calculate tSNE for merged dataset (can take some time)
 do_umap = config.get('do_umap', True)                       # Calculate UMAP for merged dataset
 
