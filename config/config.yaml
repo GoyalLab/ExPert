@@ -1,27 +1,25 @@
-# overall options
-cores: 14        # how many cores to use (ideally number of datasets)
-# preprocessing options
-cache: true     # cache downloaded files or reload
-qc: false        # apply quality control to cells (recommended)
-scale: false     # center and scale (recommended)
-n_hvg: 2000     # Total number of highly variable genes to determine (or percentage of genes in dataset)
-subset_hvg: false  # Directly subset dataset to highly variable genes (not recommended, rapidly decreases matching genes in merged set)
-# merge options
-hvg: true                     # only use highly variable genes of each dataset (recommended)
-zero_padding: true           # Fill missing genes with 0 counts (optional if total hvg number high)
-correction_method: 'scanorama'     # batch effect correction method, can be one of 'scanorama', or 'skip'
-
-# file specifications
-data: 'resources/datasets/data'
+# Base parameters for ExPert datasets merge
+cores: 18
+norm: false
+log_norm: false
+scale: false
+n_hvg: 2000
+subset_hvg: false
+zero_padding: true
+correction_method: 'skip'
+cache: true
+plot: true
+do_umap: true
 log: 'logs'
-dataset_meta: 'resources/datasets/meta/filtered_datasets.csv'
 output_dir: 'results'
 
-# list of all datasets to combine (with download links), generated from filtered_datasets.csv
+# Datasets to merge (total of 18 sets)
 datasets:
  "DatlingerBock2021": "https://zenodo.org/record/7041849/files/DatlingerBock2021.h5ad"
  "AdamsonWeissman2016_GSM2406675_10X001": "https://zenodo.org/record/7041849/files/AdamsonWeissman2016_GSM2406675_10X001.h5ad"
+ "PapalexiSatija2021_eccite_arrayed_RNA": "https://zenodo.org/record/7041849/files/PapalexiSatija2021_eccite_arrayed_RNA.h5ad"
  "AdamsonWeissman2016_GSM2406677_10X005": "https://zenodo.org/record/7041849/files/AdamsonWeissman2016_GSM2406677_10X005.h5ad"
+ "PapalexiSatija2021_eccite_RNA": "https://zenodo.org/record/7041849/files/PapalexiSatija2021_eccite_RNA.h5ad"
  "TianKampmann2021_CRISPRa": "https://zenodo.org/record/7041849/files/TianKampmann2021_CRISPRa.h5ad"
  "ShifrutMarson2018": "https://zenodo.org/record/7041849/files/ShifrutMarson2018.h5ad"
  "TianKampmann2019_day7neuron": "https://zenodo.org/record/7041849/files/TianKampmann2019_day7neuron.h5ad"
@@ -31,6 +29,7 @@ datasets:
  "GasperiniShendure2019_highMOI": "https://zenodo.org/record/7041849/files/GasperiniShendure2019_highMOI.h5ad"
  "NormanWeissman2019_filtered": "https://zenodo.org/record/7041849/files/NormanWeissman2019_filtered.h5ad"
  "ReplogleWeissman2022_rpe1": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_rpe1.h5ad"
+ "FrangiehIzar2021_RNA": "https://zenodo.org/record/7041849/files/FrangiehIzar2021_RNA.h5ad"
  "ReplogleWeissman2022_K562_essential": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_K562_essential.h5ad"
  "GasperiniShendure2019_atscale": "https://zenodo.org/record/7041849/files/GasperiniShendure2019_atscale.h5ad"
-# "ReplogleWeissman2022_K562_gwps": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_K562_gwps.h5ad"
+ "ReplogleWeissman2022_K562_gwps": "https://zenodo.org/record/7041849/files/ReplogleWeissman2022_K562_gwps.h5ad"

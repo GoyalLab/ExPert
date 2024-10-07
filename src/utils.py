@@ -3,6 +3,7 @@ import scanpy as sc
 from tqdm import tqdm
 import logging
 import pandas as pd
+import numpy as np
 
 
 def setup_logger(log_file):
@@ -86,3 +87,122 @@ def make_obs_names_unique(df, agg='mean'):
     # choose the first non-nan value for duplicated object columns
     meta = df[obj_cols].groupby(df[obj_cols].columns, axis=1).apply(lambda x: x.bfill(axis=1).iloc[:, 0])
     return pd.concat([meta, numerics], axis=1)
+
+def create_config_file(base_conf, datasets, config_path='config/config.yaml'):
+    with open(config_path, 'w') as f:
+        # Add parameters
+        f.write('# Base parameters for ExPert datasets merge\n')
+        for k,v in base_conf.items():
+            f.write(f"{k}: {v}\n")
+        # Add datasets
+        f.write(f'\n# Datasets to merge (total of {datasets.shape[0]} sets)\n')
+        f.write('datasets:\n')
+        for i, row in datasets[['index', 'download link']].iterrows():
+            f.write(f" \"{row['index']}\": \"{row['download link']}\"\n")
+
+
+def ref_per_method():
+    return {
+        'skip': {
+            'cpu': {'mem': 2.25, 'time': 5}
+        },
+        'scanorama': {
+            'cpu': {'mem': 3.64, 'time': 5}
+        },
+        'scANVI': {
+            'cpu': {'mem': 2.86, 'time': 180},
+            'gpu': {'mem': 2.86, 'time': 5}
+        }
+    }
+            
+
+def estimate_time(ds, n, method='skip', min_h=1, device='cpu'):
+    ref_min = ref_per_method()[method][device]['time']
+    x = ds.sort_values('bytes').iloc[:4,].bytes.sum()
+    y = ds.sort_values('bytes').iloc[:n,].bytes.sum()
+    h = int(y/x * ref_min / 60)
+    if h < min_h:
+        h = min_h
+    return int(h)
+
+
+# estimate RAM based on test set
+def estimate_RAM(ds, n, method='skip', round=True, factor=10, min_mem=20, device='cpu'):
+    ref_ram = ref_per_method()[method][device]['mem']
+    x = ds.sort_values('bytes').iloc[:4,].bytes.sum()
+    y = ds.sort_values('bytes').iloc[:n,].bytes.sum()
+    mem = y/x * ref_ram
+    if round:
+        mem = np.round(mem / factor)*factor
+    if mem < min_mem:
+        mem = min_mem
+    return int(mem)
+
+
+# get appropriate partition
+def get_partition(ram=100, use_gpu=False):
+    if use_gpu:
+        return 'genomics-gpu'
+    if ram > 200:
+        return 'genomics-himem'
+    else:
+        return 'genomics'
+    
+
+def requires_gpu(m):
+    return m=='scANVI'
+    
+
+# create slurm script
+def create_sbatch_script(base_conf, ds, conda_env='harmonize', script='main_quest.sh', config_path='config/config.yaml', time_str=None):
+    # check for GPU requirement
+    method = base_conf['correction_method'].strip("''")
+    gpu = requires_gpu(method)
+    device = 'gpu' if gpu else 'cpu'
+    # estimate RAM usage
+    ram = estimate_RAM(ds, n=ds.shape[0], method=method, device=device)
+    # estimate time
+    if time_str is None:
+        time_str = f'{estimate_time(ds, n=ds.shape[0], method=method, device=device)}:00:00'
+    # check partition
+    partition = get_partition(ram, use_gpu=gpu)
+    # define logs (create log dir for each run)
+    log_dir = 'logs/quest/%j'
+    log_file = f'{log_dir}/snakemake.log'
+    # define sbatch parameters
+    sbatch_params = {
+        'account': 'b1042',
+        'partition': partition,
+        'job-name': 'ExPert',
+        'nodes': 1,
+        'ntasks-per-node': ds.shape[0],
+        'mem': f'{ram}GB',
+        'time': time_str,
+        'output': log_file,
+        'verbose': True
+    }
+    # write sbatch file
+    with open(script, 'w') as f:
+        f.write('#!/bin/bash\n')
+        # add sbatch parameters
+        for k,v in sbatch_params.items():
+            if isinstance(v, bool):
+                # flags
+                p = f'#SBATCH --{k}\n'
+            else:
+                p = f'#SBATCH --{k} {v}\n'
+            f.write(p)
+        # add run parameters
+        f.write('# Define log directory\n')
+        f.write('LOG="logs/quest/${SLURM_JOB_ID}"\n\n')
+        # load modules
+        f.write('echo "Setting up pipeline..."\n')
+        f.write('module purge\n')
+        f.write('module load anaconda3\n')
+        f.write('source ~/.bashrc\n')
+        f.write(f'conda activate {conda_env}\n')
+        # execute actual pipeline
+        f.write('echo "Starting pipeline..."\n')
+        f.write(f'snakemake --cores {ds.shape[0]} --verbose --configfile "{config_path}" --config log="$LOG"\n')
+        f.write('echo "Finished pipeline"\n')
+        f.write('conda deactivate\n')
