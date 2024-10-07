@@ -47,20 +47,21 @@ def _scANVI(adata, batch_key='dataset', labels_key='celltype', model_dir='./'):
     scvi.settings.verbosity = 2
     # Check if CUDA (GPU) is available
     use_gpu = torch.cuda.is_available()
+    logging.info(f'GPU available: {"yes" if use_gpu else "no"}')
     # Initialize scvi adata, specify dataset and cell type
     scvi.model.SCVI.setup_anndata(adata, batch_key=batch_key, labels_key=labels_key)
     # build scVI model
     scvi_model = scvi.model.SCVI(adata)
     # train model
     logging.info('Training scVI model')
-    scvi_model.train(early_stopping=True, use_gpu=use_gpu)
+    scvi_model.train(early_stopping=True)
     logging.info('Finished training scVI model')
     # run scANVI that additionally incorporated cell labels
     model_scanvi = scvi.model.SCANVI.from_scvi_model(
         scvi_model, unlabeled_category="unlabelled"
     )
     logging.info('Training scANVI model')
-    model_scanvi.train(use_gpu=use_gpu)
+    model_scanvi.train()
     logging.info('Finished training scANVI model')
     logging.info(f'Saving scANVI model in {model_dir}')
     model_scanvi.save("./scanvi", overwrite=True)

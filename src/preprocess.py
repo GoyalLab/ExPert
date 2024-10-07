@@ -2,6 +2,7 @@ from scipy.stats import median_abs_deviation
 import scanpy as sc
 import numpy as np
 import logging
+import scipy.sparse as sp
 
 
 # credit to https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
@@ -73,7 +74,11 @@ def prepare_dataset(adata, name='Unknown', qc=True, norm=True, log=True, scale=T
         ds = adata.copy()
         sc.pp.normalize_total(ds)
         sc.pp.log1p(ds)
-        sc.pp.highly_variable_genes(ds, n_top_genes=n_hvg, subset=subset)
+        if not sp.issparse(ds.X):
+            ds.X = sp.csr_matrix(ds.X)
+        # use batches if possible
+        batch_key = 'batch' if 'batch' in ds.obs.columns else None
+        sc.pp.highly_variable_genes(ds, n_top_genes=n_hvg, subset=subset, batch_key=batch_key)
         adata.var['highly_variable'] = ds.var['highly_variable']
     else:
         sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset)
