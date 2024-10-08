@@ -27,7 +27,8 @@ def load_configs(default_config="config/config.yaml"):
 config = load_configs()
 
 # get basic parameters
-DATA = config.get('data', 'resources/datasets/data')
+DATA = config.get('data', 'resources/datasets/data/processed')
+CACHE_DIR = config.get('cache_dir', 'resources/datasets/data/raw')
 LOG = config.get('log', 'logs')
 # List of datasets to process
 DATASETS = config['datasets']
@@ -64,7 +65,7 @@ do_umap = config.get('do_umap', True)                       # Calculate UMAP for
 
 ## START OF PIPELINE
 
-# define pipeline output, i.e. merged dataset
+# define pipeline output, i.e. merged dataset and common gene pool
 rule all:
     input:
         HVG_POOL,
@@ -73,7 +74,8 @@ rule all:
 # 1. Download and preprocess each dataset
 rule process_dataset:
     output:
-        os.path.join(DATA, "{dataset}.h5ad")
+        raw = os.path.join(CACHE_DIR, "{dataset}.h5ad"),
+        processed = os.path.join(DATA, "{dataset}.h5ad")
     log:
         os.path.join(LOG, 'processing', "{dataset}.log")
     params:
