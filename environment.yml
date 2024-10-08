@@ -1,4 +1,4 @@
-name: ExPert
+name: harmonize
 channels:
   - bioconda
   - conda-forge
@@ -274,6 +274,7 @@ dependencies:
   - s3transfer=0.10.2=pyhd8ed1ab_0.conda
   - scanpy=1.10.3=pyhd8ed1ab_0.conda
   - scikit-learn=1.5.2=py310h27f47ee_1.conda
+  - scikit-misc=0.1.4=py310h3254323_4
   - scipy=1.14.1=py310ha3fb0e1_0.conda
   - scvi-tools=1.2.0=pyhd8ed1ab_0.conda
   - seaborn=0.13.2=hd8ed1ab_2.conda

@@ -143,7 +143,7 @@ def estimate_RAM(ds, n, method='skip', round=True, factor=10, min_mem=20, device
 def get_partition(ram=100, use_gpu=False):
     if use_gpu:
         return 'genomics-gpu'
-    if ram > 200:
+    if ram > 240:
         return 'genomics-himem'
     else:
         return 'genomics'

@@ -2,6 +2,7 @@ from scipy.stats import median_abs_deviation
 import scanpy as sc
 import numpy as np
 import logging
+from scipy import sparse
 import scipy.sparse as sp
 
 
@@ -46,6 +47,27 @@ def quality_control_filter(adata, percent_threshold=20, nmads=5, mt_nmads=3, mt_
     return adata
 
 
+def memory_check(ds, max_mem=30):
+    # check size allocated by object after log-transform, convert to float16 if necessary
+    num_elements = ds.X.shape[0] * ds.X.shape[1] if not sparse.issparse(ds.X) else ds.X.nnz
+    mem_float32 = num_elements * np.dtype('float32').itemsize
+    # Set maximum memory threshold
+    memory_threshold = max_mem * 1024 ** 3
+
+    # Decide on dtype based on memory requirements
+    if mem_float32 <= memory_threshold:
+        target_dtype = np.float32
+    else:
+        target_dtype = np.float16
+
+    logging.info(f"Converted ds.X to {target_dtype} based on memory requirements.")
+    # Convert ds.X to the decided dtype and make sure it's sparse
+    if not sparse.issparse(ds.X):
+        ds.X = sparse.csr_matrix(ds.X, dtype=target_dtype)
+    else:
+        ds.X = ds.X.astype(target_dtype)
+
+
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
 def prepare_dataset(adata, name='Unknown', qc=True, norm=True, log=True, scale=True, n_hvg=2000, subset=False):
     # apply quality control measures
@@ -70,17 +92,11 @@ def prepare_dataset(adata, name='Unknown', qc=True, norm=True, log=True, scale=T
     # Calculate highly variable genes
     logging.info(f'Determining highly variable genes for dataset {name}')
     if not log:
-        # Don't update the initial data, but base gene filtering on preprocessed data
-        ds = adata.copy()
-        sc.pp.normalize_total(ds)
-        sc.pp.log1p(ds)
-        if not sp.issparse(ds.X):
-            ds.X = sp.csr_matrix(ds.X)
-        # use batches if possible
-        batch_key = 'batch' if 'batch' in ds.obs.columns else None
-        sc.pp.highly_variable_genes(ds, n_top_genes=n_hvg, subset=subset, batch_key=batch_key)
-        adata.var['highly_variable'] = ds.var['highly_variable']
+        # Use seurat_v3 for raw counts
+        logging.info(f'Using flavor "seurat_v3" when determining hvgs for raw counts')
+        sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset, flavor='seurat_v3')
     else:
+        # Use default options for normalized counts
         sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset)
     if scale:
         logging.info(f'Scaling and centering {name}')
