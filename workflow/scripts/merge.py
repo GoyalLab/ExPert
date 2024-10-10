@@ -2,33 +2,19 @@ import logging
 
 import pandas as pd
 
-from src.harmonize import harmonize
-from src.utils import setup_logger, make_obs_names_unique
+from src.utils import setup_logger
+from src.merge import collapse_obs, merge
 
 
-def get_hvg_pool(files, agg='mean'):
-    pool = None
-    # for each csv file, update the total mapping of highly variable genes
-    for file in files:
-        hvg = pd.read_csv(file, index_col=0)
-        if pool is None:
-            pool = hvg
-        else:
-            pool = pd.concat([pool, hvg], axis=1)
-    # clean up duplicate values
-    pool = make_obs_names_unique(pool, agg=agg)
-    logging.info(f'HVG pool shape: {pool.shape[0]} genes, {pool.shape[1]} var columns')
-    return pool
 
-
-def merge_datasets(dataset_files, hvg_files, merged_set_output, pool_output, method='harmony', hvg=True, zero_pad=True, cores=-1, plot=True, do_umap=True, do_tsne=False):
-    # collect pool of highly variable genes over all datasets
-    pool = get_hvg_pool(hvg_files)
-    pool.to_csv(pool_output)
-    # read all preprocessed datasets, combine, and correct for batch effects
-    merged = harmonize(dataset_files, pool, method=method, hvg=hvg, zero_pad=zero_pad, cores=cores, plot=plot, do_umap=do_umap, do_tsne=do_tsne)
-    # write final dataset to file
-    merged.write_h5ad(merged_set_output)
+def merge_datasets(dataset_files, merged_set_output, obs_files, pool_file, merge_method='on_disk'):
+    # read pool
+    pool = pd.read_csv(pool_file, index_col=0)
+    # collect all .obs data from the datasets
+    obs = collapse_obs(obs_files)
+    logging.info(f'Prepared meta-set for merge with: {obs.shape[0]} cells, {pool.shape[0]} genes')
+    # merge datasets and write to file
+    merge(dataset_files, merged_set_output, obs=obs, var=pool, method=merge_method)
 
 
 if __name__ == "__main__":
@@ -39,16 +25,10 @@ if __name__ == "__main__":
     try:
         merge_datasets(
             dataset_files=snakemake.input.dataset_files,
-            hvg_files=snakemake.input.hvg_files,
+            pool_file=snakemake.input.pool,
+            obs_files=snakemake.input.obs_files,
             merged_set_output=snakemake.output.merged_set,
-            pool_output=snakemake.output.pool,
-            method=snakemake.params.method,
-            hvg=snakemake.params.hvg,
-            zero_pad=snakemake.params.zero_pad,
-            cores=snakemake.params.cores,
-            plot=snakemake.params.plot,
-            do_umap=snakemake.params.do_umap,
-            do_tsne=snakemake.params.do_tsne
+            merge_method=snakemake.params.merge_method
         )
     except NameError:
         print("This script is meant to be run through Snakemake.")

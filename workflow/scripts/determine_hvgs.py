@@ -3,7 +3,7 @@ import anndata as ad
 
 def hvg_pool(dataset_file, output_file):
     if dataset_file.endswith('.h5ad'):
-        adata = ad.read(dataset_file)
+        adata = ad.read(dataset_file, backed='r')
         # save hvg gene info
         adata[:, adata.var.highly_variable].var.to_csv(output_file, index=True)
     else:

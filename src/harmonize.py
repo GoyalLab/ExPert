@@ -11,6 +11,8 @@ import scipy.sparse as sp
 from MulticoreTSNE import MulticoreTSNE as tsne
 import scvi
 import torch
+import dask.array as da
+from pathlib import Path
 
 
 def _pca_reconstruction(adata, n_comps=50, pca_key='X_pca'):
@@ -112,8 +114,8 @@ def _read_datasets(data_files, pool, hvg_filter=True, zero_pad=True):
     for file in data_files:
         if file.endswith('.h5ad'):
             logging.info('Reading {}'.format(file))
-            name = ''.join(os.path.basename(file).split('.')[:-1])
-            adata = ad.read(file)
+            name = Path(file).stem
+            adata = sc.read(file)
             # make cell barcodes unique to dataset
             adata.obs_names = adata.obs_names + ';' + name
             # apply hvg pool and zero-pad filters to dataset
@@ -193,14 +195,38 @@ def _tsne(adata, pca_key='X_pca', obs_key='X_tsne', cores=1):
     logging.info('Finished tSNE')
 
 
+def _read_dataset(file):
+    logging.info(f'Reading {file}...')
+    d = sc.read(file)
+    logging.info(f'Finished reading {file}')
+    return d
+
+
+def harmonize_metaset(metaset_file, method='skip'):
+    metaset = _read_dataset(metaset_file)
+    pca_key = 'X_pca'
+    if method != 'skip':
+        _pca(metaset)
+        # normalize expression based on merged dataset
+        if method == 'scANVI':
+            pca_key = 'X_scANVI'
+            _scANVI(metaset)
+        elif method == 'harmonypy':
+            pca_key = 'X_pca_harmony'
+            _harmony(metaset)
+    metaset.uns['pca_key'] = pca_key
+    return metaset
+        
+
 def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, cores=1, plot=False, do_umap=False, do_tsne=False):
     # read datasets to one dict
     ds_dict = _read_datasets(data_files, hvg_pool.index, hvg_filter=hvg, zero_pad=zero_pad)
-    # extract names and according AnnDatas
-    ds_keys, ds_list = [*ds_dict.keys()], [*ds_dict.values()]
+    # set PCA key
     pca_key = 'X_pca'
-
+    # method selection
     if method != 'skip':
+        # extract names and according AnnDatas
+        ds_keys, ds_list = [*ds_dict.keys()], [*ds_dict.values()]
         # reduce datasets to common genes
         ds_list = reduce_to_common_genes(ds_list)
         # apply batch effect normalization over different datasets and adjust original counts
@@ -218,12 +244,12 @@ def harmonize(data_files, hvg_pool, method='skip', hvg=True, zero_pad=True, core
             _harmony(merged)
     else:
         # collapse to a merged AnnData object
-        merged = merge_datasets_dict(ds_dict)
-        _pca(merged)
+        merged = merge_datasets_dask(ds_dict)
     # add summarized var data (highly variable gene information)
     # merged.var = pd.concat([merged.var, hvg_pool], axis=1, join='inner')
     logging.info(f'Resulting metaset spans: {merged.shape[0]} combined cells and {merged.shape[1]} common genes')
     if plot:
+        _pca(merged)
         # calculate neighbors
         _neighbors(merged, pca_key=pca_key)
         if do_tsne:

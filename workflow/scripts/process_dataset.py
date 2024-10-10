@@ -1,16 +1,19 @@
-from src.utils import get_dataset, setup_logger
-from src.preprocess import prepare_dataset
+from src.utils import setup_logger
+from src.preprocess import preprocess_dataset
 import logging
+import scanpy as sc
+from pathlib import Path
 
 
-def process_dataset(dataset_link, dataset_name, raw_output_path, output_path, cache=True, qc=True, norm=True, log=True, scale=True, n_hvg=2000, subset=False):
-    # download/cache dataset
-    logging.info(f"Downloading/caching dataset {dataset_name}")
-    ds = get_dataset(dataset_link, dataset_name, raw_output_path, cache)
+def process_dataset(dataset_file, output_path, qc=True, norm=True, log=True, scale=True, n_hvg=2000, subset=False):
+    # read dataset from downloaded file
+    ds = sc.read(dataset_file)
+    # get dataset_file name
+    ds_name = Path(dataset_file).stem
     # prepare dataset
-    logging.info(f"Preparing dataset {dataset_name}")
-    ds = prepare_dataset(ds, dataset_name, qc=qc, norm=norm, log=log, scale=scale, n_hvg=n_hvg, subset=subset)
-    logging.info(f"Finished preparing dataset {dataset_name}")
+    logging.info(f"Preparing dataset {ds_name}")
+    ds = preprocess_dataset(ds, ds_name, qc=qc, norm=norm, log=log, scale=scale, n_hvg=n_hvg, subset=subset)
+    logging.info(f"Finished preparing dataset {ds_name}")
     ds.write_h5ad(output_path)
 
 
@@ -21,16 +24,14 @@ if __name__ == "__main__":
     # execute dataset preparation
     try:
         process_dataset(
-            dataset_link=snakemake.params.url,
-            dataset_name=snakemake.params.name,
-            raw_output_path=snakemake.output.raw,
+            dataset_file=snakemake.input.dataset_file,
             output_path=snakemake.output.processed,
-            cache=snakemake.params.cache,
             qc=snakemake.params.qc,
             norm=snakemake.params.norm,
             log=snakemake.params.log_norm,
             scale=snakemake.params.scale,
-            n_hvg=snakemake.params.n_hvg
+            n_hvg=snakemake.params.n_hvg,
+            subset=snakemake.params.subset
         )
     except NameError:
         print("This script is meant to be run through Snakemake.")

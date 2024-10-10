@@ -4,6 +4,7 @@ from tqdm import tqdm
 import logging
 import pandas as pd
 import numpy as np
+import os
 
 
 def setup_logger(log_file):
@@ -40,29 +41,30 @@ def get_file_size(url, verbose=False):
         return f"Error: {e}"
 
 
-def download_file(url, output_path):
-    try:
-        # Send a GET request to download the file
-        response = requests.get(url, stream=True)
-        response.raise_for_status()  # Check for errors
+def download_file(url, output_path, cache=True) -> str:
+    if not os.path.exists(output_path) or not cache:
+        try:
+            # Send a GET request to download the file
+            response = requests.get(url, stream=True)
+            response.raise_for_status()  # Check for errors
 
-        # Get the total file size from the response headers (in bytes)
-        total_size_in_bytes = int(response.headers.get('content-length', 0))
+            # Get the total file size from the response headers (in bytes)
+            total_size_in_bytes = int(response.headers.get('content-length', 0))
 
-        # Initialize the progress bar with the total file size
-        progress_bar = tqdm(total=total_size_in_bytes, unit='B', unit_scale=True, desc=output_path)
+            # Initialize the progress bar with the total file size
+            progress_bar = tqdm(total=total_size_in_bytes, unit='B', unit_scale=True, desc=output_path)
 
-        # Write the file to the output path in chunks
-        with open(output_path, 'wb') as file:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    file.write(chunk)
-                    progress_bar.update(len(chunk))  # Update the progress bar
-        progress_bar.close()
+            # Write the file to the output path in chunks
+            with open(output_path, 'wb') as file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        file.write(chunk)
+                        progress_bar.update(len(chunk))  # Update the progress bar
+            progress_bar.close()
 
-        print(f"Downloaded successfully: {output_path}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading file: {e}")
+            return f"Successfully downloaded file: {output_path}"
+        except requests.exceptions.RequestException as e:
+            return f"Error downloading file: {e}"
 
 
 def get_dataset(url, dataset_name, output_path, cache=True):

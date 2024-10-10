@@ -15,7 +15,9 @@ def is_outlier(adata, metric: str, nmads: int):
     return outlier
 
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
-def quality_control_filter(adata, percent_threshold=20, nmads=5, mt_nmads=3, mt_per=8):
+# mt_nmads: Increased NMADS for mitochondrial counts
+# mt_per: Maximum percentage of mitochondrial counts is increased to up to 20% to account for variablity in cancer cell lines
+def quality_control_filter(adata, percent_threshold=20, nmads=5, mt_nmads=5, mt_per=20):
     # ensure unique variable names
     adata.var_names_make_unique()
     # mitochondrial genes
@@ -43,11 +45,11 @@ def quality_control_filter(adata, percent_threshold=20, nmads=5, mt_nmads=3, mt_
     # remove outliers
     logging.info(f'Total number of cells: {adata.n_obs}')
     adata = adata[(~adata.obs.outlier) & (~adata.obs.mt_outlier)]
-    logging.info(f'Number of cells after filtering of low quality cells: {adata.n_obs}')
+    logging.info(f'Number of cells after filtering for low quality cells: {adata.n_obs}')
     return adata
 
 
-def memory_check(ds, max_mem=30):
+def _memory_check(ds, max_mem=30):
     # check size allocated by object after log-transform, convert to float16 if necessary
     num_elements = ds.X.shape[0] * ds.X.shape[1] if not sparse.issparse(ds.X) else ds.X.nnz
     mem_float32 = num_elements * np.dtype('float32').itemsize
@@ -60,7 +62,7 @@ def memory_check(ds, max_mem=30):
     else:
         target_dtype = np.float16
 
-    logging.info(f"Converted ds.X to {target_dtype} based on memory requirements.")
+    logging.info(f"Converted ds.X to {target_dtype} based on memory requirements. (max. Mem: {max_mem}GB)")
     # Convert ds.X to the decided dtype and make sure it's sparse
     if not sparse.issparse(ds.X):
         ds.X = sparse.csr_matrix(ds.X, dtype=target_dtype)
@@ -69,7 +71,7 @@ def memory_check(ds, max_mem=30):
 
 
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
-def prepare_dataset(adata, name='Unknown', qc=True, norm=True, log=True, scale=True, n_hvg=2000, subset=False):
+def preprocess_dataset(adata, name='Unknown', qc=True, norm=True, log=True, scale=True, n_hvg=2000, subset=False, min_genes=10000):
     # apply quality control measures
     if qc:
         logging.info(f'Quality control for dataset {name}')
@@ -90,14 +92,18 @@ def prepare_dataset(adata, name='Unknown', qc=True, norm=True, log=True, scale=T
         n_hvg = int(adata.n_vars * n_hvg)
         logging.info(f'Number of highly variable genes to use: {n_hvg} ({perc}* {adata.n_vars})')
     # Calculate highly variable genes
-    logging.info(f'Determining highly variable genes for dataset {name}')
-    if not log:
-        # Use seurat_v3 for raw counts
-        logging.info(f'Using flavor "seurat_v3" when determining hvgs for raw counts')
-        sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset, flavor='seurat_v3')
+    if adata.n_vars <= min_genes:
+        logging.info(f'Selecting all genes for dataset {name}, because of low gene number: {adata.n_vars}')
+        adata.var['highly_variable'] = True
     else:
-        # Use default options for normalized counts
-        sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset)
+        logging.info(f'Determining highly variable genes for dataset {name}')
+        if not log:
+            # Use seurat_v3 for raw counts
+            logging.info(f'Using flavor "seurat_v3" when determining hvgs for raw counts')
+            sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset, flavor='seurat_v3')
+        else:
+            # Use default options for normalized counts
+            sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset)
     if scale:
         logging.info(f'Scaling and centering {name}')
         sc.pp.scale(adata)
