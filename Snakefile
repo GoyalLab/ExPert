@@ -68,7 +68,7 @@ scale = config.get('scale', False)                      # Center and scale each 
 plot = config.get('plot', True)                         # Whether to run plotting options such as tSNE or UMAP, if true, UMAP is default (can be plotted with final object using sc.pl.*)
 do_tsne = config.get('do_tsne', False)                      # Calculate tSNE for merged dataset (can take some time)
 do_umap = config.get('do_umap', True)                       # Calculate UMAP for merged dataset
-merge_method = config.get('merge_method', 'on_disk')    # How to merge datasets into meta-set
+merge_method = config.get('merge_method', 'dask')    # How to merge datasets into meta-set
 
 
 ## START OF PIPELINE

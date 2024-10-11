@@ -1,7 +1,7 @@
 import logging
 
 import pandas as pd
-import os
+import scipy.sparse as sp
 import anndata as ad
 from pathlib import Path
 import numpy as np
@@ -17,12 +17,19 @@ def _filter(d, dataset_name, hvg_pool, zero_pad=True):
     missing_hvgs = set(hvg_pool) - set(matching_hvgs)
     if zero_pad and len(missing_hvgs) > 0:
         logging.info(f'{len(missing_hvgs)} hvgs missing from pool; padding with zero values')
-        # build zero matrix for missing genes
-        zero_matrix = np.zeros((d.n_obs, len(missing_hvgs)))
-        # define AnnData for missing genes
-        ds_zeros = ad.AnnData(X=zero_matrix, var=pd.DataFrame(index=list(missing_hvgs)), obs=d.obs)
-        # merge original and zero AnnData, keep original meta data for samples
-        d = ad.concat([d, ds_zeros], axis=1, merge='first')
+        # build empty matrix for padded matrix
+        zero_matrix = sp.csc_matrix((d.n_obs, len(missing_hvgs)), dtype=np.float32)
+        # stack matrices horizontally
+        logging.debug(f'Adding sparse 0-pad to .X ({d.n_obs}, {len(missing_hvgs)})')
+        X = sp.hstack((d.X, zero_matrix))
+        # define proper gene assignments, missing genes is unordered, but does not matter (all are 0)
+        gene_list = matching_hvgs + missing_hvgs
+        # build final AnnData object
+        logging.debug('Updating padded AnnData')
+        d = sc.AnnData(X=X, obs=d.obs, var=pd.DataFrame(index=list(gene_list)))
+        logging.debug('Ordering genes in padded AnnData')
+        # ensure .var is ordered in the correct way after merge
+        d = d[:, hvg_pool]
     else:
         logging.info(f'{len(missing_hvgs)} hvgs lost from pool')
     return d
@@ -36,11 +43,11 @@ def prepare_merge(input_pth, pool_genes, out, hvg=True, zero_pad=True):
         # make cell barcodes unique to dataset
         adata.obs_names = adata.obs_names + ';' + name
         adata.obs['dataset'] = name
-        # subset to precalculated gene pool
+        # subset to pre-calculated gene pool
         if hvg:
             adata = _filter(adata, name, pool_genes, zero_pad=zero_pad)
         # save prepared adata
-        adata.write_h5ad(out)
+        adata.write_h5ad(out, compression='gzip')
         return adata.obs
     else:
         raise FileNotFoundError('File has to be .h5ad format')

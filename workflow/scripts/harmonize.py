@@ -1,5 +1,3 @@
-import logging
-import scanpy as sc
 
 from src.utils import setup_logger
 from src.harmonize import harmonize_metaset
@@ -7,8 +5,7 @@ from src.harmonize import harmonize_metaset
 
 
 def harmonize(metaset_path, merged_set_output, method='scANVI'):
-    harmonized = harmonize_metaset(metaset_path, method=method)
-    harmonized.write_h5ad(merged_set_output, compression='gzip')
+    harmonize_metaset(metaset_path, method=method).write_h5ad(merged_set_output, compression='gzip')
 
 
 if __name__ == "__main__":

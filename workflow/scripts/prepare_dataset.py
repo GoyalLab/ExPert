@@ -6,7 +6,7 @@ from src.prepare import prepare_merge
 
 def prepare_dataset(dataset_file, pool_file, prepared_path, obs_path, hvg=True, zero_pad=True):
     # read gene pool
-    pool = pd.read_csv(pool_file)
+    pool = pd.read_csv(pool_file, index_col=0)
     # subset dataset, make obs names unique, and save obs to file
     obs = prepare_merge(dataset_file, pool.index, prepared_path, hvg=hvg, zero_pad=zero_pad)
     obs.to_csv(obs_path)

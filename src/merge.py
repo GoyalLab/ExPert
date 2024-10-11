@@ -4,6 +4,8 @@ import logging
 import anndata as ad
 import pandas as pd
 from pathlib import Path
+import numpy as np
+import dask.array as da
 
 
 def merge_methods():
@@ -62,7 +64,7 @@ def _on_disk(input_pths, out_pth, obs, var, key='dataset'):
 
     sc.AnnData(X=X, obs=obs, var=var).write_h5ad(out_pth, compression='gzip')
     # keep track of index batches to insert into
-    idx_map = obs[key].value_counts()
+    idx_map = obs[key].value_counts().sort_index()
     # open empty meta-set and keep updating .X
     try:
         meta_set = sc.read(out_pth, backed='r+')
@@ -71,26 +73,44 @@ def _on_disk(input_pths, out_pth, obs, var, key='dataset'):
         for idx, file in enumerate(input_pths):
             logging.info(f'Inserting {file} into meta-set')
             # get target slice of meta set .X
-            end_idx = idx_map.iloc[idx]
+            end_idx = start + idx_map.iloc[idx]
             logging.debug(f'Target slice : {start}:{end_idx}')
             # read dataset
+            logging.debug(f'Reading : {file}')
             ds = sc.read(file)
             # define update data
+            logging.debug('Building update slice')
             new_data = ds.X.tocoo()
             row_idx = new_data.row + start
             new_data = sp.csr_matrix((new_data.data, (row_idx, new_data.col)), shape=meta_set.X.shape)
             # update slice
+            logging.debug(f'Updating slice : {start}:{end_idx}')
             meta_set.X = meta_set.X.to_memory() + new_data
             # write changes to disk
+            logging.debug('Writing updated .X')
             meta_set.write()
             # update next insert location
             start = end_idx
+            logging.info(f'Updated {np.round(end_idx/obs.shape[0]*100, 2)}% of meta-set .X matrix')
     finally:
         meta_set.file.close()
 
 
-def merge(input_pths, out_pth, obs, var, method='on_disk'):
-    if method=='on_disk':
+def _dask_vstack(input_pths, out_pth, obs, var):
+    X = []
+    for file in input_pths:
+        logging.info(f'Adding {file} .X to meta-set')
+        X.append(da.from_array(sc.read(file).X))
+    logging.info('Stacking .X matrices')
+    X = da.vstack(X)
+    logging.info(f'Creating AnnData and saving to {out_pth}')
+    sc.AnnData(X=X, obs=obs, var=var).write_h5ad(out_pth)
+
+
+def merge(input_pths, out_pth, obs, var, method='dask'):
+    if method == 'dask':
+        _dask_vstack(input_pths, out_pth, obs=obs, var=var)
+    elif method=='on_disk':
         _on_disk(input_pths, out_pth, obs=obs, var=var)
     elif method=='in_memory':
         _in_memory(input_pths, out_pth)

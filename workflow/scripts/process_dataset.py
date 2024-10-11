@@ -11,10 +11,10 @@ def process_dataset(dataset_file, output_path, qc=True, norm=True, log=True, sca
     # get dataset_file name
     ds_name = Path(dataset_file).stem
     # prepare dataset
-    logging.info(f"Preparing dataset {ds_name}")
+    logging.info(f"Pre-processing dataset {ds_name}")
     ds = preprocess_dataset(ds, ds_name, qc=qc, norm=norm, log=log, scale=scale, n_hvg=n_hvg, subset=subset)
-    logging.info(f"Finished preparing dataset {ds_name}")
-    ds.write_h5ad(output_path)
+    logging.info(f"Finished pre-processing dataset {ds_name}")
+    ds.write_h5ad(output_path, compression='gzip')
 
 
 if __name__ == "__main__":
