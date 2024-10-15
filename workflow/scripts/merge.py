@@ -15,7 +15,6 @@ def check_files(fs1, fs2):
     assert get_basenames(fs1) == get_basenames(fs2)
 
 
-
 def merge_datasets(dataset_files, merged_set_output, obs_files, pool_file, merge_method='dask'):
     # ensure order of datasets of insertion and .obs is the same
     dataset_files = sorted(dataset_files)

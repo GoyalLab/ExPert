@@ -96,20 +96,31 @@ def _on_disk(input_pths, out_pth, obs, var, key='dataset'):
         meta_set.file.close()
 
 
-def _dask_vstack(input_pths, out_pth, obs, var):
+def _dask_vstack(input_pths, obs, var):
     X = []
     for file in input_pths:
         logging.info(f'Adding {file} .X to meta-set')
         X.append(da.from_array(sc.read(file).X))
     logging.info('Stacking .X matrices')
     X = da.vstack(X)
-    logging.info(f'Creating AnnData and saving to {out_pth}')
-    sc.AnnData(X=X, obs=obs, var=var).write_h5ad(out_pth)
+    return sc.AnnData(X=X, obs=obs, var=var)
+
+
+def _umap(adata):
+    logging.info('Computing PCA for metaset')
+    sc.pp.pca(adata, chunked=True, chunk_size=6000)
+    logging.info('Computing neighbors')
+    sc.pp.neighbors(adata)
+    logging.info('Computing UMAP')
+    sc.tl.umap(adata)
 
 
 def merge(input_pths, out_pth, obs, var, method='dask'):
     if method == 'dask':
-        _dask_vstack(input_pths, out_pth, obs=obs, var=var)
+        metaset = _dask_vstack(input_pths, obs=obs, var=var)
+        # _umap(metaset)
+        logging.info(f'Saving metaset AnnData to {out_pth}')
+        metaset.write_h5ad(out_pth, compression='gzip')
     elif method=='on_disk':
         _on_disk(input_pths, out_pth, obs=obs, var=var)
     elif method=='in_memory':
