@@ -117,6 +117,8 @@ rule process_dataset:
 rule determine_hvg:
     input:
         os.path.join(PROCESS_DIR, "{dataset}.h5ad")
+    params:
+        hvg = hvg
     output:
         os.path.join(HVG_DIR, "{dataset}_hvgs.csv")
     script:
@@ -146,7 +148,6 @@ rule prepare_datasets:
     log:
         os.path.join(LOG, 'prepare', "{dataset}.log")
     params:
-        hvg=hvg,
         zero_pad=zero_padding
     script:
         "workflow/scripts/prepare_dataset.py"
@@ -161,7 +162,8 @@ rule merge_datasets:
     log:
         os.path.join(LOG, "merge.log")
     params:
-        merge_method = merge_method
+        merge_method = merge_method,
+        umap = do_umap
     output:
         merged_set = MERGED_OUTPUT_FILE
     script:
@@ -177,6 +179,7 @@ rule harmonize:
     output:
         harmonized = HARMONIZED_OUTPUT_FILE
     params:
-        method = correction_method
+        method = correction_method,
+        umap = do_umap
     script:
         "workflow/scripts/harmonize.py"
