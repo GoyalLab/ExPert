@@ -5,6 +5,8 @@ import logging
 import pandas as pd
 import numpy as np
 import os
+import anndata as ad
+import scipy.sparse as sp
 
 
 def setup_logger(log_file):
@@ -208,3 +210,19 @@ def create_sbatch_script(base_conf, ds, conda_env='harmonize', script='main_ques
         f.write(f'snakemake --cores {ds.shape[0]} --verbose --configfile "{config_path}" --config log="$LOG"\n')
         f.write('echo "Finished pipeline"\n')
         f.write('conda deactivate\n')
+
+
+def _is_sparse(f):
+    # Check if the matrix is sparse or not
+    adata = sc.read_h5ad(f, backed='r')
+    is_sparse = isinstance(adata.X, (ad._core.sparse_dataset.CSCDataset, ad._core.sparse_dataset.CSRDataset))
+    # Close the file to free resources if needed
+    adata.file.close()
+    return is_sparse
+
+def read_ad(f):
+    kws = {}
+    if not _is_sparse(f):
+        logging.info('Converting dense .X matrix to sparse.csc_matrix')
+        kws = {'as_sparse':['X'], 'as_sparse_fmt':sp.csc_matrix}
+    return sc.read_h5ad(f, **kws)

@@ -106,19 +106,29 @@ def _dask_vstack(input_pths, obs, var):
     return sc.AnnData(X=X, obs=obs, var=var)
 
 
-def _umap(adata):
+def _pca_dask(adata, dense_chunk_size=10_000):
     logging.info('Computing PCA for metaset')
-    sc.pp.pca(adata, chunked=True, chunk_size=6000)
+    adata.layers["dense"] = adata.X.rechunk((dense_chunk_size, -1)).map_blocks(
+        lambda x: x.toarray(), dtype=adata.X.dtype, meta=np.array([])
+    )
+    sc.pp.pca(adata, layer='dense')
+    logging.debug('Computing last step of PCA')
+    adata.obsm["X_pca"] = adata.obsm["X_pca"].compute()
     logging.info('Computing neighbors')
     sc.pp.neighbors(adata)
+
+
+def _umap(adata):
     logging.info('Computing UMAP')
     sc.tl.umap(adata)
 
 
-def merge(input_pths, out_pth, obs, var, method='dask'):
+def merge(input_pths, out_pth, obs, var, method='dask', do_umap=True):
     if method == 'dask':
         metaset = _dask_vstack(input_pths, obs=obs, var=var)
-        # _umap(metaset)
+        if do_umap:
+            _pca_dask(metaset)
+            _umap(metaset)
         logging.info(f'Saving metaset AnnData to {out_pth}')
         metaset.write_h5ad(out_pth, compression='gzip')
     elif method=='on_disk':

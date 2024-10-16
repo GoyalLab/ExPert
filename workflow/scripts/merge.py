@@ -15,7 +15,7 @@ def check_files(fs1, fs2):
     assert get_basenames(fs1) == get_basenames(fs2)
 
 
-def merge_datasets(dataset_files, merged_set_output, obs_files, pool_file, merge_method='dask'):
+def merge_datasets(dataset_files, merged_set_output, obs_files, pool_file, merge_method='dask', do_umap=True):
     # ensure order of datasets of insertion and .obs is the same
     dataset_files = sorted(dataset_files)
     obs_files = sorted(obs_files)
@@ -28,7 +28,7 @@ def merge_datasets(dataset_files, merged_set_output, obs_files, pool_file, merge
     var = pd.DataFrame(index=list(pool.index))
     logging.info(f'Prepared meta-set for merge with: {obs.shape[0]} cells, {pool.shape[0]} genes')
     # merge datasets and write to file
-    merge(dataset_files, merged_set_output, obs=obs, var=var, method=merge_method)
+    merge(dataset_files, merged_set_output, obs=obs, var=var, method=merge_method, do_umap=do_umap)
 
 
 if __name__ == "__main__":
@@ -42,7 +42,8 @@ if __name__ == "__main__":
             pool_file=snakemake.input.pool,
             obs_files=snakemake.input.obs_files,
             merged_set_output=snakemake.output.merged_set,
-            merge_method=snakemake.params.merge_method
+            merge_method=snakemake.params.merge_method,
+            do_umap=snakemake.params.umap
         )
     except NameError:
         print("This script is meant to be run through Snakemake.")

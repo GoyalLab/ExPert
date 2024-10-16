@@ -136,6 +136,9 @@ def requires_raw_data():
 def requires_processed_data():
     return ['scanorama', 'harmonypy']
 
+def requires_gpu():
+    return ['scANVI']
+
 def check_method(m, conf):
     methods = correction_methods()
     if m not in methods:
@@ -149,6 +152,9 @@ def check_method(m, conf):
         logging.info(f'Method {m} requires preprocessed data, setting preprocess to include normalization and log1p')
         conf['norm'] = True
         conf['log_norm'] = True
+    if m in requires_gpu():
+        if not torch.cuda.is_available():
+            raise SystemError('scANVI requires GPU to effectively harmonize.')
 
 
 def reduce_to_common_genes(ds_list):
@@ -202,7 +208,7 @@ def _read_dataset(file):
     return d
 
 
-def harmonize_metaset(metaset_file, method='skip'):
+def harmonize_metaset(metaset_file, method='skip', umap=True):
     metaset = _read_dataset(metaset_file)
     pca_key = 'X_pca'
     if method != 'skip':
@@ -215,6 +221,10 @@ def harmonize_metaset(metaset_file, method='skip'):
             pca_key = 'X_pca_harmony'
             _harmony(metaset)
     metaset.uns['pca_key'] = pca_key
+    # Pre-calculate UMAP for easier plotting
+    if umap:
+        _neighbors(metaset, pca_key=pca_key)
+        _umap(metaset)
     return metaset
         
 
