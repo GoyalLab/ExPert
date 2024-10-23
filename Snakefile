@@ -170,8 +170,7 @@ rule merge_datasets:
     log:
         os.path.join(LOG, "merge.log")
     params:
-        merge_method = merge_method,
-        umap = do_umap
+        merge_method = merge_method
     output:
         merged_set = MERGED_OUTPUT_FILE
     script:

@@ -45,12 +45,14 @@ def _in_memory(input_pths, out_pth):
     _merge_datasets_dict(ds_dict).write_h5ad(out_pth, compression='gzip')
 
 
-def collapse_obs(obs_files, join='inner'):
+def collapse_obs(obs_files, join='inner', cell_key='celltype'):
     obs = None
     # read all .obs and combine them
     for file in obs_files:
         logging.info(f'Collecting .obs from {file}')
         ds_obs = pd.read_csv(file, index_col=0)
+        if cell_key not in ds_obs.columns:
+            ds_obs[cell_key] = ds_obs.get('cell_line', 'Unknown')
         if obs is None:
             obs = ds_obs
         else:
@@ -123,12 +125,9 @@ def _umap(adata):
     sc.tl.umap(adata)
 
 
-def merge(input_pths, out_pth, obs, var, method='dask', do_umap=True):
+def merge(input_pths, out_pth, obs, var, method='dask'):
     if method == 'dask':
         metaset = _dask_vstack(input_pths, obs=obs, var=var)
-        if do_umap:
-            _pca_dask(metaset)
-            _umap(metaset)
         logging.info(f'Saving metaset AnnData to {out_pth}')
         metaset.write_h5ad(out_pth, compression='gzip')
     elif method=='on_disk':
