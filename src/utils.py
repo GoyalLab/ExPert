@@ -12,9 +12,18 @@ import scipy.sparse as sp
 def setup_logger(log_file):
     logging.basicConfig(
         filename=log_file,
-        level=logging.DEBUG,
+        level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
+
+
+def log_decorator(func):
+    def wrapper(*args, **kwargs):
+        logging.info(f'Computing {func.__name__}')
+        result = func(*args, **kwargs)
+        logging.info(f'Finished {func.__name__}')
+        return result
+    return wrapper
 
 
 def convert_size(size_bytes: int) -> str:
