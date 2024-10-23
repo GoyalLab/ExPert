@@ -51,6 +51,9 @@ HVG_DIR = os.path.join(OUTPUT_DIR, 'hvg')
 HVG_POOL = os.path.join(OUTPUT_DIR, 'hvg_pool.csv')
 # obs outputs
 OBS_DIR = os.path.join(OUTPUT_DIR, 'obs')
+# model output
+MODEL_DIR = os.path.join(OUTPUT_DIR, 'scanvi')
+MODEL_FILE = os.path.join(MODEL_DIR, 'model.pt')
 
 ## PARAMETERS (or defaults)
 correction_method = config.get('correction_method', 'scANVI')
@@ -73,11 +76,16 @@ merge_method = config.get('merge_method', 'dask')    # How to merge datasets int
 
 ## START OF PIPELINE
 
-# define final pipeline endpoint, i.e. merged dataset or harmonized dataset
-OUTPUT_FILE = MERGED_OUTPUT_FILE if correction_method=='skip' else HARMONIZED_OUTPUT_FILE
+# define final pipeline endpoint, i.e. merged dataset or harmonized dataset, and other outputs
+OUTPUT_FILES = [MERGED_OUTPUT_FILE]
+if correction_method!='skip':
+    OUTPUT_FILES.append(HARMONIZED_OUTPUT_FILE)
+    if correction_method=='scANVI':
+        OUTPUT_FILES.append(MODEL_FILE)
+
 rule all:
     input:
-        OUTPUT_FILE
+        *OUTPUT_FILES
 
 
 # 1. Download each dataset
@@ -171,15 +179,22 @@ rule merge_datasets:
 
 
 # 7. Harmonize merged set
+
+# define output files of rule based on correction method
+HARMONIZED_OUTPUT_FILES = {'harmonized': HARMONIZED_OUTPUT_FILE}
+if correction_method == 'scANVI':
+    HARMONIZED_OUTPUT_FILES.update({'model_file': MODEL_FILE})
+
 rule harmonize:
     input:
         merged = MERGED_OUTPUT_FILE
     log:
         os.path.join(LOG, "harmonize.log")
     output:
-        harmonized = HARMONIZED_OUTPUT_FILE
+        **HARMONIZED_OUTPUT_FILES
     params:
         method = correction_method,
-        umap = do_umap
+        umap = do_umap,
+        model_dir = MODEL_DIR
     script:
         "workflow/scripts/harmonize.py"
