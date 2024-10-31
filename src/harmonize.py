@@ -15,7 +15,7 @@ import dask.array as da
 from pathlib import Path
 import warnings
 
-from typing import Literal
+from typing import List, Literal
 from collections.abc import Iterable as IterableClass
 from collections.abc import Sequence
 from anndata import AnnData
@@ -26,7 +26,7 @@ from scvi.distributions._utils import DistributionConcatenator
 from scvi.model._utils import _get_batch_code_from_category
 from scvi import REGISTRY_KEYS
 
-from src.utils import log_decorator
+from src.utils import log_decorator, log_memory_usage
 
 
 def _pca_reconstruction(adata, n_comps=50, pca_key='X_pca'):
@@ -73,7 +73,7 @@ def _train_scANVI(adata, model_dir='./scanvi'):
     scvi_model.train()
     logging.info('Finished training scANVI model')
     logging.info(f'Saving scANVI model in {model_dir}')
-    scvi_model.save(model_dir, overwrite=True)
+    scvi_model.save(model_dir, overwrite=True, save_anndata=False)
     # add trained latent space
     adata.obsm["X_scANVI"] = scvi_model.get_latent_representation()
     logging.info('Finished SCANVI training')
@@ -179,7 +179,7 @@ def normalize_expression(
 
 
 @log_decorator
-def _scANVI(adata, batch_key='dataset', labels_key='celltype', model_dir='./scanvi'):
+def _scANVI(adata: AnnData, batch_key: str = 'dataset', labels_key: str = 'celltype', model_dir: str = './scanvi') -> None:
     if adata.isbacked:
         logging.info('Loading .X into memory to train faster')
         adata.X = adata.X.to_memory()
@@ -194,7 +194,7 @@ def _scANVI(adata, batch_key='dataset', labels_key='celltype', model_dir='./scan
     # Initialize scvi adata, specify dataset and cell type
     scvi.model.SCVI.setup_anndata(adata, batch_key=batch_key, labels_key=labels_key)
     # train model or fall back to pre-calculated model
-    if 'model.pt' in os.listdir(model_dir):
+    if os.path.exists(os.path.join(model_dir, 'model.pt')):
         logging.info(f'Caching model from {model_dir}')
         model_scanvi = scvi.model.SCANVI.load(model_dir, adata=adata)
     else:
@@ -364,4 +364,82 @@ def harmonize_metaset(metaset_file, output_path, method='skip', umap=True, model
         _neighbors(metaset, key_added=method)
         _umap(metaset, neighbors_key=method)
     # save all changes to metaset
+    logging.info(f'Saving harmonized metaset to {output_path}')
     metaset.write_h5ad(output_path, compression='gzip')
+
+
+class Harmonizer:
+    """
+    Class to Harmonize a merged AnnData object
+    """
+    metaset: AnnData = None
+    method: str = 'scANVI'
+
+    _mem_log_dir: str = './'
+    _is_harmonized: bool = False
+    _harmonized_pca: str = None
+    _methods: List[str] = ['scANVI', 'scanorama', 'harmonypy', 'skip']
+
+
+    def __init__(self, metaset_file: str, method: str = None, mem_log_dir: str = None) -> None:
+        self._init_method(method)
+        self._init_dataset(metaset_file)
+        self._init_mem_log_dir(mem_log_dir)
+        
+
+    def _init_mem_log_dir(self, mem_log_dir: str) -> None:
+        if mem_log_dir:
+            os.makedirs(mem_log_dir, exist_ok=True)
+            self._mem_log_dir = mem_log_dir
+
+    def _init_method(self, m: str) -> None:
+        if m not in self._methods:
+            raise ValueError(f'Method has to be one of: {self._methods}')
+        self.method = m
+        self._harmonized_pca = f'X_{m}'
+
+    def _init_dataset(self, file: str) -> None:
+        self.metaset = _read_dataset(file)
+    
+    def _run_scANVI(self, dataset_key: str, cell_type_key: str, model_dir: str):
+        _scANVI(self.metaset, batch_key=dataset_key, labels_key=cell_type_key, model_dir=model_dir)
+    
+    @log_decorator
+    def harmonize(self, dataset_key: str = 'dataset', cell_type_key: str = 'celltype', model_dir:str = './', method: str = None):
+        # Update method if given
+        if method:
+            self.method = self._init_method(method)
+        # launch specific method
+        if self.method == 'scANVI':
+            self._run_scANVI(dataset_key, cell_type_key, model_dir)
+            self._is_harmonized = True
+        elif self.method == 'skip':
+            logging.info('No harmonization applied to registered metaset')
+
+    def _run_umap(self):
+        @log_memory_usage(self._mem_log_dir)
+        def monitor_umap():
+            _pca(self.metaset)
+            _neighbors(self.metaset)
+            _umap(self.metaset)
+        monitor_umap()
+
+    def calculate_harm_umap(self):
+        if self._is_harmonized:
+            self._run_umap()
+        else:
+            logging.info("Can't calculate harmonized UMAP on row data")
+    
+    def calculate_raw_umap(self):
+        if not self._is_harmonized:
+            self._run_umap()
+        else:
+            logging.info("Can't calculate raw UMAP on harmonized data")
+
+    def _save(self, *args, **kwargs):
+        self.metaset.write_h5ad(*args, **kwargs)
+
+    def save_normalized_adata(self, path: str, **kwargs):
+        if self._is_harmonized:
+            self._save(path, **kwargs)
+    
