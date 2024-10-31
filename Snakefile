@@ -1,6 +1,7 @@
 import os
 from src.harmonize import check_method
 from snakemake.io import load_configfile
+from src.utils import get_param_hash, save_config
 
 
 # Get the absolute path to the directory containing the Snakefile
@@ -33,27 +34,8 @@ LOG = config.get('log', 'logs')
 # List of datasets to process
 DATASETS = config['datasets']
 DATASET_NAMES = list(DATASETS.keys())
-print(f'Got {len(DATASET_NAMES)} datasets')
+
 DATASET_URLS = DATASETS
-# save used params for execution
-params = ['qc', 'norm', 'log_norm', 'n_hvg', 'subset_hvg', 'hvg', 'zero_padding', 'scale', 'correction_method']
-CONFIG_STR = os.path.sep.join(f"{k}/{v}" for k, v in config.items() if k in params)
-OUTPUT_DIR = os.path.join(str(config['output_dir']), CONFIG_STR)
-# define output files
-MERGED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset.h5ad')
-HARMONIZED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset_harmonized.h5ad')
-# process_dataset
-PROCESS_DIR = os.path.join(DATA, 'processed')
-# prepare_dataset
-PREPARE_DIR = os.path.join(DATA, 'prepared')
-# HVG outputs
-HVG_DIR = os.path.join(OUTPUT_DIR, 'hvg')
-HVG_POOL = os.path.join(OUTPUT_DIR, 'hvg_pool.csv')
-# obs outputs
-OBS_DIR = os.path.join(OUTPUT_DIR, 'obs')
-# model output
-MODEL_DIR = os.path.join(OUTPUT_DIR, 'scanvi')
-MODEL_FILE = os.path.join(MODEL_DIR, 'model.pt')
 
 ## PARAMETERS (or defaults)
 correction_method = config.get('correction_method', 'scANVI')
@@ -73,6 +55,28 @@ do_tsne = config.get('do_tsne', False)                      # Calculate tSNE for
 do_umap = config.get('do_umap', True)                       # Calculate UMAP for merged dataset
 merge_method = config.get('merge_method', 'dask')    # How to merge datasets into meta-set
 
+# Generate hash code for each run config and use as output directory
+CONFIG_HASH = get_param_hash(config)
+OUTPUT_DIR = os.path.join(str(config['output_dir']), CONFIG_HASH)
+# save used params in output directory
+save_config(config, os.path.join(OUTPUT_DIR, 'config.yaml'))
+
+# Output files
+MERGED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset.h5ad')
+HARMONIZED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset_harmonized.h5ad')
+# process_dataset
+PROCESS_DIR = os.path.join(DATA, 'processed')
+# prepare_dataset
+PREPARE_DIR = os.path.join(DATA, 'prepared')
+# HVG outputs
+HVG_DIR = os.path.join(OUTPUT_DIR, 'hvg')
+HVG_POOL = os.path.join(OUTPUT_DIR, 'hvg_pool.csv')
+# obs outputs
+OBS_DIR = os.path.join(OUTPUT_DIR, 'obs')
+# model output
+MODEL_DIR = os.path.join(OUTPUT_DIR, 'scanvi')
+MODEL_FILE = os.path.join(MODEL_DIR, 'model.pt')
+
 
 ## START OF PIPELINE
 
@@ -81,7 +85,8 @@ OUTPUT_FILES = [MERGED_OUTPUT_FILE]
 if correction_method!='skip':
     OUTPUT_FILES.append(HARMONIZED_OUTPUT_FILE)
     if correction_method=='scANVI':
-        OUTPUT_FILES.append(MODEL_FILE)
+        print('Caching trained models')
+        # OUTPUT_FILES.append(MODEL_FILE)
 
 rule all:
     input:
@@ -182,7 +187,8 @@ rule merge_datasets:
 # define output files of rule based on correction method
 HARMONIZED_OUTPUT_FILES = {'harmonized': HARMONIZED_OUTPUT_FILE}
 if correction_method == 'scANVI':
-    HARMONIZED_OUTPUT_FILES.update({'model_file': MODEL_FILE})
+    print('Caching trained models')
+    # HARMONIZED_OUTPUT_FILES.update({'model_file': MODEL_FILE})
 
 rule harmonize:
     input:
@@ -193,7 +199,6 @@ rule harmonize:
         **HARMONIZED_OUTPUT_FILES
     params:
         method = correction_method,
-        umap = do_umap,
         model_dir = MODEL_DIR
     script:
         "workflow/scripts/harmonize.py"

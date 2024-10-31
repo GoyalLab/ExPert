@@ -7,6 +7,10 @@ import numpy as np
 import os
 import anndata as ad
 import scipy.sparse as sp
+from memory_profiler import memory_usage
+import functools
+import hashlib
+import yaml
 
 
 def setup_logger(log_file):
@@ -17,6 +21,27 @@ def setup_logger(log_file):
     )
 
 
+def hash(s: str, d: int = 4):
+    return hashlib.shake_128(s.encode('utf-8')).hexdigest(d)
+
+
+def get_param_hash(p: dict, d: int = 8):
+    blacklist = {'log', 'datasets'}
+    ps = p.copy()
+    # sort dict
+    ps = dict(sorted(p.items()))
+    s = ';'.join([f'{k}:{v}' for k,v in ps.items() if k not in blacklist])
+    s += 'datasets:' + ','.join(sorted(ps.get('datasets')))
+    return hash(s, d)
+
+
+def save_config(c: dict, o: str):
+    d = os.path.dirname(o)
+    os.makedirs(d, exist_ok=True)
+    with open(o, 'w') as f:
+        yaml.dump(c, f, default_flow_style=False)
+
+
 def log_decorator(func):
     def wrapper(*args, **kwargs):
         logging.info(f'Computing {func.__name__}')
@@ -24,6 +49,30 @@ def log_decorator(func):
         logging.info(f'Finished {func.__name__}')
         return result
     return wrapper
+
+
+def log_memory_usage(mem_dir="./mem"):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            mem_file = os.path.join(mem_dir, f'{func.__name__}.txt')
+            with open(mem_file, "a") as log_file:
+                log_file.write(f"\nMemory usage for {func.__name__}:\n")
+                
+                def track_memory():
+                    mem_usage = memory_usage((func, args, kwargs), interval=0.1)
+                    return mem_usage
+
+                # Run memory tracking and execute the function
+                mem_usage = track_memory()
+
+                # Log memory usage per line
+                for line_num, mem in enumerate(mem_usage):
+                    log_file.write(f"Line {line_num + 1}: {mem} MiB\n")
+                    
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 def convert_size(size_bytes: int) -> str:
