@@ -1,0 +1,5 @@
+{
+    "SBATCH_DEFAULTS": "account=b1042",
+    "CLUSTER_NAME": "",
+    "CLUSTER_CONFIG": ""
+}
