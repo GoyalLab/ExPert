@@ -273,7 +273,7 @@ def create_sbatch_script(base_conf, ds, conda_env='harmonize', script='main_ques
 def _is_sparse(f):
     # Check if the matrix is sparse or not
     adata = sc.read_h5ad(f, backed='r')
-    is_sparse = isinstance(adata.X, (ad._core.sparse_dataset.CSCDataset, ad._core.sparse_dataset.CSRDataset))
+    is_sparse = isinstance(adata.X, (ad._core.sparse_dataset._CSCDataset, ad._core.sparse_dataset._CSRDataset))
     # Close the file to free resources if needed
     adata.file.close()
     return is_sparse
