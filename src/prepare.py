@@ -10,7 +10,6 @@ from src.utils import read_ad
 import dask.array as da
 
 
-
 def _filter(d, dataset_name, hvg_pool, zero_pad=True):
     # extract .X, obs and var from dataset and delete input
     X, obs, var = d.X, d.obs, d.var

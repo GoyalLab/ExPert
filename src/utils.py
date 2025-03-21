@@ -9,8 +9,6 @@ import anndata as ad
 import scipy.sparse as sp
 from memory_profiler import memory_usage
 import functools
-import hashlib
-import yaml
 
 
 def setup_logger(log_file):
@@ -19,28 +17,6 @@ def setup_logger(log_file):
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
-
-
-def hash(s: str, d: int = 4):
-    return hashlib.shake_128(s.encode('utf-8')).hexdigest(d)
-
-
-def get_param_hash(p: dict, d: int = 8):
-    blacklist = {'log', 'datasets'}
-    ps = p.copy()
-    # sort dict
-    ps = dict(sorted(p.items()))
-    s = ';'.join([f'{k}:{v}' for k,v in ps.items() if k not in blacklist])
-    s += 'datasets:' + ','.join(sorted(ps.get('datasets')))
-    return hash(s, d)
-
-
-def save_config(c: dict, o: str):
-    d = os.path.dirname(o)
-    os.makedirs(d, exist_ok=True)
-    with open(o, 'w') as f:
-        yaml.dump(c, f, default_flow_style=False)
-
 
 def log_decorator(func):
     def wrapper(*args, **kwargs):
@@ -273,7 +249,7 @@ def create_sbatch_script(base_conf, ds, conda_env='harmonize', script='main_ques
 def _is_sparse(f):
     # Check if the matrix is sparse or not
     adata = sc.read_h5ad(f, backed='r')
-    is_sparse = isinstance(adata.X, (ad._core.sparse_dataset._CSCDataset, ad._core.sparse_dataset._CSRDataset))
+    is_sparse = isinstance(adata.X, (ad._core.sparse_dataset.CSCDataset, ad._core.sparse_dataset.CSRDataset))
     # Close the file to free resources if needed
     adata.file.close()
     return is_sparse

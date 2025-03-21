@@ -11,7 +11,7 @@ def harmonize(metaset_path, harmonized_output, method='scANVI', model_dir='./sca
     harmonizer = Harmonizer(metaset_file=metaset_path, method=method, mem_log_dir=mem_dir)
     # harmonize datasets
     harmonizer.harmonize(model_dir=model_dir)
-    # save normalized data TODO: think about removing gzip option and doing that later (could decrease runtime significantly)
+    # save normalized data
     harmonizer.save_normalized_adata(harmonized_output)
 
 

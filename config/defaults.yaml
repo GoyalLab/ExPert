@@ -1,0 +1,25 @@
+# Base parameters for ExPert datasets merge
+## I/O options:
+datasheet: 'path/to/your/datasheet.csv'
+output_dir: 'results'
+data_dir: 'resources/datasets/data'
+cache_dir: 'resources/datasets/data/raw'
+log_dir: 'logs'
+## Pre-processing:
+qc: true                                    # Do quality control on cells (e.g. check for percentage of mitochondiral counts)
+norm: false                                 # Apply sc.pp.normalize_total()
+log_norm: false                             # Apply log1p scaling
+scale: false                                # Center and scale the data
+hvg: true                                   # Calculate highly variable genes
+n_hvg: 2000                                 # Number of highly variable genes to filter for (required if raw data is used)
+subset_hvg: false                           # Directly subset to hvgs (not recommended)
+## Merge & Harmonize:
+zero_padding: true                          # Keep genes that are not overlapping with genes from other experiments (assign 0 to them)
+correction_method: 'skip'                   # How to harmonize the data over the different experiments, can be one of: 'scANVI', 'scanorama', 'harmonypy', 'skip'
+merge_method: 'dask'                        # Whether to merge on-disk (dask) or in memory (memory)
+## Other:
+cache: true                                 # Whether to cache existing runs or re-run everything
+cores: 20                                   # Maximum number of cores to use for the run
+plot: false                                 # Whether to plot the entire merged dataset
+do_umap: false
+do_tsne: false

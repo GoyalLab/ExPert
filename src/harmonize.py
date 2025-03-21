@@ -9,7 +9,7 @@ import scipy.sparse as sp
 import scvi
 import torch
 import dask.array as da
-import warnings
+from pathlib import Path
 
 from typing import List, Literal
 from collections.abc import Iterable as IterableClass
@@ -27,7 +27,7 @@ from src.utils import log_decorator, log_memory_usage
 
 def _train_scANVI(adata, model_dir='./scanvi'):
     # build scVI model
-    scvi_model = scvi.model.SCVI(adata)
+    scvi_model = scvi.model.SCVI(adata, )
     # train model
     logging.info('Training scVI model')
     scvi_model.train(early_stopping=True)
@@ -110,10 +110,8 @@ def normalize_expression(
     qz_store = DistributionConcatenator()
     px_store = DistributionConcatenator()
     for tensors in scdl:
-        logging.info(f"Processing new tensors in data loader")
         per_batch_exprs = []
         for batch in transform_batch:
-            logging.info(f"Processing transform batch {batch}...")
             generative_kwargs = model._get_transform_batch_gen_kwargs(batch)
             inference_kwargs = {"n_samples": n_samples}
             inference_outputs, generative_outputs = model.module.forward(
@@ -138,7 +136,6 @@ def normalize_expression(
             per_batch_exprs = da.from_array(per_batch_exprs)
         exprs.append(per_batch_exprs)
     # stack batches
-    logging.info('Stacking matrices')
     if as_dask:
         exprs = da.vstack(exprs)
     else:
@@ -149,11 +146,10 @@ def normalize_expression(
 
 
 @log_decorator
-def _scANVI(adata: AnnData, batch_key: str = 'dataset', labels_key: str = 'celltype', model_dir: str = './scanvi', minify: bool = False) -> None:
+def _scANVI(adata: AnnData, batch_key: str = 'dataset', labels_key: str = 'celltype', model_dir: str = './scanvi') -> None:
     if adata.isbacked:
         logging.info('Loading .X into memory to train faster')
         adata.X = adata.X.to_memory()
-    # convert to csr matrix for faster training
     if not isinstance(adata.X, sp.csr_matrix):
         logging.info('Converting .X to CSR matrix to increase training speed')
         adata.X = sp.csr_matrix(adata.X)
@@ -170,57 +166,54 @@ def _scANVI(adata: AnnData, batch_key: str = 'dataset', labels_key: str = 'cellt
         model_scanvi = scvi.model.SCANVI.load(model_dir, adata=adata)
     else:
         model_scanvi = _train_scANVI(adata, model_dir=model_dir)
-
-    if minify:
-        # Minify adata with latent representation and save minified version to disk
-        logging.info('Getting latent representation for model')
-        qzm, qzv = model_scanvi.get_latent_representation(give_mean=False, return_dist=True)
-        model_scanvi.adata.obsm["X_latent_qzm"] = qzm
-        model_scanvi.adata.obsm["X_latent_qzv"] = qzv
-        logging.info('Minifying adata with model latent space and saving to disk')
-        model_scanvi.minify_adata()
-        model_scanvi.save(model_dir, save_anndata=True, overwrite=True)
     # set dataset to correct for (ideally select largest dataset)
-    batch_key = str(adata.obs['dataset'].value_counts().index[0])
+    batch_key = adata.obs['dataset'].value_counts().index[0]
     # reconstruct normalized gene expression counts and set them as default to avoid adding layers
     logging.info(f'Reconstructing gene expression corrected for reference: {batch_key}')
-    adata.X = normalize_expression(model=model_scanvi, adata=adata,
+    adata.X = normalize_expression(model=model_scanvi, 
+                                   adata=adata,
                                    library_size=10_000,
-                                   transform_batch=[batch_key],
+                                   transform_batch=batch_key,
                                    as_dask=True)
 
 
+def _filter(d, dataset_name, hvg_pool, zero_pad=True):
+    # filter for pool of highly variable genes
+    matching_hvgs = d.var_names.intersection(hvg_pool)
+    logging.info(f'Found {len(matching_hvgs)} pool genes in {dataset_name}')
+    d = d[:, matching_hvgs]
+    # check for missing genes
+    missing_hvgs = set(hvg_pool) - set(matching_hvgs)
+    if zero_pad and len(missing_hvgs) > 0:
+        logging.info(f'{len(missing_hvgs)} hvgs missing from pool; padding with zero values')
+        # build zero matrix for missing genes
+        zero_matrix = np.zeros((d.n_obs, len(missing_hvgs)))
+        # define AnnData for missing genes
+        ds_zeros = ad.AnnData(X=zero_matrix, var=pd.DataFrame(index=list(missing_hvgs)), obs=d.obs)
+        # merge original and zero AnnData, keep original meta data for samples
+        d = ad.concat([d, ds_zeros], axis=1, merge='first')
+    else:
+        logging.info(f'{len(missing_hvgs)} hvgs lost from pool')
+    return d
 
-def correction_methods():
-    return ['scANVI', 'scanorama', 'harmonypy', 'skip']
 
-def requires_raw_data():
-    return ['scANVI']
-
-def requires_processed_data():
-    return ['scanorama', 'harmonypy']
-
-def requires_gpu():
-    return ['scANVI']
-
-def check_method(m, conf):
-    methods = correction_methods()
-    if m not in methods:
-        raise ValueError(f'Method must be {methods}; got {m}')
-    if m in requires_raw_data():
-        logging.info(f'Method {m} requires raw data, setting preprocess to exclude normalization and log1p')
-        conf['norm'] = False
-        conf['log_norm'] = False
-        conf['scale'] = False
-    if m in requires_processed_data():
-        logging.info(f'Method {m} requires preprocessed data, setting preprocess to include normalization and log1p')
-        conf['norm'] = True
-        conf['log_norm'] = True
-    if m in requires_gpu():
-        if not torch.cuda.is_available():
-            # raise SystemError('scANVI requires a GPU to effectively harmonize.')
-            warnings.warn('scANVI requires a GPU to effectively harmonize. Running on CPU will significantly increase the runtime.')
-
+def _read_datasets(data_files, pool, hvg_filter=True, zero_pad=True):
+    ds_dict = {}
+    for file in data_files:
+        if file.endswith('.h5ad'):
+            logging.info('Reading {}'.format(file))
+            name = Path(file).stem
+            adata = sc.read(file)
+            # make cell barcodes unique to dataset
+            adata.obs_names = adata.obs_names + ';' + name
+            # apply hvg pool and zero-pad filters to dataset
+            if hvg_filter:
+                adata = _filter(adata, name, pool, zero_pad=zero_pad)
+            logging.info(f'Adding {adata.n_obs} cells to merged dataset')
+            # save dataset in dictionary
+            ds_dict[name] = adata
+    logging.info(f'Finished reading {len(ds_dict)} datasets')
+    return ds_dict
 
 def reduce_to_common_genes(ds_list):
     common_genes = list(set.intersection(*(set(adata.var_names) for adata in ds_list)))
@@ -254,7 +247,6 @@ def _neighbors(adata, **kwargs):
 def _umap(adata,**kwargs):
     sc.tl.umap(adata, **kwargs)
 
-
 def _read_dataset(file, backed=None):
     logging.info(f'Reading {file}...')
     d = sc.read(file, backed=backed)
@@ -266,16 +258,16 @@ class Harmonizer:
     """
     Class to Harmonize a merged AnnData object
     """
-    metaset: AnnData
+    metaset: AnnData = None
     method: str = 'scANVI'
 
-    _mem_log_dir: str = '.mem'
+    _mem_log_dir: str = './'
     _is_harmonized: bool = False
-    _harmonized_pca: str = 'X_pca'
+    _harmonized_pca: str = None
     _methods: List[str] = ['scANVI', 'scanorama', 'harmonypy', 'skip']
 
 
-    def __init__(self, metaset_file: str, method: str = 'scANVI', mem_log_dir: str = '.mem') -> None:
+    def __init__(self, metaset_file: str, method: str = None, mem_log_dir: str = None) -> None:
         self._init_method(method)
         self._init_dataset(metaset_file)
         self._init_mem_log_dir(mem_log_dir)
@@ -299,7 +291,10 @@ class Harmonizer:
         _scANVI(self.metaset, batch_key=dataset_key, labels_key=cell_type_key, model_dir=model_dir)
     
     @log_decorator
-    def harmonize(self, dataset_key: str = 'dataset', cell_type_key: str = 'celltype', model_dir:str = './'):
+    def harmonize(self, dataset_key: str = 'dataset', cell_type_key: str = 'celltype', model_dir:str = './', method: str = None):
+        # Update method if given
+        if method:
+            self.method = self._init_method(method)
         # launch specific method
         if self.method == 'scANVI':
             self._run_scANVI(dataset_key, cell_type_key, model_dir)
@@ -319,7 +314,7 @@ class Harmonizer:
         if self._is_harmonized:
             self._run_umap()
         else:
-            logging.info("Can't calculate harmonized UMAP on raw data")
+            logging.info("Can't calculate harmonized UMAP on row data")
     
     def calculate_raw_umap(self):
         if not self._is_harmonized:
@@ -330,7 +325,6 @@ class Harmonizer:
     def _save(self, *args, **kwargs):
         self.metaset.write_h5ad(*args, **kwargs)
 
-    @log_decorator
     def save_normalized_adata(self, path: str, **kwargs):
         if self._is_harmonized:
             self._save(path, **kwargs)

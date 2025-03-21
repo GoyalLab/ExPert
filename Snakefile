@@ -1,7 +1,6 @@
 import os
-from src.harmonize import check_method
-from snakemake.io import load_configfile
-from src.utils import get_param_hash, save_config
+from src.workflow_utils import load_configs, get_param_hash, save_config, read_data_sheet, check_method
+from src.statics import DATA_SHEET_KEYS
 
 
 # Get the absolute path to the directory containing the Snakefile
@@ -10,38 +9,23 @@ workflow.basedir = os.path.abspath(os.path.dirname(workflow.snakefile))
 # Add the project root to PYTHONPATH
 os.environ["PYTHONPATH"] = f"{workflow.basedir}:{os.environ.get('PYTHONPATH', '')}"
 
-def load_configs(default_config="config/config.yaml"):
-    # Load default config
-    config = load_configfile(default_config)
-    
-    # Update with any additional config files (from --configfile)
-    for cf in workflow.overwrite_configfiles:
-        update_config = load_configfile(cf)
-        config.update(update_config)
-
-    # Update with command-line options (from --config)
-    config.update(workflow.overwrite_config)
-    
-    return config
-
 # Load and merge configs
-config = load_configs()
+config = load_configs(wf=workflow)
 
-# get basic parameters
-DATA = config.get('data', 'resources/datasets/data')
-CACHE_DIR = config.get('cache_dir', 'resources/datasets/data/raw')
-LOG = config.get('log', 'logs')
+# TODO: wrap all of this in a constant class
+## PARAMETERS: I/O
+DATASHEET_PATH = str(config.get('datasheet'))
+DATA = str(config.get('data_dir'))
+CACHE_DIR = str(config.get('cache_dir'))
+LOG = config.get('log_dir')
 # List of datasets to process
-DATASETS = config['datasets']
-DATASET_NAMES = list(DATASETS.keys())
+DATASET_SHEET = read_data_sheet(DATASHEET_PATH)
+DATASET_NAMES = DATASET_SHEET.index.tolist()
+sep = '\n\t - '
+dataset_info = sep + sep.join(DATASET_NAMES)
+print(f'Datasets:\n{dataset_info}')
 
-DATASET_URLS = DATASETS
-
-## PARAMETERS (or defaults)
-correction_method = config.get('correction_method', 'scANVI')
-check_method(correction_method, config)
-
-cache = config.get('cache', True)                       # Cache datasets if already downloaded
+## PARAMETERS: Pre-processing
 qc = config.get('qc', True)                             # Perform QC on cells
 norm = config.get('norm', False)                        # Normalize gene expression (total sum)
 log_norm = config.get('log_norm', False)                # Log normalize gene expression (log1p)
@@ -50,13 +34,19 @@ subset_hvg = config.get('subset_hvg', False)            # Only include highly va
 hvg = config.get('hvg', True)                           # Filter metaset genes for high variance
 zero_padding = config.get('zero_padding', True)         # Fill missing genes with 0s to include all genes across the merged metaset
 scale = config.get('scale', False)                      # Center and scale each dataset
+
+## PARAMETERS: Merge & Harmonize
+correction_method = config.get('correction_method')
+check_method(correction_method, config)
+
+cache = config.get('cache', True)                       # Cache datasets if already downloaded
 plot = config.get('plot', True)                         # Whether to run plotting options such as tSNE or UMAP, if true, UMAP is default (can be plotted with final object using sc.pl.*)
 do_tsne = config.get('do_tsne', False)                      # Calculate tSNE for merged dataset (can take some time)
 do_umap = config.get('do_umap', True)                       # Calculate UMAP for merged dataset
 merge_method = config.get('merge_method', 'dask')    # How to merge datasets into meta-set
 
 # Generate hash code for each run config and use as output directory
-CONFIG_HASH = get_param_hash(config)
+CONFIG_HASH = get_param_hash(config, DATASET_NAMES)
 OUTPUT_DIR = os.path.join(str(config['output_dir']), CONFIG_HASH)
 # save used params in output directory
 save_config(config, os.path.join(OUTPUT_DIR, 'config.yaml'))
@@ -100,7 +90,7 @@ rule download_dataset:
     log:
         os.path.join(LOG, 'downloads', "{dataset}.log") 
     params:
-        url = lambda wildcards: DATASET_URLS[wildcards.dataset],
+        url = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.URL],
         name = lambda wildcards: wildcards.dataset,
         cache = cache
     script:
@@ -116,6 +106,8 @@ rule process_dataset:
     log:
         os.path.join(LOG, 'processing', "{dataset}.log")
     params:
+        is_cancer = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.CANCER],
+        name = lambda wildcards: wildcards.dataset,
         qc = qc,
         norm = norm,
         log_norm = log_norm,
