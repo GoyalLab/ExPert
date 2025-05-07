@@ -6,6 +6,8 @@ data_dir: 'resources/datasets/data'
 cache_dir: 'resources/datasets/data/raw'
 log_dir: 'logs'
 ## Pre-processing:
+perturbation_col: 'perturbation'            # Column name to look for in .obs that specifies the perturbation label
+ctrl_key: 'control'                         # Column value in .obs[perturbation_col] that represents control cells
 qc: true                                    # Do quality control on cells (e.g. check for percentage of mitochondiral counts)
 norm: false                                 # Apply sc.pp.normalize_total()
 log_norm: false                             # Apply log1p scaling
@@ -13,6 +15,15 @@ scale: false                                # Center and scale the data
 hvg: true                                   # Calculate highly variable genes
 n_hvg: 2000                                 # Number of highly variable genes to filter for (required if raw data is used)
 subset_hvg: false                           # Directly subset to hvgs (not recommended)
+n_ctrl: 10000                               # Maximum number of control cells, randomly draw n_ctrl if there are more control cells than that, keep all if less
+single_perturbations_only: true             # Exclude multiple perturbations from dataset
+
+## Filtering:
+mixscale_filter: true                       # Filter cells by knockdown efficiency (based on mixscale: https://www.biorxiv.org/content/10.1101/2024.01.29.576933v2)
+min_deg: 5                                  # Minimum amount of differentially expressed genes compared to control cells for each perturbation to pass filtering
+ctrl_dev: 0.5                               # Minimum standart deviation of perturbed cells mixscale score to control
+min_cells_per_perturbation: 5               # Minimum amount of cells / perturbation required to pass filtering
+
 ## Merge & Harmonize:
 zero_padding: true                          # Keep genes that are not overlapping with genes from other experiments (assign 0 to them)
 correction_method: 'skip'                   # How to harmonize the data over the different experiments, can be one of: 'scANVI', 'scanorama', 'harmonypy', 'skip'
@@ -23,3 +34,39 @@ cores: 20                                   # Maximum number of cores to use for
 plot: false                                 # Whether to plot the entire merged dataset
 do_umap: false
 do_tsne: false
+seed: 42                                    # Set seed for reproducibility
+
+## Resources:
+# Set RAM limits for all tasks that require loading datasets into memory
+min_mem: 100                  # Set minimum RAM (GB)
+max_mem: 240                  # Set maximum RAN (GB)
+# 1. Download
+dwl_t: '48:00:00'
+dwl_m: '20GB'
+dwl_p: 'genomics'
+# 2. Preprocess
+pp_t: '48:00:00'
+pp_p: 'genomics'
+# 2.1 Filter cells
+fc_t: '48:00:00'
+fc_m: '200GB'
+fc_p: 'genomics'
+# 3. HVGs
+hvg_t: '4:00:00'
+hvg_m: '20GB'
+hvg_p: 'genomics'
+# 4. Gene pool
+pool_t: '4:00:00'
+pool_m: '20GB'
+pool_p: 'genomics'
+# 5. Prepare for merge
+prep_t: '48:00:00'
+prep_p: 'genomics'
+# 6. Merge
+merge_t: '48:00:00'
+merge_m: '300GB'
+merge_p: 'genomics-himem'
+# 7. Harmonize (requires gpu when used with scanvi)
+harm_t: '48:00:00'
+harm_m: '10GB'
+harm_p: 'genomics'

@@ -29,7 +29,12 @@ if __name__ == "__main__":
             log=snakemake.params.log_norm,
             scale=snakemake.params.scale,
             n_hvg=snakemake.params.n_hvg,
-            subset=snakemake.params.subset
+            subset=snakemake.params.subset,
+            n_ctrl=snakemake.params.n_ctrl,
+            single_perturbations_only=snakemake.params.single_perturbations_only,
+            p_col=snakemake.params.p_col,
+            ctrl_key=snakemake.params.ctrl_key,
+            seed=snakemake.params.seed
         )
     except NameError:
         print("This script is meant to be run through Snakemake.")

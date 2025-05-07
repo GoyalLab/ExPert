@@ -23,4 +23,3 @@ if __name__ == "__main__":
         )
     except NameError:
         print("This script is meant to be run through Snakemake.")
-        # Optionally, add fallback behavior for direct execution

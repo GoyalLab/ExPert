@@ -1,7 +1,7 @@
 # install pipx
 pip install pipx --user
 # set profile directory
-profile_dir="/projects/b1042/GoyalLab/lschwartz/ExPert/workflow/cluster_profile"
+profile_dir="./"
 
 # use cookiecutter to create the profile in the config directory
 template="gh:Snakemake-Profiles/slurm"

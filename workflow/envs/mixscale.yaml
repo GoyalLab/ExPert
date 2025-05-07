@@ -1,0 +1,22 @@
+name: mixscale
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - r-base=4.4.0
+  - r-seurat
+  - r-pma
+  - r-protoclust
+  - r-argparse
+  - r-devtools
+  - r-remotes
+  - r-biocmanager
+  - r-igraph
+  - bioconductor-glmgampoi
+  - bioconductor-singlecellexperiment
+  - bioconductor-zellkonverter
+  - zlib
+  - hdf5
+  - pkg-config
+  - xz

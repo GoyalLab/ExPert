@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import logging
 import anndata as ad
+import scipy.sparse as sp
 
 
 # credit to https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
@@ -56,6 +57,42 @@ def quality_control_filter(
     adata._inplace_subset_obs((~adata.obs.outlier) & (~adata.obs.mt_outlier))
     logging.info(f'Number of cells after filtering for low quality cells: {adata.n_obs}')
 
+def subset_ctrl_cells(
+        adata: ad.AnnData, 
+        n_ctrl: int = 10_000, 
+        perturbation_col: str = 'perturbation',
+        ctrl_key: str = 'control',
+        seed: int = 42
+    ) -> None:
+    # Randomly pick N control cells out of pool of cells with control label
+    ctrl_mask = adata.obs[perturbation_col]==ctrl_key
+    ctrl_obs = adata.obs[ctrl_mask]
+    # Keep all cells if number of control cells is smaller than given number
+    if ctrl_obs.shape[0] < n_ctrl:
+        logging.info(f'Number of control cells ({ctrl_obs.shape[0]}) < {n_ctrl}, keeping all cells.')
+    else:
+        logging.info(f'Randomly selecting {n_ctrl} control cells out of pool of {ctrl_obs.shape[0]} cells')
+        # Sample control cells
+        ctrl_idc = ctrl_obs.sample(n_ctrl, replace=False, random_state=seed).index
+        # Include all perturbed cells
+        p_idc = adata.obs[~ctrl_mask].index
+        # Build final list of indices to filter for
+        idc = ctrl_idc.tolist()
+        idc.extend(p_idc)
+        # Filter dataset
+        adata._inplace_subset_obs(idc)
+
+def single_perturbation_mask(meta: pd.DataFrame, p_col: str = 'perturbation'):
+    # remove multiple perturbations
+    all_perturbations = meta[p_col].str.split('_', expand=True)         # Expand perturbation label
+    col = all_perturbations.iloc[:, 1]                                  # Focus on second label
+    mask = (
+        col.isna() |                                    # Keep all empty second perturbations
+        col.str.match(r'^\d+$|^pDS|^pBA')               # Keep all numbers and plasmids
+    )
+    return mask
+
+
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
 def preprocess_dataset(
         adata: ad.AnnData, 
@@ -68,14 +105,28 @@ def preprocess_dataset(
         hvg: bool = True,
         n_hvg: int = 2000, 
         subset: bool = False, 
-        min_genes: int = 5000
+        n_ctrl: int | None = 10_000,
+        single_perturbations_only: bool = True,
+        p_col: str = 'perturbation',
+        ctrl_key: str = 'control',
+        min_genes: int = 5_000,
+        seed: int = 42
     ) -> ad.AnnData:
+    # Filter for single perturbations only
+    if single_perturbations_only:
+        sp_mask = single_perturbation_mask(adata.obs, p_col=p_col)
+        adata._inplace_subset_obs(sp_mask)
+    # Ensure adata.X is always in csr format
+    if not isinstance(adata.X, sp.csr_matrix):
+        adata.X = sp.csr_matrix(adata.X)
     # apply quality control measures
     if qc:
         logging.info(f'Quality control for dataset {name}')
         mt_percent = 25 if cancer else 12           # set threshold higher for cancer
         logging.info(f'Cancer: {cancer}, mt_per: {mt_percent}')
         quality_control_filter(adata, mt_per=mt_percent)
+    if n_ctrl is not None:
+        subset_ctrl_cells(adata, n_ctrl=n_ctrl, seed=seed, perturbation_col=p_col, ctrl_key=ctrl_key)
     if hvg:
         # Calculate highly variable genes
         if adata.n_vars <= min_genes:
