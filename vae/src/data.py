@@ -4,20 +4,29 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import anndata as ad
 import scipy.sparse as sp
-from typing import Optional, Tuple, Dict
+from typing import Iterable, Optional, Tuple, Dict
 from sklearn.model_selection import train_test_split
 
 import pytorch_lightning as pl
 
 
-class BatchData():
-    X: torch.Tensor
-    Y: Dict[str, torch.Tensor]
-
-    def __init__(self, X, Y) -> None:
-        self.X = X
-        self.Y = Y
-
+def split_data(adata: ad.AnnData, cls_label: str, test_size: float = 0.1, seed: int = 42, add_split_info: bool = True) -> tuple[ad.AnnData, ad.AnnData]:
+    y = adata.obs[cls_label]  # Class labels
+    # Perform stratified train-test split
+    train_idx, test_idx = train_test_split(
+        range(adata.n_obs),
+        test_size=test_size,
+        stratify=y,           # Preserve class distribution
+        random_state=seed
+    )
+    if add_split_info:
+        adata.obs['initial_split'] = None
+        adata.obs.iloc[train_idx, (adata.obs.shape[1]-1)] = 'train'
+        adata.obs.iloc[test_idx, (adata.obs.shape[1]-1)] = 'test'
+    # split the data before we start upsampling
+    train_set = adata[train_idx].copy()
+    test_set = adata[test_idx].copy()
+    return train_set, test_set
 
 class AnnDataset(Dataset):
     """Custom Dataset for loading AnnData objects with one-hot encoded labels"""
@@ -258,7 +267,7 @@ class MultiLabelAnnDataset(Dataset):
         onehot[label] = 1.0
         return onehot
 
-    def __getitem__(self, idx: int) -> BatchData:
+    def __getitem__(self, idx: int) -> Dict:
         # Get the cell index
         cell_idx = self.indices[idx]
         
@@ -273,7 +282,7 @@ class MultiLabelAnnDataset(Dataset):
         # Get one-hot encoded labels for each property
         oh_map = {k: self.to_onehot(ls[idx], self.num_classes[k]) for k, ls in self.encoded_labels.items()}
 
-        return BatchData(expression, oh_map)
+        return {'X': expression, 'Y': oh_map}
         
 
 class MultiLabelAnnDataModule(pl.LightningDataModule):
@@ -283,6 +292,7 @@ class MultiLabelAnnDataModule(pl.LightningDataModule):
         cell_type_col: str,
         pert_type_col: str,
         pert_col: str,
+        dataset_col: Optional[str] = None,
         batch_size: int = 128,
         train_val_split: float = 0.8,
         num_workers: int = 1,
@@ -293,6 +303,7 @@ class MultiLabelAnnDataModule(pl.LightningDataModule):
         self.cell_type_col = cell_type_col
         self.pert_type_col = pert_type_col
         self.pert_col = pert_col
+        self.dataset_col = dataset_col
         self.batch_size = batch_size
         self.train_val_split = train_val_split
         self.num_workers = num_workers
@@ -302,13 +313,15 @@ class MultiLabelAnnDataModule(pl.LightningDataModule):
         self.cell_type_classes = len(adata.obs[cell_type_col].unique())
         self.pert_type_classes = len(adata.obs[pert_type_col].unique())
         self.pert_classes = len(adata.obs[pert_col].unique())
+        self.dataset_classes = len(adata.obs[dataset_col].unique()) if dataset_col is not None else 0
         
         # Create temporary dataset to get label encoders
         temp_dataset = MultiLabelAnnDataset(
             adata=adata,
             cell_type_col=cell_type_col,
             pert_type_col=pert_type_col,
-            pert_col=pert_col
+            pert_col=pert_col,
+            dataset_col=dataset_col
         )
         self.label_encoders = temp_dataset.label_encoders
         self.label_decoders = temp_dataset.label_decoders

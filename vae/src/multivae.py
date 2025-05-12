@@ -1,5 +1,5 @@
-from sympy import Float
 from src.vae import VAE, Encoder, Decoder, Classifier
+from src.modules.zinb import ZINBDecoder, NoisyEncoder
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,7 +9,7 @@ import scanpy as sc
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional
 import pytorch_lightning as pl
 from typing import List
 from torchmetrics.classification import MulticlassAccuracy, MulticlassConfusionMatrix
@@ -17,6 +17,7 @@ from sklearn.metrics import precision_score, recall_score, roc_auc_score
 
 
 class MultiPropertyVAE(pl.LightningModule):
+    
     """VAE for multiple cell properties with single encoder and detailed metrics"""
     def __init__(
         self,
@@ -59,11 +60,9 @@ class MultiPropertyVAE(pl.LightningModule):
             input_dim += n_batches
         
         # Initialize shared encoder
-        self.encoder = Encoder(
+        self.encoder = NoisyEncoder(
             input_dim=input_dim,
-            hidden_dims=hidden_dims,
-            latent_dim=encoder_latent_dim,  # Intermediate dimension before splitting
-            dropout_rate=dropout_rate
+            latent_dim=encoder_latent_dim
         )
         
         # Separate projection layers for each latent space
@@ -84,11 +83,9 @@ class MultiPropertyVAE(pl.LightningModule):
                            pert_latent_dim + shared_latent_dim)
         
         # Initialize decoder
-        self.decoder = Decoder(
+        self.decoder = ZINBDecoder(
             latent_dim=total_latent_dim,
-            hidden_dims=hidden_dims[::-1],
-            output_dim=input_dim,
-            dropout_rate=dropout_rate
+            output_dim=input_dim
         )
         
         # Initialize separate classifiers
@@ -227,8 +224,16 @@ class MultiPropertyVAE(pl.LightningModule):
                 pert_mu, pert_log_var,
                 shared_mu, shared_log_var)
     
-    def training_step(self, batch, batch_idx):
-        x, (y_cell, y_pert_type, y_pert) = batch
+    def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
+        x = batch['X']
+        y = batch['Y']
+        y_cell = y.get('cell_type')
+        y_pert_type = y.get('pert_type')
+        y_pert = y.get('pert')
+        dataset = y.get('dataset')
+
+        if self.use_datasets:
+            x = torch.cat([x, dataset], dim=-1)
         
         (reconstruction, cell_type_pred, pert_type_pred, pert_pred,
          cell_mu, cell_log_var, pert_type_mu, pert_type_log_var,
@@ -251,9 +256,9 @@ class MultiPropertyVAE(pl.LightningModule):
         class_loss = self.cell_type_weight * cell_type_loss + self.perturbation_type_weight * pert_type_loss + self.perturbation_weight * pert_loss
         
         # Calculate accuracies
-        cell_acc = self.train_acc_cell(torch.softmax(cell_type_pred, dim=1), self._convert_onehot_to_indices(y_cell)) if self.use_cell_type else 0
-        pert_type_acc = self.train_acc_pert_type(torch.softmax(pert_type_pred, dim=1), self._convert_onehot_to_indices(y_pert_type)) if self.use_pert_type else 0
-        pert_acc = self.train_acc_pert(torch.softmax(pert_pred, dim=1), self._convert_onehot_to_indices(y_pert)) if self.use_pert else 0
+        cell_acc = self.train_acc_cell(torch.softmax(cell_type_pred, dim=1), self._convert_onehot_to_indices(y_cell)) if self.use_cell_type else 1.0
+        pert_type_acc = self.train_acc_pert_type(torch.softmax(pert_type_pred, dim=1), self._convert_onehot_to_indices(y_pert_type)) if self.use_pert_type else 1.0
+        pert_acc = self.train_acc_pert(torch.softmax(pert_pred, dim=1), self._convert_onehot_to_indices(y_pert)) if self.use_pert else 1.0
         
         # Total loss
         total_loss = recon_loss + self.beta * kl_loss + self.alpha * class_loss
@@ -279,8 +284,16 @@ class MultiPropertyVAE(pl.LightningModule):
         
         return total_loss
 
-    def validation_step(self, batch, batch_idx):
-        x, (y_cell, y_pert_type, y_pert) = batch
+    def validation_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
+        x = batch['X']
+        y = batch['Y']
+        y_cell = y.get('cell_type')
+        y_pert_type = y.get('pert_type')
+        y_pert = y.get('pert')
+        dataset = y.get('dataset')
+
+        if self.use_datasets:
+            x = torch.cat([x, dataset], dim=-1)
         
         (reconstruction, cell_type_pred, pert_type_pred, pert_pred,
          cell_mu, cell_log_var, pert_type_mu, pert_type_log_var,
@@ -406,18 +419,22 @@ class MultiPropertyVAE(pl.LightningModule):
         labels = {
             'cell_type': [],
             'perturbation_type': [],
-            'perturbation': []
+            'perturbation': [],
+            'dataset': []
         }
         
         with torch.no_grad():
             for batch in dataloader:
                 if return_labels:
-                    x, y = batch
-                    labels['cell_type'].append(y[0])
-                    labels['perturbation_type'].append(y[1])
-                    labels['perturbation'].append(y[2])
+                    x, y = batch['X'], batch['Y']
+                    labels['cell_type'].append(y['cell_type'])
+                    labels['perturbation_type'].append(y['pert_type'])
+                    labels['perturbation'].append(y['pert'])
+                    labels['dataset'].append(y.get('dataset'))
                 else:
-                    x = batch
+                    x = batch['X']
+                if self.use_datasets:
+                    x = torch.cat([x, batch['Y']['dataset']], dim=-1)
                 
                 # Move to same device as model
                 x = x.to(self.device)

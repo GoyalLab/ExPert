@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.functional import one_hot
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 import numpy as np
@@ -15,6 +16,8 @@ import seaborn as sns
 from src.data import AnnDataModule
 
 from pytorch_lightning.callbacks import ModelCheckpoint
+from torch.distributions import Distribution
+from scvi.distributions import Normal, ZeroInflatedNegativeBinomial
 
 
 class Encoder(nn.Module):
@@ -24,11 +27,13 @@ class Encoder(nn.Module):
         input_dim: int,
         hidden_dims: List[int],
         latent_dim: int,
-        dropout_rate: float = 0.1
+        dropout_rate: float = 0.1,
+        reparameterize: bool = False,
+        return_dist: bool = False
     ):
         super().__init__()
         
-        # Build encoder layers
+        # Build encoder layers in funnel structure
         layers = []
         prev_dim = input_dim
         for dim in hidden_dims:
@@ -45,42 +50,72 @@ class Encoder(nn.Module):
         # Mean and variance layers
         self.fc_mu = nn.Linear(hidden_dims[-1], latent_dim)
         self.fc_var = nn.Linear(hidden_dims[-1], latent_dim)
+        self.var_eps = 1e-4
+        self.reparameterize = reparameterize
+        self.return_dist = return_dist
         
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[Distribution, torch.Tensor, torch.Tensor]:
         x = self.encoder(x)
         mu = self.fc_mu(x)
-        log_var = self.fc_var(x)
-        return mu, log_var
+        if self.reparameterize:
+            log_var = torch.exp(self.fc_var(x)) + self.var_eps
+        else:
+            log_var = self.fc_var(x)
+        if self.return_dist:
+            dist = Normal(mu, log_var.sqrt())
+            return dist, mu, log_var
+        else:
+            return mu, log_var
 
 class Decoder(nn.Module):
-    """VAE Decoder Network"""
+    """
+    VAE Decoder Network: design inspired by scVI (https://doi.org/10.1038/s41592-018-0229-2)
+    - Designed to work with ZINB distribution
+    """
     def __init__(
         self,
         latent_dim: int,
         hidden_dims: List[int],
         output_dim: int,
-        dropout_rate: float = 0.1
+        dropout_rate: float = 0.1,
+        use_batch_norm: bool = True,
+        activation_fn: nn.Module = nn.ReLU(),
     ):
         super().__init__()
         
-        # Build decoder layers
+        # Build decoder layers in funnel structure
         layers = []
         prev_dim = latent_dim
         for dim in hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, dim),
-                nn.BatchNorm1d(dim),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate)
+                nn.BatchNorm1d(dim, momentum=0.01, eps=0.001) if use_batch_norm else nn.Identity(),
+                activation_fn,
+                nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
             ])
             prev_dim = dim
             
-        layers.append(nn.Linear(hidden_dims[-1], output_dim))
+        # layers.append(nn.Linear(hidden_dims[-1], output_dim))
+        # stack main decoder
+        self.px_decoder = nn.Sequential(*layers)
+        # mean gamma from last layer
+        self.px_scale_decoder = nn.Sequential(
+            nn.Linear(hidden_dims[-1], output_dim),
+            nn.Softmax(dim=-1),
+        )
+        # dispersion from last layer
+        self.px_r_decoder = nn.Linear(hidden_dims[-1], output_dim)
+        # dropout from last layer
+        self.px_dropout_decoder = nn.Linear(hidden_dims[-1], output_dim)
         
-        self.decoder = nn.Sequential(*layers)
-        
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.decoder(z)
+    def forward(self, z: torch.Tensor, library: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The decoder returns values for the parameters of the ZINB distribution
+        px = self.px_decoder(z)
+        px_scale = self.px_scale_decoder(px)
+        px_dropout = self.px_dropout_decoder(px)
+        px_rate = torch.exp(library) * px_scale 
+        px_r = self.px_r_decoder(px)
+        return px_scale, px_r, px_rate, px_dropout
 
 class Classifier(nn.Module):
     """Classification head for latent space"""
@@ -113,7 +148,8 @@ class Classifier(nn.Module):
         return self.classifier(z)
 
 class VAE(pl.LightningModule):
-    """Semi-supervised VAE with detailed class-wise metrics"""
+
+    """Semi-supervised VAE with ZINB distribution loss"""
     def __init__(
         self,
         input_dim: int,
@@ -122,22 +158,29 @@ class VAE(pl.LightningModule):
         latent_dim: int = 32,
         classifier_hidden_dims: List[int] = [64],
         learning_rate: float = 1e-3,
+        alpha: float = 1.0,  # Classification loss weight
         beta: float = 1.0,  # KL divergence weight
-        alpha: float = 1.0,  # Classification loss weight,
         scheduler = None,
         monitor_loss = None,
         dropout_rate: float = 0.1,
-        dynamic_alpha: bool = False     # Dynically adjust alpha to first learn latent space before classifying
+        use_observed_lib_size: bool = True,
     ):
         super().__init__()
         
         self.save_hyperparameters()
         
         # Initialize encoder and decoder
-        self.encoder = Encoder(
+        self.z_encoder = Encoder(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
             latent_dim=latent_dim,
+            dropout_rate=dropout_rate
+        )
+
+        self.l_encoder = Encoder(
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            latent_dim=1,
             dropout_rate=dropout_rate
         )
         
@@ -171,32 +214,45 @@ class VAE(pl.LightningModule):
         self.alpha = alpha
         self.learning_rate = learning_rate
         self.num_classes = num_classes
-        self.dynamic_alpha = dynamic_alpha
         self.scheduler = scheduler
         self.monitor_loss = monitor_loss
+        self.use_observed_lib_size = use_observed_lib_size
+
+    def _compute_local_library_params(
+        self,
+        batch_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Computes local library parameters.
+
+        Compute two tensors of shape (batch_index.shape[0], 1) where each
+        element corresponds to the mean and variances, respectively, of the
+        log library sizes in the batch the cell corresponds to.
+        """
+        from torch.nn.functional import linear
+
+        n_batch = self.library_log_means.shape[1]
+        local_library_log_means = linear(
+            one_hot(batch_index.squeeze(-1), n_batch).float(), self.library_log_means
+        )
+
+        local_library_log_vars = linear(
+            one_hot(batch_index.squeeze(-1), n_batch).float(), self.library_log_vars
+        )
+
+        return local_library_log_means, local_library_log_vars
         
     def reparameterize(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
         """Reparameterization trick"""
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
         return mu + eps * std
-        
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, log_var = self.encoder(x)
-        z = self.reparameterize(mu, log_var)
-        reconstruction = self.decoder(z)
-        classification = self.classifier(z)
-        return reconstruction, classification, mu, log_var
     
-    def _get_reconstruction_loss(self, x: torch.Tensor, reconstruction: torch.Tensor) -> torch.Tensor:
-        """Reconstruction loss"""
-        recon_loss = F.mse_loss(reconstruction, x, reduction='mean')
+    def _get_reconstruction_loss(self, x: torch.Tensor, recon_distr: ZeroInflatedNegativeBinomial) -> torch.Tensor:
+        """Reconstruction loss.
+        Uses scVIs ZINB class to infer the probability of drawing X from the reconstructed ZINB.
+        """
+        recon_loss = -recon_distr.log_prob(x).sum(-1)
         return recon_loss
-    
-    def _get_kl_divergence_loss(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-        """KL divergence loss"""
-        kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
-        return kl_loss
     
     def _get_classification_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Classification loss"""
@@ -240,85 +296,104 @@ class VAE(pl.LightningModule):
             self.log(f'{prefix}_class_{i}_recall', recall, prog_bar=False)
             self.log(f'{prefix}_class_{i}_f1', f1, prog_bar=False)
     
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def _get_sample_library_size(self, x):
+        return torch.log(x.sum(1)).unsqueeze(1)
+
+    def _inference(self, x, l, batch_index):
+        d, qz, z = self.z_encoder(x)
+        ql = None
+        if not self.use_observed_lib_size:
+            if self.batch_representation == "embedding":
+                dl, ql, library_encoded = self.l_encoder(x)
+            else:
+                dl, ql, library_encoded = self.l_encoder(x)
+            l = library_encoded
+        
+        return z, d, ql, l
+    
+    def _generative(self, z, l, batch_index):
+        px_scale, px_r, px_rate, px_dropout = self.decoder(z, l)
+        classification = self.classifier(z)
+
+        px_r = torch.exp(px_r)
+
+        px = ZeroInflatedNegativeBinomial(
+            mu=px_rate,
+            theta=px_r,
+            zi_logits=px_dropout,
+            scale=px_scale,
+        )
+        if self.use_observed_lib_size:
+            pl = None
+        else:
+            (
+                local_library_log_means,
+                local_library_log_vars,
+            ) = self._compute_local_library_params(batch_index)
+            pl = Normal(local_library_log_means, local_library_log_vars.sqrt())
+        pz = Normal(torch.zeros_like(z), torch.ones_like(z))
+        return px, pl, pz, classification
+
+    def forward(self, x: torch.Tensor, l: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, log_var = self.z_encoder(x)
+        z = self.reparameterize(mu, log_var)
+        px_scale, px_r, px_rate, px_dropout = self.decoder(z, l)
+        classification = self.classifier(z)
+        return px_scale, px_r, px_rate, px_dropout, classification
+    
+    def _step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int, prefix: str) -> torch.Tensor:
+        from torch.distributions import kl_divergence
         x, y = batch
-        reconstruction, classification, mu, log_var = self(x)
+        # get library size for batch
+        library_size = self._get_sample_library_size(x)
+        z, qz, ql, l = self._inference(x, library_size, batch_idx)
+        px, pl, pz, classification = self._generative(z, l, batch_idx)
         
         # Calculate losses
-        recon_loss = self._get_reconstruction_loss(x, reconstruction)
-        kl_loss = self._get_kl_divergence_loss(mu, log_var)
-        class_loss = self._get_classification_loss(classification, y)
+        recon_loss = self._get_reconstruction_loss(x, recon_distr=px)
+        kl_divergence_z = kl_divergence(qz, pz).sum(dim=-1)
+        if pl is not None and ql is not None:
+            kl_divergence_l = kl_divergence(ql, pl).sum(dim=-1)
+        else:
+            kl_divergence_l = torch.zeros_like(kl_divergence_z)
+        
+        class_loss = torch.mean(self._get_classification_loss(classification, y))
+
+        kl_local_for_warmup = kl_divergence_z
+        kl_local_no_warmup = kl_divergence_l
+
+        weighted_kl_local = torch.mean(self.beta * kl_local_for_warmup + kl_local_no_warmup)
         
         # Convert predictions to probabilities with softmax
         pred_probs = torch.softmax(classification, dim=1)
         # Convert target from one-hot to indices
         target_indices = self._convert_onehot_to_indices(y)
         # Calculate accuracy
-        accuracy = self.train_acc(pred_probs, target_indices)
+        accuracy = self.train_acc(pred_probs, target_indices) if prefix == 'train' else self.val_acc(pred_probs, target_indices)
         
         # Log class-wise metrics
-        self._log_class_metrics(classification, y, self.train_class_acc, 
-                              self.train_confmat, 'train')
+        self._log_class_metrics(classification, y, self.train_class_acc if prefix == 'train' else self.val_class_acc, 
+                              self.train_confmat if prefix == 'train' else self.val_confmat, prefix)
         
-        # Adjust alpha dynically if option is enabled and reconstruction is already good
-        if self.dynamic_alpha and recon_loss < 0.1:
-            # switch from reconstructing to classifying
-            alpha = 10
-        else:
-            alpha = self.alpha
         # Total loss
-        total_loss = recon_loss + self.beta * kl_loss + alpha * class_loss
+        total_loss = recon_loss + self.beta * weighted_kl_local + self.alpha * class_loss
         
         # Log overall metrics
         self.log_dict({
-            'train_loss': total_loss,
-            'train_recon_loss': recon_loss,
-            'train_kl_loss': kl_loss,
-            'train_class_loss': class_loss,
-            'train_accuracy': accuracy
+            f'{prefix}_loss': total_loss,
+            f'{prefix}_recon_loss': recon_loss,
+            f'{prefix}_kl_loss': weighted_kl_local,
+            f'{prefix}_class_loss': class_loss,
+            f'{prefix}_accuracy': accuracy
         }, prog_bar=True)
         
         return total_loss
+
+    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        return self._step(batch, batch_idx, 'train')
     
     def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        x, y = batch
-        reconstruction, classification, mu, log_var = self(x)
-        
-        # Calculate losses
-        recon_loss = self._get_reconstruction_loss(x, reconstruction)
-        kl_loss = self._get_kl_divergence_loss(mu, log_var)
-        class_loss = self._get_classification_loss(classification, y)
-        
-        # Convert predictions to probabilities with softmax
-        pred_probs = torch.softmax(classification, dim=1)
-        # Convert target from one-hot to indices
-        target_indices = self._convert_onehot_to_indices(y)
-        # Overall accuracy
-        accuracy = self.val_acc(pred_probs, target_indices)
-        
-        # Log class-wise metrics
-        self._log_class_metrics(classification, y, self.val_class_acc, 
-                              self.val_confmat, 'val')
-        
-        # Adjust alpha dynically if option is enabled
-        if self.dynamic_alpha and recon_loss < 0.1:
-            # switch from reconstructing to classifying
-            alpha = 10
-        else:
-            alpha = self.alpha
-        # Total loss
-        total_loss = recon_loss + self.beta * kl_loss + alpha * class_loss
-        
-        # Log overall metrics
-        self.log_dict({
-            'val_loss': total_loss,
-            'val_recon_loss': recon_loss,
-            'val_kl_loss': kl_loss,
-            'val_class_loss': class_loss,
-            'val_accuracy': accuracy
-        }, prog_bar=True)
-        
-        return total_loss
+        return self._step(batch, batch_idx, 'val')
     
     def on_validation_epoch_end(self):
         """Log confusion matrix at the end of each validation epoch"""
@@ -357,7 +432,7 @@ class VAE(pl.LightningModule):
     def get_latent_representation(self, 
                                 dataloader: DataLoader,
                                 return_labels: bool = True,
-                                sample: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+                                sample: bool = False) -> Tuple[np.ndarray, np.ndarray] | np.ndarray:
         """
         Extract latent space representations for the entire dataset.
         
@@ -386,7 +461,7 @@ class VAE(pl.LightningModule):
                 x = x.to(self.device)
                 
                 # Get latent representations
-                mu, log_var = self.encoder(x)
+                d, mu, log_var = self.z_encoder(x)
                 
                 if sample:
                     # Sample from the latent space
