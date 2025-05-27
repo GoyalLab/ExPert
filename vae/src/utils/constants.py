@@ -37,6 +37,7 @@ class _MODULE_KEYS(NamedTuple):
     QZGM_KEY: str = "qzgm"
     QZGV_KEY: str = "qzgv"
     PWDG_KEY: str = "gpwd"
+    LIBRARY_G_KEY: str = "library_g"
     # inference (library)
     LIBRARY_KEY: str = "library"
     LABEL_KEY: str = "label"
@@ -53,11 +54,15 @@ class _MODULE_KEYS(NamedTuple):
     PG_KEY: str = "pg"
     PL_KEY: str = "pl"
     PZ_KEY: str = "pz"
+    PZG_KEY: str = "pzg"
     # loss
     KL_L_KEY: str = "kl_divergence_l"
     KL_Z_KEY: str = "kl_divergence_z"
+    KL_ZG_KEY: str = "kl_divergence_zg"
     R2_MEAN_KEY: str = "r2_mean"
     R2_VAR_KEY: str = "r2_var"
+    # prediction
+    PREDICTION_KEY: str = "cls_prediction"
 
 
 REGISTRY_KEYS = _REGISTRY_KEYS_NT()

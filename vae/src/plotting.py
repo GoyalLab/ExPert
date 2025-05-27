@@ -5,13 +5,12 @@ import os
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 import anndata as ad
-import scvi
 import logging
 import scanpy as sc
 from typing import List
 import scipy.sparse as sp
 
-from src.models._gpvi import GPVI
+from src.utils.constants import MODULE_KEYS
 
 
 def get_latest_tensor_dir(d: str) -> str:
@@ -78,16 +77,16 @@ def get_model_latent(model, mode) -> ad.AnnData:
         raise ValueError(f'Model does not have indices for mode: {mode}, has to be one of [train, val, test]')
     lr = model.get_latent_representation(indices=idx)
     if isinstance(lr, dict):
-        z = lr['z']
-        zg = lr['zg']
+        z = lr[MODULE_KEYS.Z_KEY]
+        zg = lr[MODULE_KEYS.ZG_KEY]
     else:
         z = lr
         zg = None
     latent = ad.AnnData(z)
     latent.obs = model.adata.obs.iloc[idx,:].copy()
-    latent.obs['scanvi_predictions'] = model.predict(indices=idx)
+    latent.obs[MODULE_KEYS.PREDICTION_KEY] = model.predict(indices=idx)
     if zg is not None:
-        latent.obsm['zg'] = zg
+        latent.obsm[MODULE_KEYS.ZG_KEY] = zg
     return latent
 
 def calc_umap(adata: ad.AnnData, rep='X') -> None:
@@ -108,7 +107,7 @@ def get_classification_report(latent: ad.AnnData, cls_label: str, mode: str) -> 
 
     report = classification_report(
         latent.obs[cls_label],
-        latent.obs['scanvi_predictions'],
+        latent.obs[MODULE_KEYS.PREDICTION_KEY],
         zero_division=0,
         output_dict=True
     )
@@ -122,11 +121,9 @@ def get_classification_report(latent: ad.AnnData, cls_label: str, mode: str) -> 
     return summary, report_data
 
 def plot_performance_support_corr(summary: pd.DataFrame, o: str):
-    plt_legend = summary['perturbation'].nunique() <= 100
-    ax = sns.scatterplot(summary, x='log_count', y='f1-score', hue='perturbation', legend=plt_legend)
-    plt.legend(loc='lower center', bbox_to_anchor=(0.5, -0.5), ncol=10)
+    sns.kdeplot(summary, x='log_count', y='f1-score', hue='mode')
     plt.xlabel('Class support (log)')
-    plt.ylabel('f1-score')
+    plt.ylabel('Macro f1-score')
     plt.savefig(o, dpi=300, bbox_inches='tight')
 
 def plot_model_results_mode(latent: ad.AnnData, mode: str, batch_key: str, cls_labels: list[str], plt_dir: str, cm: bool = True, add_key: str = '') -> None:
@@ -139,23 +136,23 @@ def plot_model_results_mode(latent: ad.AnnData, mode: str, batch_key: str, cls_l
         if cl != batch_key and cm:
             cm_p = os.path.join(plt_dir, f'{mode}_cm_{cl}.png')
             yt = latent.obs[cl]
-            yp = latent.obs['scanvi_predictions'].str.split(';').str[i]
+            yp = latent.obs[MODULE_KEYS.PREDICTION_KEY].str.split(';').str[i]
             plot_confusion(yt, yp, plt_file=cm_p)
     if cm:
         # plot confusion matrix for exact label
         cm_p = os.path.join(plt_dir, f'{mode}_cm_cls_label.png')
         yt = latent.obs['cls_label']
-        yp = latent.obs['scanvi_predictions']
+        yp = latent.obs[MODULE_KEYS.PREDICTION_KEY]
         plot_confusion(yt, yp, plt_file=cm_p)
 
-def predict_novel(model, adata: ad.AnnData, cls_label: str, cls_labels: list[str], out_dir: str | None = None, batch_key: str = 'dataset', key: str = 'report', mode: str = 'test', emb_key: str = 'gene_embedding'):
+def predict_novel(model, adata: ad.AnnData, cls_label: str, out_dir: str | None = None, batch_key: str = 'dataset', key: str = 'report', mode: str = 'test', emb_key: str = 'gene_embedding', soft: bool = False):
     adata.X = sp.csr_matrix(adata.X)
-    model.setup_anndata(adata, batch_key=batch_key, labels_key=cls_label, cls_labels=cls_labels, unlabeled_category='unknown', gene_emb_obsm_key=emb_key)
-    adata.obsm['scanvi_z'] = model.get_latent_representation(adata=adata, ignore_embedding=emb_key is None)
-    sc.pp.neighbors(adata, use_rep='scanvi_z')
+    model.setup_anndata(adata, batch_key=batch_key, labels_key=cls_label, unlabeled_category='unknown', gene_emb_obsm_key=emb_key)
+    adata.obsm['latent_z'] = model.get_latent_representation(adata=adata, ignore_embedding=emb_key is None)
+    sc.pp.neighbors(adata, use_rep='latent_z')
     sc.tl.umap(adata)
     # run the trained model with novel data
-    adata.obs['scanvi_predictions'] = model.predict(adata=adata, ignore_embedding=emb_key is None)
+    adata.obs[MODULE_KEYS.PREDICTION_KEY] = model.predict(adata=adata, ignore_embedding=emb_key is None, soft=soft)
     test_summary, test_report = get_classification_report(adata, cls_label=cls_label, mode='test')
     # add reports to adata
     adata.uns[key] = {

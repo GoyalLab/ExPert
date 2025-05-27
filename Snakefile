@@ -1,6 +1,7 @@
 import os
 from src.workflow_utils import load_configs, get_param_hash, save_config, read_data_sheet, check_config
 from src.statics import DATA_SHEET_KEYS
+import numpy as np
 
 
 # Get the absolute path to the directory containing the Snakefile
@@ -13,17 +14,12 @@ os.environ["PYTHONPATH"] = f"{workflow.basedir}:{os.environ.get('PYTHONPATH', ''
 config = load_configs(wf=workflow)
 
 ## PARAMETERS: I/O
-DATASHEET_PATH = str(config.get('datasheet'))
 DATA = str(config.get('data_dir'))
 CACHE_DIR = str(config.get('cache_dir'))
 LOG = config.get('log_dir')
 # List of datasets to process
-DATASET_SHEET = read_data_sheet(DATASHEET_PATH)
+DATASET_SHEET = read_data_sheet(config)
 DATASET_NAMES = DATASET_SHEET.index.tolist()
-sep = '\n\t - '
-dataset_info = sep + sep.join(DATASET_NAMES)
-print(f'Datasets:\n{dataset_info}')
-
 
 ## CHECK PARAMS & BUILD I/O PATHS
 check_config(config)
@@ -146,16 +142,18 @@ if config['mixscale_filter']:
             ctrl_dev = config['ctrl_dev'],
             perturbation_col = config['perturbation_col'],
             ctrl_key = config['ctrl_key'],
+            min_deg = config['min_deg'],
             min_cells_per_perturbation = config['min_cells_per_perturbation']
         resources:
             time = config['fc_t'],
-            mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
+            mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MAX_MEM],
             partition = config['fc_p']
         shell:
             """
             Rscript workflow/scripts/mixscale.R \\
             -i {input.dataset_file} \\
             -o {output.filtered_file} \\
+            -d {params.min_deg} \\
             -t {params.ctrl_dev} \\
             -m {params.min_cells_per_perturbation} \\
             -p {params.perturbation_col} \\
@@ -229,6 +227,7 @@ rule merge_datasets:
     log:
         os.path.join(LOG, "merge.log")
     params:
+        meta_sheet = DATASET_SHEET,
         merge_method = config['merge_method']
     resources:
         time = config['merge_t'],

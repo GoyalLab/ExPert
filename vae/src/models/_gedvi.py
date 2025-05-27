@@ -6,6 +6,7 @@ from src._train.plan import SemiSupervisedTrainingPlan
 from src.utils.preprocess import _prep_adata
 
 import torch
+import warnings
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
@@ -14,7 +15,7 @@ from sklearn.utils.class_weight import compute_class_weight
 
 
 from collections.abc import Sequence
-from typing import Literal, Any
+from typing import Iterable, Literal, Any
 import numpy.typing as npt
 from collections.abc import Iterator
 
@@ -24,7 +25,7 @@ from anndata import AnnData
 from scvi.data import AnnDataManager
 from scvi.model._utils import get_max_epochs_heuristic
 from scvi.train import TrainRunner
-from scvi.data._utils import get_anndata_attribute
+from scvi.data._utils import get_anndata_attribute, _check_if_view
 from scvi.utils import setup_anndata_dsp
 from scvi.utils._docstrings import devices_dsp
 from scvi.train._callbacks import SubSampleLabels
@@ -32,7 +33,8 @@ from scvi.model.base import (
     BaseModelClass,
     ArchesMixin,
     VAEMixin,
-    RNASeqMixin
+    RNASeqMixin,
+    UnsupervisedTrainingMixin
 )
 from scvi.data.fields import (
     CategoricalJointObsField,
@@ -43,11 +45,19 @@ from scvi.data.fields import (
     NumericalJointObsField,
     NumericalObsField,
 )
+from scvi._types import AnnOrMuData
+from scvi.model._scvi import SCVI
 
 logger = logging.getLogger(__name__)
 
 
-class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
+class GEDVI(
+        RNASeqMixin, 
+        VAEMixin,
+        ArchesMixin, 
+        BaseModelClass,
+        UnsupervisedTrainingMixin,
+    ):
     _module_cls = GEDVAE
     _training_plan_cls = SemiSupervisedTrainingPlan
     _LATENT_QZM_KEY = "gpvi_latent_qzm"
@@ -59,9 +69,8 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         adata: AnnData,
         n_hidden: int = 256,
         n_latent: int = 20,
-        n_layers_encoder: int = 2,
-        n_layers_decoder: int = 1,
-        dropout_rate_encoder: float = 0.2,
+        n_layers: int = 2,
+        dropout_rate: float = 0.2,
         dropout_rate_decoder: float | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
@@ -97,8 +106,8 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         # Look for special parameters for G, fall back to X parameters
         n_latent_g = n_latent_g if n_latent_g else n_latent
         n_hidden_g = n_hidden_g if n_hidden_g else n_hidden
-        n_layers_encoder_g = n_layers_encoder_g if n_layers_encoder_g else n_layers_encoder
-        dropout_rate_encoder_g = dropout_rate_encoder_g if dropout_rate_encoder_g else dropout_rate_encoder
+        n_layers_encoder_g = n_layers_encoder_g if n_layers_encoder_g else n_layers
+        dropout_rate_encoder_g = dropout_rate_encoder_g if dropout_rate_encoder_g else dropout_rate
 
         # Initialize genevae
         self.module = self._module_cls(
@@ -110,10 +119,10 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             n_latent_g=n_latent_g,
             n_hidden_x=n_hidden,
             n_hidden_g=n_hidden_g,
-            n_layers_encoder_x=n_layers_encoder,
+            n_layers_encoder_x=n_layers,
             n_layers_encoder_g=n_layers_encoder_g,
-            n_layers_decoder=n_layers_decoder,
-            dropout_rate_encoder_x=dropout_rate_encoder,
+            n_layers_decoder=n_layers,
+            dropout_rate_encoder_x=dropout_rate,
             dropout_rate_encoder_g=dropout_rate_encoder_g,
             dropout_rate_decoder=dropout_rate_decoder,
             n_continuous_cov=self.summary_stats.get('n_extra_continuous_covs', 0),
@@ -153,6 +162,175 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         self._labeled_indices = np.argwhere(labels != self.unlabeled_category_).ravel()
         self._code_to_label = dict(enumerate(self._label_mapping))
 
+    @classmethod
+    def from_scvi_model(
+        cls,
+        scvi_model: SCVI,
+        unlabeled_category: str,
+        labels_key: str | None = None,
+        adata: AnnData | None = None,
+        gene_emb_obsm_key: str | None = None,
+        **model_kwargs,
+    ):
+        """Initialize scanVI model with weights from pretrained :class:`~scvi.model.SCVI` model.
+
+        Parameters
+        ----------
+        scvi_model
+            Pretrained scvi model
+        labels_key
+            key in `adata.obs` for label information. Label categories can not be different if
+            labels_key was used to setup the SCVI model. If None, uses the `labels_key` used to
+            setup the SCVI model. If that was None, and error is raised.
+        unlabeled_category
+            Value used for unlabeled cells in `labels_key` used to setup AnnData with scvi.
+        adata
+            AnnData object that has been registered via :meth:`~GEDVI.setup_anndata`.
+        model_kwargs
+            kwargs for gedvi model
+        """
+        from copy import deepcopy
+        from scvi import settings
+        from scvi.data._constants import (
+            _SETUP_ARGS_KEY,
+            ADATA_MINIFY_TYPE,
+        )
+        from scvi.data._utils import _is_minified
+
+        scvi_model._check_if_trained(message="Passed in scvi model hasn't been trained yet.")
+
+        model_kwargs = dict(model_kwargs)
+        init_params = scvi_model.init_params_
+        non_kwargs = init_params["non_kwargs"]
+        kwargs = init_params["kwargs"]
+        kwargs = {k: v for (i, j) in kwargs.items() for (k, v) in j.items()}
+        for k, v in {**non_kwargs, **kwargs}.items():
+            if k in model_kwargs.keys():
+                warnings.warn(
+                    f"Ignoring param '{k}' as it was already passed in to pretrained "
+                    f"SCVI model with value {v}.",
+                    UserWarning,
+                    stacklevel=settings.warnings_stacklevel,
+                )
+                del model_kwargs[k]
+
+        if scvi_model.minified_data_type == ADATA_MINIFY_TYPE.LATENT_POSTERIOR:
+            raise ValueError(
+                f"We cannot use the given scVI model to initialize {cls.__name__} because it has "
+                "minified adata. Keep counts when minifying model using "
+                "minified_data_type='latent_posterior_parameters_with_counts'."
+            )
+
+        if adata is None:
+            adata = scvi_model.adata
+        else:
+            if _is_minified(adata):
+                raise ValueError(f"Please provide a non-minified `adata` to initialize {cls.__name__}.")
+            # validate new anndata against old model
+            scvi_model._validate_anndata(adata)
+
+        scvi_setup_args = deepcopy(scvi_model.adata_manager.registry[_SETUP_ARGS_KEY])
+        scvi_labels_key = scvi_setup_args["labels_key"]
+        if labels_key is None and scvi_labels_key is None:
+            raise ValueError(
+                "A `labels_key` is necessary as the scVI model was initialized without one."
+            )
+        if scvi_labels_key is None:
+            scvi_setup_args.update({"labels_key": labels_key})
+        # Look for gene embedding key and set to None if it is not found
+        if gene_emb_obsm_key is None:
+            if REGISTRY_KEYS.GENE_EMB_KEY not in adata.obsm.keys():
+                scvi_setup_args.update({"gene_emb_obsm_key": None})
+            else:
+                scvi_setup_args.update({"gene_emb_obsm_key": REGISTRY_KEYS.GENE_EMB_KEY})
+        cls.setup_anndata(
+            adata,
+            unlabeled_category=unlabeled_category,
+            **scvi_setup_args,
+        )
+        gedvi_model = cls(adata, **non_kwargs, **kwargs, **model_kwargs)
+        scvi_state_dict = scvi_model.module.state_dict()
+        gedvi_model.module.load_state_dict(scvi_state_dict, strict=False)
+        gedvi_model.was_pretrained = True
+
+        return gedvi_model
+    
+    @classmethod
+    def from_base_model(
+        cls,
+        scvi_model,
+        labels_key: str | None = None,
+        adata: AnnData | None = None,
+        **model_kwargs,
+    ):
+        """Initialize scanVI model with weights from pretrained :class:`~scvi.model.SCVI` model.
+
+        Parameters
+        ----------
+        scvi_model
+            Pretrained scvi model
+        labels_key
+            key in `adata.obs` for label information. Label categories can not be different if
+            labels_key was used to setup the SCVI model. If None, uses the `labels_key` used to
+            setup the SCVI model. If that was None, and error is raised.
+        unlabeled_category
+            Value used for unlabeled cells in `labels_key` used to setup AnnData with scvi.
+        adata
+            AnnData object that has been registered via :meth:`~GEDVI.setup_anndata`.
+        model_kwargs
+            kwargs for gedvi model
+        """
+        from copy import deepcopy
+        from scvi import settings
+        from scvi.data._constants import (
+            _SETUP_ARGS_KEY,
+        )
+        from scvi.data._utils import _is_minified
+
+        scvi_model._check_if_trained(message="Passed in scvi model hasn't been trained yet.")
+
+        model_kwargs = dict(model_kwargs)
+        init_params = scvi_model.init_params_
+        non_kwargs = init_params["non_kwargs"]
+        kwargs = init_params["kwargs"]
+        kwargs = {k: v for (i, j) in kwargs.items() for (k, v) in j.items()}
+        for k, v in {**non_kwargs, **kwargs}.items():
+            if k in model_kwargs.keys():
+                warnings.warn(
+                    f"Ignoring param '{k}' as it was already passed in to pretrained "
+                    f"SCVI model with value {v}.",
+                    UserWarning,
+                    stacklevel=settings.warnings_stacklevel,
+                )
+                del model_kwargs[k]
+
+        if adata is None:
+            adata = scvi_model.adata
+        else:
+            if _is_minified(adata):
+                raise ValueError(f"Please provide a non-minified `adata` to initialize {cls.__name__}.")
+            # validate new anndata against old model
+            scvi_model._validate_anndata(adata)
+
+        scvi_setup_args = deepcopy(scvi_model.adata_manager.registry[_SETUP_ARGS_KEY])
+        scvi_labels_key = scvi_setup_args["labels_key"]
+        if labels_key is None and scvi_labels_key is None:
+            raise ValueError(
+                "A `labels_key` is necessary as the scVI model was initialized without one."
+            )
+        if scvi_labels_key is None:
+            scvi_setup_args.update({"labels_key": labels_key})
+        cls.setup_anndata(
+            adata,
+            **scvi_setup_args,
+        )
+        gedvi_model = cls(adata, **non_kwargs, **kwargs, **model_kwargs)
+        scvi_state_dict = scvi_model.module.state_dict()
+        gedvi_model.module.load_state_dict(scvi_state_dict, strict=False)
+        gedvi_model.was_pretrained = True
+
+        return gedvi_model
+
     def predict(
         self,
         adata: AnnData | None = None,
@@ -166,7 +344,7 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         Parameters
         ----------
         adata
-            AnnData object that has been registered via :meth:`~scvi.model.SCANVI.setup_anndata`.
+            AnnData object that has been registered via :meth:`~GEDVI.setup_anndata`.
         indices
             Return probabilities for each class label.
         soft
@@ -237,7 +415,7 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         data_params: dict[str, Any]={}, 
         model_params: dict[str, Any]={}, 
         train_params: dict[str, Any]={},
-        return_runner: bool = True
+        return_runner: bool = False
     ):
         """Train the model.
 
@@ -296,7 +474,7 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
 
         plan_kwargs = train_params.pop('plan_kwargs', {})
         # create training plan
-        training_plan = self._training_plan_cls(self.module, self.n_labels, **plan_kwargs)
+        training_plan = self._training_plan_cls(module=self.module, n_classes=self.n_labels, **plan_kwargs)
         check_val_every_n_epoch = train_params.pop('check_val_every_n_epoch', 10)
         # if we have labeled cells, we want to subsample labels each epoch
         sampler_callback = [SubSampleLabels()] if len(self._labeled_indices) != 0 else []
@@ -328,6 +506,28 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             return runner
         else:
             return runner()
+        
+    def _validate_anndata(
+        self, adata: AnnOrMuData | None = None, copy_if_view: bool = True, extend_categories: bool = True
+    ) -> AnnData:
+        """Validate anndata has been properly registered, transfer if necessary."""
+        if adata is None:
+            adata = self.adata
+
+        _check_if_view(adata, copy_if_view=copy_if_view)
+
+        adata_manager = self.get_anndata_manager(adata)
+        if adata_manager is None:
+            logger.info(
+                "Input AnnData not setup with scvi-tools. "
+                + "attempting to transfer AnnData setup"
+            )
+            self._register_manager_for_instance(self.adata_manager.transfer_fields(adata, extend_categories=extend_categories))
+        else:
+            # Case where correct AnnDataManager is found, replay registration as necessary.
+            adata_manager.validate()
+
+        return adata
         
     @torch.inference_mode()
     def get_latent_representation(
@@ -390,6 +590,9 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             'zs': [],
             'zgs': [],
         }
+        # Ignore embedding if there is none
+        if REGISTRY_KEYS.GENE_EMB_KEY not in adata.obsm.keys():
+            ignore_embedding = True
 
         for tensors in dataloader:
             if ignore_embedding:
@@ -404,7 +607,7 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             qzm, qzv = qz.loc, qz.scale.square()
 
             # Handle latent variables zg (if embeddings are not ignored)
-            if not ignore_embedding:
+            if not ignore_embedding and outputs.get(MODULE_KEYS.ZG_KEY) is not None:
                 qzg = outputs.get(MODULE_KEYS.QZG_KEY) or Normal(
                     outputs[MODULE_KEYS.QZGM_KEY], outputs[MODULE_KEYS.QZGV_KEY].sqrt()
                 )
@@ -419,20 +622,20 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
                 continue
 
             z = qzm if give_mean else outputs[MODULE_KEYS.Z_KEY]
-            if not ignore_embedding:
+            if not ignore_embedding and outputs.get(MODULE_KEYS.ZG_KEY) is not None:
                 zg = qzgm if give_mean else outputs[MODULE_KEYS.ZG_KEY]
 
             if give_mean and getattr(self.module, 'latent_distribution', None) == 'ln':
                 z = softmax(qz.sample([mc_samples]), dim=-1).mean(dim=0)
-                if not ignore_embedding:
+                if not ignore_embedding and outputs.get(MODULE_KEYS.ZG_KEY) is not None:
                     zg = softmax(qzg.sample([mc_samples]), dim=-1).mean(dim=0)
 
             results['zs'].append(z.cpu())
-            if not ignore_embedding:
+            if not ignore_embedding and outputs.get(MODULE_KEYS.ZG_KEY) is not None:
                 results['zgs'].append(zg.cpu())
 
         if return_dist:
-            if ignore_embedding:
+            if ignore_embedding or outputs.get(MODULE_KEYS.ZG_KEY) is None:
                 return (
                     torch.cat(results['z_means']).numpy(),
                     torch.cat(results['z_vars']).numpy(),
@@ -448,7 +651,7 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
                 ),
             }
 
-        if ignore_embedding:
+        if ignore_embedding or outputs.get(MODULE_KEYS.ZG_KEY) is None:
             return torch.cat(results['zs']).numpy()
 
         return {
@@ -463,7 +666,6 @@ class GEDVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         adata: AnnData,
         labels_key: str,
         unlabeled_category: str,
-        cls_labels: list[str],
         layer: str | None = None,
         gene_emb_obsm_key: str | None = 'gene_embedding',
         batch_key: str | None = None,

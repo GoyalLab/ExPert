@@ -15,6 +15,58 @@ from typing import Literal, Any
 from umap import UMAP
 
 
+def _compute_weight(
+    epoch: int,
+    step: int,
+    n_epochs_warmup: int | None,
+    n_steps_warmup: int | None,
+    n_epochs_stall: int | None,
+    max_weight: float = 1.0,
+    min_weight: float = 0.0,
+    invert: bool = False,
+) -> float:
+    """Computes the classification weight for the current step or epoch.
+
+    If both `n_epochs_warmup` and `n_steps_warmup` are None, `max_weight` is returned.
+
+    Parameters
+    ----------
+    epoch
+        Current epoch.
+    step
+        Current step.
+    n_epochs_warmup
+        Number of training epochs to scale weight on classification loss from
+        `min_weight` to `max_weight`.
+    n_steps_warmup
+        Number of training steps (minibatches) to scale weight on classification loss from
+        `min_weight` to `max_weight`.
+    max_weight
+        Maximum scaling factor on classification loss during training.
+    min_weight
+        Minimum scaling factor on classification loss during training.
+    """
+    if min_weight > max_weight:
+        raise ValueError(
+            f"min_weight={min_weight} is larger than max_weight={max_weight}."
+        )
+    # Start warmup at this epoch
+    if n_epochs_stall is not None:
+        if epoch < n_epochs_stall:
+            return min_weight
+        else:
+            epoch -= n_epochs_stall
+
+    slope = max_weight - min_weight
+    if n_epochs_warmup is not None:
+        if epoch < n_epochs_warmup:
+            return slope * (epoch / n_epochs_warmup) + min_weight
+    elif n_steps_warmup is not None:
+        if step < n_steps_warmup:
+            return slope * (step / n_steps_warmup) + min_weight
+    return max_weight
+
+
 class SemiSupervisedTrainingPlan(TrainingPlan):
     """Lightning module task for SemiSupervised Training.
 
@@ -56,12 +108,20 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
         self,
         module: BaseModuleClass,
         n_classes: int,
-        *,
-        classification_ratio: int = 50,
         lr: float = 1e-3,
         weight_decay: float = 1e-6,
         n_steps_kl_warmup: int | None = None,
         n_epochs_kl_warmup: int | None = 400,
+        n_steps_cls_warmup: int | None = None,
+        n_epochs_cls_warmup: int | None = 400,
+        n_epochs_cls_stall: int | None = 100,
+        max_cls_weight: float = 1.0,
+        min_cls_weight: float = 0.0,
+        n_steps_contr_warmup: int | None = None,
+        n_epochs_contr_warmup: int | None = 400,
+        n_epochs_contr_stall: int | None = 100,
+        max_contr_weight: float = 1.0,
+        min_contr_weight: float = 0.0,
         reduce_lr_on_plateau: bool = False,
         lr_factor: float = 0.6,
         lr_patience: int = 30,
@@ -72,8 +132,7 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
         compile: bool = False,
         compile_kwargs: dict | None = None,
         average: str = "macro",
-        plot_cm: bool = True,
-        plot_umap: bool = False,
+        use_posterior_mean: Literal["train", "val", "both"] = "train",
         **loss_kwargs,
     ):
         super().__init__(
@@ -91,42 +150,65 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
             compile_kwargs=compile_kwargs,
             **loss_kwargs,
         )
-        self.loss_kwargs.update({"classification_ratio": classification_ratio})
+        # CLS params
+        self.n_steps_cls_warmup = n_steps_cls_warmup
+        self.n_epochs_cls_warmup = n_epochs_cls_warmup
+        self.n_epochs_cls_stall = n_epochs_cls_stall
+        self.max_cls_weight = max_cls_weight
+        self.min_cls_weight = min_cls_weight
+        self.use_posterior_mean = use_posterior_mean
+        # Contrastive params
+        self.n_steps_contr_warmup = n_steps_contr_warmup
+        self.n_epochs_contr_warmup = n_epochs_contr_warmup
+        self.n_epochs_contr_stall = n_epochs_contr_stall
+        self.max_contr_weight = max_contr_weight
+        self.min_contr_weight = min_contr_weight
+        # Misc
         self.n_classes = n_classes
         self.average = average
-        self.plot_cm = plot_cm
-        self.plot_umap = plot_umap
+        self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
+        self.plot_umap = self.loss_kwargs.pop("plot_umap", False)
         # Initialize confusion matrix
         self.train_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
         self.val_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
         self.test_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
-
+    
     def log_with_mode(self, key: str, value: Any, mode: str, **kwargs):
         """Log with mode."""
         # TODO: Include this with a base training plan
         self.log(f"{mode}_{key}", value, **kwargs)
 
-    def plot_confusion(self, y_true, y_pred, figsize=(10, 8), hm_kwargs={'annot': False}, verbose=False, plt_file=None):
-        from sklearn.metrics import confusion_matrix
-        import numpy as np
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        
-        # Get class labels (for multiclass classification, this will correspond to unique labels)
-        class_labels = np.unique(y_pred)
-        # Generate confusion matrix
-        cm = confusion_matrix(y_true, y_pred, labels=class_labels)
-        # cm_percentage = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
-        # Plot confusion matrix using seaborn heatmap
-        plt.figure(figsize=figsize)
-        sns.heatmap(cm, xticklabels=class_labels, yticklabels=class_labels, **hm_kwargs)
-        plt.xlabel('Predicted Labels')
-        plt.ylabel('True Labels')
-        plt.title('Confusion Matrix')
-        # Return the plot instead of showing it
-        fig = plt.gcf()  # Get the current figure
-        plt.close(fig)  # Close the figure to prevent it from displaying
-        return fig
+    @property
+    def classification_ratio(self):
+        """Scaling factor on classification weight during training. Consider Jax"""
+        klw = _compute_weight(
+            self.current_epoch,
+            self.global_step,
+            self.n_epochs_cls_warmup,
+            self.n_steps_cls_warmup,
+            self.n_epochs_cls_stall,
+            self.max_cls_weight,
+            self.min_cls_weight,
+        )
+        return (
+            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
+        )
+
+    @property
+    def contrastive_loss_weight(self):
+        """Scaling factor on contrastive weight during training. Consider Jax"""
+        klw = _compute_weight(
+            self.current_epoch,
+            self.global_step,
+            self.n_epochs_contr_warmup,
+            self.n_steps_contr_warmup,
+            self.n_epochs_contr_stall,
+            self.max_contr_weight,
+            self.min_contr_weight,
+        )
+        return (
+            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
+        )
 
     def compute_and_log_metrics(
         self, loss_output: LossOutput, metrics: dict[str, ElboMetric], mode: str
@@ -140,6 +222,16 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
                 self.log(
                     f"{mode}_{k}",
                     rl.mean() if isinstance(rl, torch.Tensor) else rl,
+                    on_epoch=True,
+                    batch_size=loss_output.n_obs_minibatch,
+                    prog_bar=True,
+                )
+        # Log individual kl local losses if there are multiple
+        if isinstance(loss_output.kl_local, dict) and len(loss_output.kl_local.keys()) > 1:
+            for k, kl in loss_output.kl_local.items():
+                self.log(
+                    f"{mode}_{k}",
+                    kl.mean() if isinstance(kl, torch.Tensor) else kl,
                     on_epoch=True,
                     batch_size=loss_output.n_obs_minibatch,
                     prog_bar=True,
@@ -224,8 +316,13 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
             full_dataset = batch
             labelled_dataset = None
 
+        # Compute KL warmup
         if "kl_weight" in self.loss_kwargs:
             self.loss_kwargs.update({"kl_weight": self.kl_weight})
+        # Compute CL warmup
+        self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
+        self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
+        self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "train" or self.use_posterior_mean == "both"})
         input_kwargs = {
             "labelled_tensors": labelled_dataset,
         }
@@ -238,6 +335,20 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
             on_epoch=True,
             batch_size=loss_output.n_obs_minibatch,
             prog_bar=True,
+        )
+        self.log(
+            "kl_weight",
+            self.loss_kwargs['kl_weight'],
+            on_epoch=True,
+            batch_size=loss_output.n_obs_minibatch,
+            prog_bar=False,
+        )
+        self.log(
+            "classification_ratio",
+            self.loss_kwargs['classification_ratio'],
+            on_epoch=True,
+            batch_size=loss_output.n_obs_minibatch,
+            prog_bar=False,
         )
         self.compute_and_log_metrics(loss_output, self.train_metrics, "train")
         return loss
@@ -254,6 +365,9 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
 
         if "kl_weight" in self.loss_kwargs:
             self.loss_kwargs.update({"kl_weight": self.kl_weight})
+        self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
+        self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
+        self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "val" or self.use_posterior_mean == "both"})
         input_kwargs = {
             "labelled_tensors": labelled_dataset,
         }
@@ -308,7 +422,7 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
                 # Log confusion matrix as a heatmap if using tensorboard
                 if isinstance(self.logger, pl.loggers.TensorBoardLogger):
                     fig = plt.figure(figsize=(10, 10), dpi=150)
-                    sns.heatmap(confusion_matrix.cpu().numpy(), annot=True, fmt='d', cmap='Blues')
+                    sns.heatmap(confusion_matrix.cpu().numpy(), annot=False)
                     plt.title(f'Validation Confusion Matrix (Epoch: {self.current_epoch})')
                     plt.close()
                     

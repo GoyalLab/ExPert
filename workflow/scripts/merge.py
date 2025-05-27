@@ -4,18 +4,27 @@ import pandas as pd
 
 from src.utils import setup_logger
 from src.merge import collapse_obs, merge
+from src.statics import DATA_SHEET_KEYS, OBS_KEYS
+from typing import List
 
 
 
-def get_basenames(fs):
+def get_basenames(fs: List[str]) -> List[str]:
     return [Path(f).stem for f in fs]
 
 
-def check_files(fs1, fs2):
+def check_files(fs1: List[str], fs2: List[str]) -> None:
     assert get_basenames(fs1) == get_basenames(fs2)
 
 
-def merge_datasets(dataset_files, merged_set_output, obs_files, pool_file, merge_method='dask'):
+def merge_datasets(
+        dataset_files: List[str], 
+        merged_set_output: str, 
+        obs_files: List[str], 
+        pool_file: str, 
+        meta_sheet: pd.DataFrame, 
+        merge_method: str = 'dask'
+    ) -> None:
     # ensure order of datasets of insertion and .obs is the same
     dataset_files = sorted(dataset_files)
     obs_files = sorted(obs_files)
@@ -24,6 +33,11 @@ def merge_datasets(dataset_files, merged_set_output, obs_files, pool_file, merge
     pool = pd.read_csv(pool_file, index_col=0)
     # collect all .obs data from the datasets
     obs = collapse_obs(obs_files)
+    # Add top level meta sheet information to obs
+    meta_sheet[OBS_KEYS.DATASET_KEY] = meta_sheet[DATA_SHEET_KEYS.INDEX].values
+    meta_sheet[OBS_KEYS.PERTURBATION_TYPE_KEY] = meta_sheet[DATA_SHEET_KEYS.PERTURBATION_TYPE].values
+    meta_sheet[OBS_KEYS.CELL_TYPE_KEY] = meta_sheet[DATA_SHEET_KEYS.CELL_TYPE].values
+    obs = obs.merge(meta_sheet[[OBS_KEYS.DATASET_KEY, OBS_KEYS.CELL_TYPE_KEY, OBS_KEYS.PERTURBATION_TYPE_KEY]], on=OBS_KEYS.DATASET_KEY)
     # reduce .var to the index
     var = pd.DataFrame(index=list(pool.index))
     logging.info(f'Prepared meta-set for merge with: {obs.shape[0]} cells, {pool.shape[0]} genes')
@@ -42,6 +56,7 @@ if __name__ == "__main__":
             pool_file=snakemake.input.pool,
             obs_files=snakemake.input.obs_files,
             merged_set_output=snakemake.output.merged_set,
+            meta_sheet=snakemake.params.meta_sheet,
             merge_method=snakemake.params.merge_method
         )
     except NameError:

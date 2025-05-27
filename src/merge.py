@@ -45,7 +45,7 @@ def _in_memory(input_pths, out_pth):
     _merge_datasets_dict(ds_dict).write_h5ad(out_pth, compression='gzip')
 
 
-def collapse_obs(obs_files, join='inner', cell_key='celltype'):
+def collapse_obs(obs_files, join='inner', cell_key='celltype') -> pd.DataFrame:
     obs = None
     # read all .obs and combine them
     for file in obs_files:

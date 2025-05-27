@@ -43,8 +43,31 @@ def save_config(c: dict, o: str):
     with open(o, 'w') as f:
         yaml.dump(c, f, default_flow_style=False)
 
-def read_data_sheet(p: str):
-    d = pd.read_csv(p)
+def determine_resources(config: dict, data_sheet: pd.DataFrame):
+    # Update configs resource requirements based on the size of the input file
+    min_mem = config['min_mem']
+    max_mem = config['max_mem']
+    # Only overwrite configs if memory is not given
+    if DATA_SHEET_KEYS.MEM not in data_sheet.columns:
+        # Fill memory column based on bytes given in metadata
+        if DATA_SHEET_KEYS.BYTES in data_sheet.columns:
+            mem_per_ds = np.maximum((data_sheet[DATA_SHEET_KEYS.BYTES] / data_sheet[DATA_SHEET_KEYS.BYTES].max() * max_mem).astype(int), min_mem)
+            data_sheet[DATA_SHEET_KEYS.MEM] = mem_per_ds.astype(str) + 'GB'
+        else:
+            # Fall back to minimum memory settings
+            data_sheet[DATA_SHEET_KEYS.MEM] = min_mem
+    else:
+        # Check if memory is given in correct format
+        assert data_sheet[DATA_SHEET_KEYS.MEM].str.endswith('GB').all()
+    # Set max memory to 2x MEM or max_mem if that is less
+    def calc_max_mem(mem_str):
+        mem_val = int(mem_str.rstrip('GB'))
+        doubled = 2 * mem_val
+        return f"{min(doubled, max_mem)}GB"
+    data_sheet[DATA_SHEET_KEYS.MAX_MEM] = data_sheet[DATA_SHEET_KEYS.MEM].apply(calc_max_mem)
+
+def read_data_sheet(config: dict):
+    d = pd.read_csv(str(config['datasheet']))
     if DATA_SHEET_KEYS.INDEX not in d.columns:
         d[DATA_SHEET_KEYS.INDEX] = d[DATA_SHEET_KEYS.P_INDEX].astype(str) + d[DATA_SHEET_KEYS.D_INDEX].fillna('').apply(lambda x: f"_{x}" if x else '')
     # set as index
@@ -52,6 +75,8 @@ def read_data_sheet(p: str):
     if DATA_SHEET_KEYS.CANCER in d.columns:
         # convert y/n to boolean
         d[DATA_SHEET_KEYS.CANCER] = d[DATA_SHEET_KEYS.CANCER].map({'y': True, 'n': False})
+    # determine resources for each dataset
+    determine_resources(config, d)
     return d
 
 
@@ -102,23 +127,6 @@ def check_types(conf):
         for expected_type, keys in type_checks.items():
             if param in keys:
                 assert isinstance(value, expected_type), f"Invalid value for {expected_type.__name__} parameter '{param}': {value}"
-
-def determine_resources(config: dict, data_sheet: pd.DataFrame):
-    # Update configs resource requirements based on the size of the input file
-    min_mem = config['min_mem']
-    max_mem = config['max_mem']
-    # Only overwrite configs if memory is not given
-    if DATA_SHEET_KEYS.MEM not in data_sheet.columns:
-        # Fill memory column based on bytes given in metadata
-        if DATA_SHEET_KEYS.BYTES in data_sheet.columns:
-            mem_per_ds = np.maximum((data_sheet[DATA_SHEET_KEYS.BYTES] / data_sheet[DATA_SHEET_KEYS.BYTES].max() * max_mem).astype(int), min_mem)
-            data_sheet[DATA_SHEET_KEYS.MEM] = mem_per_ds.astype(str) + 'GB'
-        else:
-            # Fall back to minimum memory settings
-            data_sheet[DATA_SHEET_KEYS.MEM] = min_mem
-    else:
-        # Check if memory is given in correct format
-        assert data_sheet[DATA_SHEET_KEYS.MEM].str.endswith('GB').all()
 
 def check_config(conf: dict):
     # validate config types

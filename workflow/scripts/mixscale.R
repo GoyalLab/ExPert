@@ -5,6 +5,8 @@ parser <- ArgumentParser(description = "Parser for mixscale pipeline.")
 # Add argument
 parser$add_argument("-i", "--input", required = T, help = "Path to input h5ad file.")
 parser$add_argument("-o", "--output", required = T, help = "Path to output csv file.")
+parser$add_argument("-d", "--min_deg", required = F, default = 5,
+                    help = "Minimum number of differentially expressed genes vs. control per perturbation, default is 5 (int)")
 parser$add_argument("-t", "--threshold", required = F, default = 2,
                     help = "Number of standart deviations from control group to filter cells for, default is 2 (float)")
 parser$add_argument("-m", "--min_cells_per_perturbation", required = F, default = 50,
@@ -27,6 +29,7 @@ source("bin/mixscale_utils.R")
 # Get input file path
 adata_p <- args$input
 out_p <- args$output
+min_deg <- args$min_deg
 ctrl_dev <- args$threshold
 min_cells_per_perturbation <- args$min_cells_per_perturbation
 perturbation_col <- args$pcol
@@ -40,6 +43,7 @@ seurat_obj <- mixscale_pipeline(
   seurat_obj,
   condition_col = perturbation_col,
   ctrl_col = ctrl_key,
+  min.de.genes = min_deg,
   verbose = T
 )
 # 3. Write filtered object to disk (optional)

@@ -16,8 +16,7 @@ def sample_from_ctrl_cells(
         adata: ad.AnnData,                  # AnnData object
         cls_labels: List[str],              # Labels to group by
         ctrl_key: str = 'control',          # Key for control group in last cls label
-        n_ctrl: int | None = None,          # Fixed number of cells to draw from each control
-        x_ctrl: float = 2.5,                # x_ctrl = n_cells_ctrl / n_cells_perturbed (within each group)
+        n_ctrl: int = 2000,                 # Fixed number of cells to draw from each control
     ) -> ad.AnnData:
     
     if adata.obs[cls_labels[:-1]].value_counts().shape[0] == 1:
@@ -44,7 +43,7 @@ def sample_from_ctrl_cells(
         .merge(scpp, on=cls_labels[:-1])
         .groupby(cls_labels[:-1], observed=True)
         .apply(lambda group: group.sample(
-            n=int(group['count'].unique()[0] * x_ctrl) if n_ctrl is None else n_ctrl, 
+            n=int(group['count'].unique()[0]) if int(group['count'].unique()[0]) < n_ctrl else n_ctrl, 
             replace=False
         )['cell_idx_reset'])
     ).reset_index()['cell_idx_reset']

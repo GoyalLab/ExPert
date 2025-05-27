@@ -7,12 +7,6 @@ from scvi.train import TrainRunner
 from scvi.dataloaders import SemiSupervisedDataSplitter
 from scvi.model._utils import get_max_epochs_heuristic
 import yaml
-import scipy.sparse as sp
-import anndata as ad
-import logging
-
-from ray import tune, train
-import ray
 
 
 def prepare_scanvi(model: scvi.model.SCANVI, data_params: dict[str, Any]={}, scanvi_params: dict[str, Any]={}, train_params: dict[str, Any]={}):
@@ -93,61 +87,3 @@ def save_model(model, params={}, **save_kwargs):
     save_params(params, m)
     # save model
     model.save(m, **save_kwargs)  
-
-
-class HPTuner:
-    PERC_GPU: float = 1.0
-    def __init__(
-            self,
-            adata: ad.AnnData,
-            batch_label: str = 'dataset',
-            cls_label: str = 'perturbation',
-            perc_gpu_per_task: float = 1.0
-
-    ):
-        self.data_ref = ray.put(adata)
-        self.batch_label: str = batch_label
-        self.cls_label: str = cls_label
-        self.PERC_GPU: float = perc_gpu_per_task
-
-    def run_trial(self, params: dict) -> dict[str, Any]:
-        metric = params.get('metric', 'validation_loss')
-        model_params = params['model_params']
-        data = ray.get(self.data_ref)
-        data.X = sp.csr_matrix(data.X)
-        logging.info(f'Setting up model with {params}')
-        scvi.model.SCANVI.setup_anndata(data, batch_key=self.batch_label, labels_key=self.cls_label, unlabeled_category='unknown')
-        model = scvi.model.SCANVI(data, **model_params)
-        data_params = params['data_params']
-        train_params = params['train_params']
-        runner, data_splitter = prepare_scanvi(model, data_params, train_params)
-        logging.info(f'Training model')
-        runner()
-        logging.info(f'Finished training model')
-        metric_loss = runner.trainer.callback_metrics.get(metric)
-        # train.report({metric: metric_loss})
-        params['train_idx'] = data_splitter.train_idx
-        params['val_idx'] = data_splitter.val_idx
-        # logging.info(f'Saving model')
-        # save_model(model, params, overwrite=True, save_anndata=False)
-        return {metric: metric_loss}
-
-    def run(self, search_space, 
-            resources_per_trial: dict ={'cpu': 1, 'gpu': 1},
-            num_samples: int = 12,
-            metric: str = 'validation_loss',
-            mode: str = 'min',
-            output_dir: str = './'
-        ):
-        analysis = tune.run(
-            self.run_trial,
-            config=search_space,
-            resources_per_trial=resources_per_trial,
-            num_samples=num_samples,
-            metric=metric,
-            mode=mode,
-            storage_path=output_dir,
-            scheduler=tune.schedulers.ASHAScheduler(),
-        )
-        self.analysis = analysis
-        return analysis

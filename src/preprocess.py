@@ -5,6 +5,7 @@ import pandas as pd
 import logging
 import anndata as ad
 import scipy.sparse as sp
+from src.statics import P_COLS, CTRL_KEYS
 
 
 # credit to https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
@@ -85,6 +86,8 @@ def subset_ctrl_cells(
 def single_perturbation_mask(meta: pd.DataFrame, p_col: str = 'perturbation'):
     # remove multiple perturbations
     all_perturbations = meta[p_col].str.split('_', expand=True)         # Expand perturbation label
+    if all_perturbations.shape[1] < 2:
+        return None
     col = all_perturbations.iloc[:, 1]                                  # Focus on second label
     mask = (
         col.isna() |                                    # Keep all empty second perturbations
@@ -112,10 +115,31 @@ def preprocess_dataset(
         min_genes: int = 5_000,
         seed: int = 42
     ) -> ad.AnnData:
+    # Check perturbation column
+    if p_col not in adata.obs.columns:
+        logging.info(f'"{p_col}" not found in adata.obs, looking for alternatives.')
+        candidate_p_cols = adata.obs.columns.intersection(set(P_COLS))
+        if len(candidate_p_cols) == 0:
+            raise ValueError(f'Could not find an alternative perturbation column in adata. Looked for {P_COLS}')
+        # Fall back to first hit
+        adata.obs[p_col] = adata.obs[candidate_p_cols[0]]
+        logging.info(f'Falling back to "{p_col}" as perturbation column')
+    # Check control key
+    if np.sum(adata.obs[p_col]==ctrl_key) == 0:
+        logging.info(f'{ctrl_key} not found in "{p_col}", looking for alternatives.')
+        all_ps = set(adata.obs[p_col].unique())
+        candidate_ctrl_keys = all_ps.intersection(set(CTRL_KEYS))
+        if len(candidate_ctrl_keys) == 0:
+            raise ValueError(f'Could not find an alternative control key in "{p_col}". Looked for {CTRL_KEYS}')
+        ctrl_key_hit = list(candidate_ctrl_keys)[0]
+        adata.obs[p_col] = adata.obs[p_col].replace(ctrl_key_hit, ctrl_key)
+        logging.info(f'Falling back to "{ctrl_key_hit}" as control key')
     # Filter for single perturbations only
     if single_perturbations_only:
+        logging.info(f'Filtering column "{p_col}" for single perturbations only')
         sp_mask = single_perturbation_mask(adata.obs, p_col=p_col)
-        adata._inplace_subset_obs(sp_mask)
+        if sp_mask is not None:
+            adata._inplace_subset_obs(sp_mask)
     # Ensure adata.X is always in csr format
     if not isinstance(adata.X, sp.csr_matrix):
         adata.X = sp.csr_matrix(adata.X)
@@ -130,10 +154,10 @@ def preprocess_dataset(
     if hvg:
         # Calculate highly variable genes
         if adata.n_vars <= min_genes:
-            logging.info(f'Selecting all genes for dataset {name}, because of low gene number: {adata.n_vars}')
+            logging.info(f'Selecting all genes for dataset "{name}", because of low gene number: {adata.n_vars}')
             adata.var['highly_variable'] = True
         else:
-            logging.info(f'Determining highly variable genes for dataset {name}')
+            logging.info(f'Determining highly variable genes for dataset "{name}"')
             # Use seurat_v3 for raw counts
             logging.info(f'Using flavor "seurat_v3" when determining hvgs for raw counts')
             sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset, flavor='seurat_v3')
@@ -142,15 +166,15 @@ def preprocess_dataset(
         adata.var['highly_variable'] = True
     # normalize data
     if norm:
-        logging.info(f'Normalizing dataset {name}')
+        logging.info(f'Normalizing dataset "{name}"')
         sc.pp.normalize_total(adata)
     # apply log transformation
     if log:
-        logging.info(f'log1p normalizing dataset {name}')
+        logging.info(f'log1p normalizing dataset "{name}"')
         sc.pp.log1p(adata)
     # center and scale the data
     if scale:
-        logging.info(f'Scaling and centering {name}')
+        logging.info(f'Scaling and centering "{name}"')
         sc.pp.scale(adata)
     logging.info(f'Found {np.sum(adata.var.highly_variable)} highly variable genes out of {adata.n_vars} total genes')
     return adata

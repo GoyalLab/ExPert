@@ -1,3 +1,4 @@
+from math import e
 from typing import TYPE_CHECKING, Iterable
 
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
@@ -74,13 +75,12 @@ class GPVAE(BaseModuleClass):
         lambda_g: float = 1,
         mixup_lambda: float = 1,
         update_qz: bool = True,
-        update_method: Literal['additive', 'encoder'] = 'additive',
+        update_method: Literal['additive', 'encoder', 'concat'] = 'concat',
         n_continuous_cov: int = 0,
         n_cats_per_cov: Iterable[int] | None = None,
-        y_prior: torch.Tensor | None = None,
         linear_classifier: bool = False,
         classifier_parameters: dict = {},
-        use_posterior_mean: bool = True,
+        use_posterior_mean: bool = False,
         recon_weight: float = 1,
         mse_weight: float = 0.1,
         corr_weight: float = 1,
@@ -99,7 +99,7 @@ class GPVAE(BaseModuleClass):
         extra_decoder_kwargs: dict | None = None,
 
     ):
-        from scvi.nn import DecoderSCVI, Encoder, Decoder, EncoderTOTALVI, DecoderTOTALVI
+        from scvi.nn import DecoderSCVI, Encoder
         # Initialize base model class
         super().__init__()
 
@@ -187,24 +187,9 @@ class GPVAE(BaseModuleClass):
             **_extra_encoder_kwargs,
             return_dist=True,
         )
-
-        n_input_encoder_xg = n_latent_x + n_latent_g
-        self.xg_encoder = Encoder(
-            n_input=n_input_encoder_xg, 
-            n_output=n_latent_x, 
-            n_hidden=n_hidden_x,
-            n_layers=n_layers_encoder_x, 
-            n_cat_list=encoder_cat_list, 
-            dropout_rate=dropout_rate_encoder_x, 
-            use_batch_norm=use_batch_norm_encoder, 
-            use_layer_norm=use_layer_norm_encoder,
-            var_activation=var_activation,
-            **_extra_encoder_kwargs,
-            return_dist=True,
-        )
-
+        n_input_decoder = n_latent_x + n_latent_g if self.update_method == 'concat' else n_latent_x
         self.decoder = DecoderSCVI(
-            n_input=n_latent_x,
+            n_input=n_input_decoder,
             n_output=n_input_x,
             n_cat_list=cat_list,
             n_layers=n_layers_decoder,
@@ -217,38 +202,11 @@ class GPVAE(BaseModuleClass):
 
         # Initialize classifier
         self.classifier = Classifier(
-            n_latent_x,
+            n_input_decoder,
             n_labels=n_labels,
             use_batch_norm=use_batch_norm_encoder,
             use_layer_norm=use_layer_norm_encoder,
             **self.cls_parameters,
-        )
-        # Initialize prior probabilities for y
-        self.y_prior = torch.nn.Parameter(
-            y_prior if y_prior is not None else (1 / n_labels) * torch.ones(1, n_labels),
-            requires_grad=False,
-        )
-
-        # Add scanvi latent vae
-        self.encoder_z2_z1 = Encoder(
-            n_latent_x,
-            n_latent_x,
-            n_cat_list=[self.n_labels],
-            n_layers=n_layers_encoder_x,
-            n_hidden=n_hidden_x,
-            dropout_rate=dropout_rate_encoder_x,
-            use_batch_norm=use_batch_norm_encoder,
-            use_layer_norm=use_layer_norm_encoder,
-            return_dist=True,
-        )
-        self.decoder_z1_z2 = Decoder(
-            n_latent_x,
-            n_latent_x,
-            n_cat_list=[self.n_labels],
-            n_layers=n_layers_decoder,
-            n_hidden=n_hidden_x,
-            use_batch_norm=use_batch_norm_decoder,
-            use_layer_norm=use_layer_norm_decoder,
         )
 
     def _get_inference_input(
@@ -277,6 +235,7 @@ class GPVAE(BaseModuleClass):
 
         return {
             MODULE_KEYS.Z_KEY: inference_outputs[MODULE_KEYS.Z_KEY],
+            MODULE_KEYS.ZG_KEY: inference_outputs[MODULE_KEYS.ZG_KEY],
             MODULE_KEYS.LIBRARY_KEY: inference_outputs[MODULE_KEYS.LIBRARY_KEY],
             MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
             MODULE_KEYS.Y_KEY: tensors[REGISTRY_KEYS.LABELS_KEY],
@@ -318,39 +277,35 @@ class GPVAE(BaseModuleClass):
         Before v1.1, this method by default returned probabilities per label,
         see #2301 for more details.
         """
-        b_ = b
         
+        b_ = b
+        g_ = g
         if self.log_variational:
             b_ = torch.log1p(b_)
+        if self.log_variational_emb:
+            g_ = torch.log1p(g_)
 
         if cont_covs is not None and self.encode_covariates is True:
             encoder_input_b = torch.cat((b_, cont_covs), dim=-1)
+            encoder_input_g = torch.cat((g_, cont_covs), dim=-1)
         else:
             encoder_input_b = b_
+            encoder_input_g = g_
         if cat_covs is not None and self.encode_covariates is True:
             categorical_input = torch.split(cat_covs, 1, dim=1)
         else:
             categorical_input = ()
         
-        # Encode X
-        _qz, _z = self.x_encoder(encoder_input_b, batch_index, *categorical_input)
-        # Encode G (if exists)
-        if g is not None:
-            g_ = g
-            if self.log_variational_emb:
-                g_ = torch.log1p(g_)
-            if cont_covs is not None and self.encode_covariates is True:
-                encoder_input_g = torch.cat((g_, cont_covs), dim=-1)
-            else:
-                encoder_input_g = g_
-            qz_g, z_g = self.g_encoder(encoder_input_g, batch_index, *categorical_input)
-            qz, z = self._update_latent_x(_qz, _z, qz_g, z_g)
-        else:
-            qz, z = _qz, _z
+        # Encode B (basal)
+        qz, z = self.x_encoder(encoder_input_b, batch_index, *categorical_input)
+        # Encode G (gene embedding)
+        _, z_g = self.g_encoder(encoder_input_g, batch_index, *categorical_input)
+        # Combine latent spaces
+        _, z_ = self._update_latent_x(z, z_g)
         # Whether to use posterior mean or latent space to classify
-        z = qz.loc if self.use_posterior_mean else z
+        z_ = qz.loc if self.use_posterior_mean else z_
         # Classify
-        w_y = self.classifier(z)
+        w_y = self.classifier(z_)
         return w_y
     
     @auto_move_data
@@ -379,15 +334,17 @@ class GPVAE(BaseModuleClass):
 
     def _update_latent_x_additive(
             self, 
-            qz: Distribution, z: torch.Tensor, 
-            qz_g: Distribution, z_g: torch.Tensor,
+            z: torch.Tensor, 
+            z_g: torch.Tensor, 
+            qz: Distribution | None = None,
+            qz_g: Distribution | None = None,
         ) -> tuple[Distribution, torch.Tensor]:
         """Combine z_g with z"""
         # Same latent dimensions --> just add latents with weight
         z_g_weighted = z_g * self.lambda_g
         z_updated = z + (z_g_weighted.sum(dim=-1, keepdim=True) if self.collapse_g else z_g_weighted)
 
-        if self.update_qz:
+        if self.update_qz and qz is not None and qz_g is not None:
             qz_loc_updated = qz.loc + (qz_g.loc.sum(dim=-1, keepdim=True) if self.collapse_g else qz_g.loc * self.lambda_g)
             qz_scale_updated = torch.sqrt(
             qz.scale**2 + ((qz_g.scale.sum(dim=-1, keepdim=True) if self.collapse_g else qz_g.scale * self.lambda_g)**2)
@@ -398,12 +355,14 @@ class GPVAE(BaseModuleClass):
             return qz, z_updated
         
     def _update_latent_x_encoder(
-            self,
-            qz: Distribution, z: torch.Tensor, 
-            qz_g: Distribution, z_g: torch.Tensor,
+            self, 
+            z: torch.Tensor, 
+            z_g: torch.Tensor, 
+            qz: Distribution | None = None,
+            qz_g: Distribution | None = None,
         ) -> tuple[Distribution, torch.Tensor]:
         """Combine z and zg using another encoder"""
-        if self.update_qz:
+        if self.update_qz and qz is not None and qz_g is not None:
             _x = qz.loc
             _g = qz_g.loc
         else:
@@ -412,14 +371,22 @@ class GPVAE(BaseModuleClass):
         return self.xg_encoder(_x, _g)
     
     def _update_latent_x(
-            self,
-            qz: Distribution, z: torch.Tensor, 
-            qz_g: Distribution, z_g: torch.Tensor,
+            self, 
+            z: torch.Tensor, 
+            z_g: torch.Tensor, 
+            qz: Distribution | None = None,
+            qz_g: Distribution | None = None,
         ) -> tuple[Distribution, torch.Tensor]:
+        if len(z.shape) > 2:
+            z = torch.mean(z, dim=0)
+        if len(z_g.shape) > 2:
+            z_g = torch.mean(z_g, dim=0)
         if self.update_method == 'additive':
-            return self._update_latent_x_additive(qz, z, qz_g, z_g)
-        else:
-            return self._update_latent_x_encoder(qz, z, qz_g, z_g)
+            return self._update_latent_x_additive(z, z_g, qz, qz_g)
+        elif self.update_method == 'encoder':
+            return self._update_latent_x_encoder(z, z_g, qz, qz_g)
+        elif self.update_method == 'concat':
+            return qz, torch.cat((z, z_g), dim=-1)
     
     @auto_move_data
     def inference(
@@ -453,7 +420,7 @@ class GPVAE(BaseModuleClass):
             categorical_input = ()
         
         # Encode B (basal)
-        _qz, _z = self.x_encoder(encoder_input_b, batch_index, *categorical_input)
+        qz, z = self.x_encoder(encoder_input_b, batch_index, *categorical_input)
         # Encode G (gene embedding)
         qz_g, z_g = self.g_encoder(encoder_input_g, batch_index, *categorical_input)
         # Mix g and re-do encoding to get a baseline for batch
@@ -466,12 +433,7 @@ class GPVAE(BaseModuleClass):
                 mixed_input = rolled_g
 
             z_g_rolled = self.g_encoder(mixed_input, batch_index, *categorical_input)[1]
-            z_g_mixed = self.mixup_lambda * z_g + (1 - self.mixup_lambda) * z_g_rolled
-
-            # Update latent variables
-            qz, z = self._update_latent_x(_qz, _z, qz_g, z_g_mixed)
-        else:
-            qz, z = self._update_latent_x(_qz, _z, qz_g, z_g)
+            z_g = self.mixup_lambda * z_g + (1 - self.mixup_lambda) * z_g_rolled
 
         # We use observed lib size
         ql = None
@@ -483,10 +445,13 @@ class GPVAE(BaseModuleClass):
             library = library.unsqueeze(0).expand(
                 (n_samples, library.size(0), library.size(1))
             )
+            z = torch.mean(z, dim=0)
 
         return {
             MODULE_KEYS.Z_KEY: z,
+            MODULE_KEYS.ZG_KEY: z_g,
             MODULE_KEYS.QZ_KEY: qz,
+            MODULE_KEYS.QZG_KEY: qz_g,
             MODULE_KEYS.QL_KEY: ql,
             MODULE_KEYS.LIBRARY_KEY: library,
         }
@@ -495,6 +460,7 @@ class GPVAE(BaseModuleClass):
     def generative(
         self,
         z: torch.Tensor,
+        zg: torch.Tensor,
         library: torch.Tensor,
         batch_index: torch.Tensor,
         cont_covs: torch.Tensor | None = None,
@@ -511,16 +477,20 @@ class GPVAE(BaseModuleClass):
             Poisson,
             ZeroInflatedNegativeBinomial,
         )
+        # Create prior based on zx only
+        pz = Normal(torch.zeros_like(z), torch.ones_like(z))
+        # Concatente latent spaces
+        _, z_ = self._update_latent_x(z, zg)
 
         # Init decoder input
         if cont_covs is None:
-            decoder_input = z
-        elif z.dim() != cont_covs.dim():
+            decoder_input = z_
+        elif z_.dim() != cont_covs.dim():
             decoder_input = torch.cat(
-                [z, cont_covs.unsqueeze(0).expand(z.size(0), -1, -1)], dim=-1
+                [z_, cont_covs.unsqueeze(0).expand(z_.size(0), -1, -1)], dim=-1
             )
         else:
-            decoder_input = torch.cat([z, cont_covs], dim=-1)
+            decoder_input = torch.cat([z_, cont_covs], dim=-1)
         # Manage categorical covariates
         if cat_covs is not None:
             categorical_input = torch.split(cat_covs, 1, dim=1)
@@ -570,7 +540,6 @@ class GPVAE(BaseModuleClass):
 
         # Use observed library size
         pl = None
-        pz = Normal(torch.zeros_like(z), torch.ones_like(z))
 
         return {
             MODULE_KEYS.PX_KEY: px,
@@ -649,9 +618,12 @@ class GPVAE(BaseModuleClass):
 
         # Perturbed expression
         x = tensors[REGISTRY_KEYS.X_KEY]
+        z = inference_outputs[MODULE_KEYS.Z_KEY]
         px = generative_outputs[MODULE_KEYS.PX_KEY]
+        # Base KL loss on z only
+        pz = Normal(torch.zeros_like(z), torch.ones_like(z))
         kl_divergence_z = kl_divergence(
-            inference_outputs[MODULE_KEYS.QZ_KEY], generative_outputs[MODULE_KEYS.PZ_KEY]
+            inference_outputs[MODULE_KEYS.QZ_KEY], pz
         ).sum(dim=-1)
         # We always use observed library size
         kl_divergence_l = torch.zeros_like(kl_divergence_z)
@@ -694,12 +666,12 @@ class GPVAE(BaseModuleClass):
             return LossOutput(
                 loss=loss,
                 reconstruction_loss=reconst_losses,
-                kl_local=weighted_kl_local,
+                kl_local=kl_divergence_z,
                 classification_loss=ce_loss,
                 true_labels=true_labels,
                 logits=logits,
             )
-        return LossOutput(loss=loss, reconstruction_loss=reconst_losses, kl_local=weighted_kl_local)
+        return LossOutput(loss=loss, reconstruction_loss=reconst_losses, kl_local=kl_divergence_z)
 
     def on_load(self, model: BaseModelClass):
         manager = model.get_anndata_manager(model.adata, required=True)

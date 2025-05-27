@@ -7,10 +7,34 @@ class _DATA_SHEET_NT(NamedTuple):
     P_INDEX: str = 'publication index'
     D_INDEX: str = 'dataset index'
     CANCER: str = 'cancer'
+    PERTURBATION_TYPE: str = 'perturbation'
+    CELL_TYPE: str = 'cell type'
     BYTES: str = 'bytes'
     MEM: str = 'memory'
+    MAX_MEM: str = 'max_memory'
 
-def booleans():
+class _OBS_KEYS_NT(NamedTuple):
+    DATASET_KEY: str = 'dataset'
+    PERTURBATION_TYPE_KEY: str = 'perturbation'
+    CELL_TYPE_KEY: str = 'celltype_broad'
+
+def _perturbation_cols():
+    return [
+        'perturbation',
+        'gene',
+        'perturbation_1',
+        'target'
+    ]
+
+def _ctrl_keys():
+    return [
+        'control',
+        'ctrl',
+        'non-targeting',
+        'NT'
+    ]
+
+def _booleans():
     return [
         'qc', 
         'norm', 
@@ -27,7 +51,7 @@ def booleans():
         'do_tsne'
     ]
 
-def strings():
+def _strings():
     return [
         'datasheet', 
         'output_dir', 
@@ -40,7 +64,7 @@ def strings():
         'merge_method'
     ]
 
-def ints():
+def _ints():
     return [
         'n_hvg',
         'n_ctrl',
@@ -52,13 +76,16 @@ def ints():
         'max_mem'
     ]
 
-def floats():
+def _floats():
     return [
         'ctrl_dev'
     ]
 
 DATA_SHEET_KEYS = _DATA_SHEET_NT()
-STRINGS = strings()
-BOOLEANS = booleans()
-INTS = ints()
-FLOATS = floats()
+OBS_KEYS = _OBS_KEYS_NT()
+STRINGS = _strings()
+BOOLEANS = _booleans()
+INTS = _ints()
+FLOATS = _floats()
+P_COLS = _perturbation_cols()
+CTRL_KEYS = _ctrl_keys()

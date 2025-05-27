@@ -39,7 +39,7 @@ seed: 42                                    # Set seed for reproducibility
 ## Resources:
 # Set RAM limits for all tasks that require loading datasets into memory
 min_mem: 100                  # Set minimum RAM (GB)
-max_mem: 240                  # Set maximum RAN (GB)
+max_mem: 220                  # Set maximum RAM (GB)
 # 1. Download
 dwl_t: '48:00:00'
 dwl_m: '20GB'
