@@ -9,6 +9,7 @@ class _REGISTRY_KEYS_NT(NamedTuple):
     SAMPLE_KEY: str = "sample"
     LABELS_KEY: str = "labels"
     GENE_EMB_KEY: str = "gene_embedding"
+    CLS_EMB_KEY: str = "cls_embedding"
     PROTEIN_EXP_KEY: str = "proteins"
     CAT_COVS_KEY: str = "extra_categorical_covs"
     CONT_COVS_KEY: str = "extra_continuous_covs"
@@ -25,6 +26,7 @@ class _MODULE_KEYS(NamedTuple):
     X_KEY: str = "x"
     B_KEY: str = "b"
     G_EMB_KEY: str = "g"
+    C_EMB_KEY: str = "e"
     # inference (rna)
     Z_KEY: str = "z"
     QZ_KEY: str = "qz"

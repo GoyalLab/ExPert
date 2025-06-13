@@ -103,7 +103,8 @@ class GEDVAE(BaseModuleClass):
         decode_g: bool = False,
         use_x_in_zg: bool = True,
         l1_lambda: float | None = 1e-5,
-        use_attention_encoder: bool = True,
+        use_attention_encoder: bool = False,
+        use_attention_classifier: bool = True,
         extra_encoder_kwargs: dict | None = None,
         extra_decoder_kwargs: dict | None = None,
 
@@ -130,6 +131,9 @@ class GEDVAE(BaseModuleClass):
         if dropout_rate_decoder is not None:
             logging.warning('Dropout rate for decoder currently unavailable. Will fall back to 0.')
 
+        if use_attention_encoder and use_attention_classifier:
+            logging.warning(f'Using attention in encoder and classifier head may lead to poor performance.')
+
         # Save some parameters for G
         self.decode_g = decode_g
         self.use_x_in_zg = use_x_in_zg
@@ -151,6 +155,7 @@ class GEDVAE(BaseModuleClass):
         self.classifier_parameters = classifier_parameters
         self.linear_classifier = linear_classifier
         self.class_weights = None
+        self.use_attention_classifier = use_attention_classifier
         self._update_cls_params()
 
         # Setup normalizations for en- and decoder

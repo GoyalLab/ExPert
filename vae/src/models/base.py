@@ -102,6 +102,9 @@ class AttentionFCLayers(FCLayers):
             use_layer_norm, use_activation, bias, 
             inject_covariates, activation_fn
         )
+        # Check if n_hidden is a multiple of attention_heads
+        if n_hidden % attention_heads != 0:
+            raise ValueError(f'Number of hidden neurons {n_hidden} is not divisible by number of attention heads {attention_heads}.')
         # Add Attention
         self.attention = nn.MultiheadAttention(embed_dim=n_hidden, num_heads=attention_heads, batch_first=True)
         self.seq_len = seq_len

@@ -1,5 +1,7 @@
 import lightning.pytorch as pl
 import numpy as np
+from src.data._contrastive_loader import ContrastiveAnnDataLoader
+from sklearn.model_selection import train_test_split
 
 from scvi import REGISTRY_KEYS, settings
 from scvi.data import AnnDataManager
@@ -227,6 +229,163 @@ class SemiSupervisedDataSplitter(pl.LightningDataModule):
         """Create the test data loader."""
         if len(self.test_idx) > 0:
             return self.data_loader_class(
+                self.adata_manager,
+                indices=self.test_idx,
+                shuffle=False,
+                drop_last=False,
+                pin_memory=self.pin_memory,
+                **self.data_loader_kwargs,
+            )
+        else:
+            pass
+
+
+class ContrastiveDataSplitter(pl.LightningDataModule):
+    """Creates data loaders ``train_set``, ``validation_set``, ``test_set``.
+
+    If ``train_size + validation_set < 1`` then ``test_set`` is non-empty.
+    The ratio between labeled and unlabeled data in adata will be preserved
+    in the train/test/val sets.
+
+    Parameters
+    ----------
+    adata_manager
+        :class:`~scvi.data.AnnDataManager` object that has been created via ``setup_anndata``.
+    train_size
+        float, or None (default is None, which is practicaly 0.9 and potentially adding small last
+        batch to validation cells)
+    validation_size
+        float, or None (default is None)
+    shuffle_set_split
+        Whether to shuffle indices before splitting. If `False`, the val, train, and test set
+        are split in the sequential order of the data according to `validation_size` and
+        `train_size` percentages.
+    n_samples_per_label
+        Number of subsamples for each label class to sample per epoch
+    pin_memory
+        Whether to copy tensors into device-pinned memory before returning them. Passed
+        into :class:`~scvi.data.AnnDataLoader`.
+    external_indexing
+        A list of data split indices in the order of training, validation, and test sets.
+        Validation and test set are not required and can be left empty.
+        Note that per group (train,valid,test) it will cover both the labeled and unlebeled parts
+    **kwargs
+        Keyword args for data loader. If adata has labeled data, data loader
+        class is :class:`~scvi.dataloaders.SemiSupervisedDataLoader`,
+        else data loader class is :class:`~scvi.dataloaders.AnnDataLoader`.
+
+    Examples
+    --------
+    >>> adata = scvi.data.synthetic_iid()
+    >>> scvi.model.SCVI.setup_anndata(adata, labels_key="labels")
+    >>> adata_manager = scvi.model.SCVI(adata).adata_manager
+    >>> unknown_label = "label_0"
+    >>> splitter = SemiSupervisedDataSplitter(adata, unknown_label)
+    >>> splitter.setup()
+    >>> train_dl = splitter.train_dataloader()
+    """
+
+    def __init__(
+        self,
+        adata_manager: AnnDataManager,
+        train_size: float | None = None,
+        validation_size: float | None = None,
+        shuffle_set_split: bool = True,
+        max_cells_per_batch: int = 24,
+        max_classes_per_batch = 20,
+        last_first: bool = True,
+        shuffle_classes: bool = True,
+        pin_memory: bool = False,
+        external_indexing: list[np.array, np.array, np.array] | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.adata_manager = adata_manager
+        self.train_size_is_none = not bool(train_size)
+        self.train_size = 0.9 if self.train_size_is_none else float(train_size)
+        self.validation_size = validation_size
+        self.shuffle_set_split = shuffle_set_split
+        self.drop_last = kwargs.pop("drop_last", False)
+        self.data_loader_kwargs = kwargs
+        self.max_cells_per_batch = max_cells_per_batch
+        self.max_classes_per_batch = max_classes_per_batch
+        self.last_first = last_first
+        self.shuffle_classes = shuffle_classes
+
+        self.batch_size = self.data_loader_kwargs.get("batch_size", settings.batch_size)
+
+        # Set indices and labels
+        self.indices = range(adata_manager.adata.n_obs)
+        labels_state_registry = adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
+        labels = get_anndata_attribute(
+            adata_manager.adata,
+            adata_manager.data_registry.labels.attr_name,
+            labels_state_registry.original_key,
+        ).ravel()
+        self.labels = labels
+        self.pin_memory = pin_memory
+        self.external_indexing = external_indexing
+
+    def setup(self, stage: str | None = None):
+        """Split indices in train/test/val sets."""
+        # Split dataset into train and validation set
+        train_idx, val_idx = train_test_split(
+            self.indices,
+            train_size=self.train_size,
+            stratify=self.labels,           # Preserve class distribution
+            shuffle=self.shuffle_set_split,
+            random_state=settings.seed
+        )
+
+        # Split indices are stratified, TODO: add test split logic
+        indices_train = np.array(train_idx)
+        indices_val = np.array(val_idx)
+        indices_test = np.array([])
+
+        self.train_idx = indices_train.astype(int)
+        self.val_idx = indices_val.astype(int)
+        self.test_idx = indices_test.astype(int)
+
+        self.train_labels = self.labels[self.train_idx]
+
+        # Setup contrastive data loader
+        self.data_loader_class = ContrastiveAnnDataLoader
+        self.val_loader_class = AnnDataLoader
+        # Set some defaults if needed
+        dl_kwargs = {}
+
+        self.data_loader_kwargs.update(dl_kwargs)
+
+    def train_dataloader(self):
+        """Create the train data loader."""
+        return self.data_loader_class(
+            self.adata_manager,
+            labels=self.train_labels,
+            indices=self.train_idx,
+            shuffle=self.shuffle_classes,
+            drop_last=self.drop_last,
+            pin_memory=self.pin_memory,
+            **self.data_loader_kwargs,
+        )
+
+    def val_dataloader(self):
+        """Create the validation data loader."""
+        if len(self.val_idx) > 0:
+            return self.val_loader_class(
+                self.adata_manager,
+                indices=self.val_idx,
+                shuffle=False,
+                drop_last=False,
+                pin_memory=self.pin_memory,
+                **self.data_loader_kwargs,
+            )
+        else:
+            pass
+
+    def test_dataloader(self):
+        """Create the test data loader."""
+        if len(self.test_idx) > 0:
+            return self.val_loader_class(
                 self.adata_manager,
                 indices=self.test_idx,
                 shuffle=False,
