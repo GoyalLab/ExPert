@@ -474,6 +474,14 @@ class JEDVI(
         train_size: int = data_params.pop('train_size', 0.9)
         if not train_size < 1.0 and train_size > 0:
             raise ValueError(f'Parameter train_size should be between 0 and 1, got {train_size}')
+        
+        # Check if batch size is defined or not
+        if data_params.get("batch_size") is None:
+            # Fall back to product of max cells and max classes per batch
+            msb = data_params.get("max_cells_per_batch", 32)
+            mcb = data_params.get("max_classes_per_batch", 16)
+            batch_size = int(msb * mcb)
+            data_params["batch_size"] = batch_size
 
         # Create data splitter
         data_splitter = ContrastiveDataSplitter(
@@ -492,9 +500,14 @@ class JEDVI(
                 cls_emb_registry.attr_name,
                 cls_emb_registry.attr_key,
             )
+        # Use contrastive loss in validation if that set uses the same splitter
+        if data_params.get('use_contrastive_loader', None) in ['val', 'both']:
+            plan_kwargs['use_contr_in_val'] = True
+        # Share code to label mapping with training plan
+        plan_kwargs['_code_to_label'] = self._code_to_label.copy()
         # create training plan
         training_plan = self._training_plan_cls(module=self.module, n_classes=self.n_labels, **plan_kwargs)
-        check_val_every_n_epoch = train_params.pop('check_val_every_n_epoch', 10)
+        check_val_every_n_epoch = train_params.pop('check_val_every_n_epoch', 1)
      
         # create training runner
         runner = TrainRunner(
@@ -507,10 +520,12 @@ class JEDVI(
             **train_params
         )
         if 'logger' in train_params.keys():
+            # Don't log the class embedding
+            plan_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY, None)
             # save hyper-parameters to lightning logs
             hparams = {
                 'data_params': data_params,
-                'scanvi_params': model_params,
+                'model_params': model_params,
                 'plan_params': plan_kwargs,
                 'train_params': train_params
             }

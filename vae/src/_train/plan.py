@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from typing import Literal, Any
 from umap import UMAP
+from collections import Counter, defaultdict
 
 
 def _compute_weight(
@@ -25,7 +26,6 @@ def _compute_weight(
     n_epochs_stall: int | None,
     max_weight: float = 1.0,
     min_weight: float = 0.0,
-    invert: bool = False,
 ) -> float:
     """Computes the classification weight for the current step or epoch.
 
@@ -55,7 +55,7 @@ def _compute_weight(
     # Start warmup at this epoch
     if n_epochs_stall is not None:
         if epoch < n_epochs_stall:
-            return min_weight
+            return 0.0
         else:
             epoch -= n_epochs_stall
 
@@ -557,6 +557,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         n_epochs_contr_stall: int | None = 100,
         max_contr_weight: float = 1.0,
         min_contr_weight: float = 0.0,
+        use_contr_in_val: bool = False,
         n_steps_align_warmup: int | None = None,
         n_epochs_align_warmup: int | None = None,
         n_epochs_align_stall: int | None = None,
@@ -572,7 +573,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         compile: bool = False,
         compile_kwargs: dict | None = None,
         average: str = "macro",
-        use_posterior_mean: Literal["train", "val", "both"] = "train",
+        use_posterior_mean: Literal["train", "val", "both"] | None = "val",
+        log_class_distribution: bool = False,
         **loss_kwargs,
     ):
         super().__init__(
@@ -603,6 +605,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.n_epochs_contr_stall = n_epochs_contr_stall
         self.max_contr_weight = max_contr_weight
         self.min_contr_weight = min_contr_weight
+        self.use_contr_in_val = use_contr_in_val
+        self.log_class_distribution = log_class_distribution
         # Alignment params
         self.n_steps_align_warmup = n_steps_align_warmup
         self.n_epochs_align_warmup = n_epochs_align_warmup
@@ -619,8 +623,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.val_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
         self.test_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
         # Save classes that have been seen during training
-        self.train_classes = pd.Series(np.zeros(n_classes))
-        self.val_classes = pd.Series(np.zeros(n_classes))
+        self.train_class_counts = Counter()
+        self.class_batch_counts = defaultdict(list)
     
     def log_with_mode(self, key: str, value: Any, mode: str, **kwargs):
         """Log with mode."""
@@ -771,14 +775,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
         )
 
-    def _class_count(self, mode, labels) -> tuple[float, float]:
-        classes = self.train_classes if mode=='train' else self.val_classes
-        cpp = pd.Series(labels.cpu()).value_counts()
-        classes[cpp.index] += cpp.values
-        return (classes!=0).sum(), classes.mean()
-
     def training_step(self, batch, batch_idx):
-        """Training step for semi-supervised training."""
+        """Training step for supervised training."""
         # Compute KL warmup
         if "kl_weight" in self.loss_kwargs:
             self.loss_kwargs.update({"kl_weight": self.kl_weight})
@@ -788,11 +786,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         if self.max_align_weight is not None and self.max_align_weight > 0:
             self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "train" or self.use_posterior_mean == "both"})
-        # Add external embedding to batch
-        if self.loss_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in self.loss_kwargs:
-            batch[REGISTRY_KEYS.CLS_EMB_KEY] = self.loss_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
+        # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
+        # Add external embedding to batch
+        if input_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in input_kwargs:
+            batch[REGISTRY_KEYS.CLS_EMB_KEY] = input_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
         _, _, loss_output = self.forward(batch, loss_kwargs=input_kwargs)
         loss = loss_output.loss
         self.log(
@@ -817,24 +816,31 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             prog_bar=False,
         )
         self.compute_and_log_metrics(loss_output, self.train_metrics, "train")
+        y = loss_output.true_labels.squeeze(-1)
+        # Count occurrences of each class in this batch
+        unique, counts = torch.unique(y, return_counts=True)
+        for u, c in zip(unique.tolist(), counts.tolist()):
+            self.class_batch_counts[u].append(c)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step for semi-supervised training."""
+        """Validation step for supervised training."""
         # Compute KL warmup
         if "kl_weight" in self.loss_kwargs:
             self.loss_kwargs.update({"kl_weight": self.kl_weight})
         # Compute CL warmup
         self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
-        self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
+        # Compute contrastive weight
+        self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight if self.use_contr_in_val else 0.0})
         if self.max_align_weight is not None and self.max_align_weight > 0:
             self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "train" or self.use_posterior_mean == "both"})
-        # Add external embedding to batch
-        if self.loss_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in self.loss_kwargs:
-            batch[REGISTRY_KEYS.CLS_EMB_KEY] = self.loss_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
+        # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
+        # Add external embedding to batch
+        if input_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in input_kwargs:
+            batch[REGISTRY_KEYS.CLS_EMB_KEY] = input_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
         _, _, loss_output = self.forward(batch, loss_kwargs=input_kwargs)
         loss = loss_output.loss
         self.log(
@@ -845,31 +851,30 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             prog_bar=True,
         )
         self.compute_and_log_metrics(loss_output, self.val_metrics, "validation")
+    
+    def on_train_epoch_end(self):
+        if self.log_class_distribution:
+            import matplotlib.pyplot as plt
+            # Convert counter to dataframe and pad missing values with nan
+            max_len = max(len(v) for v in self.class_batch_counts.values())
+            df = pd.DataFrame({
+                k: v + [np.nan] * (max_len - len(v))
+                for k, v in self.class_batch_counts.items()
+            })
+            # Sort by class key to make comparable
+            df = df[sorted(df.columns)]
+            fig, ax = plt.subplots(figsize=(10, 5))
+            df.boxplot(ax=ax)
+            ax.set_xlabel("Class")
+            ax.set_ylabel("Samples per Batch")
+            ax.set_title("Per-Class Distribution of Samples per Batch (Boxplot)")
+            self.logger.experiment.add_figure("train_class_batch_distribution", fig, self.current_epoch)
+            plt.close(fig)
 
-    def get_umap(self, embeddings, labels, title="UMAP Projection", figsize=(10, 8), plt_file=None):
-        """Plots a UMAP projection of embeddings colored by labels."""
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-
-        umap = UMAP(n_neighbors=15, min_dist=0.1, metric="euclidean")
-        embeddings_2d = umap.fit_transform(embeddings)
-
-        plt.figure(figsize=figsize)
-        scatter = sns.scatterplot(
-            x=embeddings_2d[:, 0],
-            y=embeddings_2d[:, 1],
-            hue=labels,
-            palette="tab10",
-            legend="full",
-            alpha=0.7,
-        )
-        scatter.set_title(title)
-        scatter.set_xlabel("UMAP-1")
-        scatter.set_ylabel("UMAP-2")
-        plt.legend(title="Labels", bbox_to_anchor=(1.05, 1), loc="upper left")
-        fig = plt.gcf()
-        plt.close(fig)
-        return fig
+            # Reset for next epoch
+            self.class_batch_counts = defaultdict(list)
+        if self.plot_umap:
+            self._plt_umap('train')
 
     def on_validation_epoch_end(self):
         """Plot class label confusion matrix and UMAP projection."""
@@ -896,31 +901,75 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                         global_step=self.current_epoch
                     )
             if self.plot_umap:
-                # Perform forward pass on the validation set to get embeddings
-                full_dataset = self.trainer.datamodule.val_dataloader()
-                embeddings = []
-                predicted_labels = []
+                self._plt_umap('val')
 
-                for _, batch in enumerate(full_dataset):
-                    if len(batch) == 2:
-                        full_data = batch[0]
-                    else:
-                        full_data = batch
+    def _plt_umap(self, mode: str):
+        # Perform forward pass on the entire training or validation dataloader
+        if mode == 'train':
+            full_dataset = self.trainer.datamodule.train_dataloader()
+        elif mode == 'val':
+            full_dataset = self.trainer.datamodule.val_dataloader()
+        else:
+            pass
+        import matplotlib.pyplot as plt
+        import seaborn as sns
 
-                    with torch.no_grad():
-                        inference_outputs, _, loss_output = self.forward(full_data)
-                        embeddings.append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
-                        if self.loss_kwargs['classification_ratio'] != 0:
-                            predicted_labels.append(torch.argmax(loss_output.logits, dim=-1).cpu())
+        embeddings = []
+        labels = []
+        covs = []
+        # Collect results for all batches
+        for _, batch in enumerate(full_dataset):
+            with torch.no_grad():
+                inference_outputs, _, loss_output = self.forward(batch)
+                embeddings.append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
+                covs.append(batch[REGISTRY_KEYS.BATCH_KEY].cpu())
+                labels.append(loss_output.true_labels)
+        # Concat results pull to cpu, and reformat
+        embeddings = torch.cat(embeddings, dim=0).cpu().numpy()
+        labels = torch.cat(labels, dim=0).cpu().numpy().squeeze()
+        covs = torch.cat(covs, dim=0).cpu().numpy().squeeze()
+        # Look for actual label encoding
+        if "_code_to_label" in self.loss_kwargs:
+            labels = [self.loss_kwargs["_code_to_label"][l] for l in labels]
+        labels = pd.Categorical(labels)
+        covs = pd.Categorical(covs)
 
-                embeddings = torch.cat(embeddings, dim=0)
-                if self.loss_kwargs['classification_ratio'] != 0:
-                    predicted_labels = torch.cat(predicted_labels, dim=0)
-                    predicted_labels = predicted_labels.cpu().numpy()
-                else:
-                    predicted_labels = None
+        """Plots a UMAP projection of validation latent space."""
+        umap = UMAP(n_neighbors=15, min_dist=0.1, metric="euclidean")
+        embeddings_2d = umap.fit_transform(embeddings)
 
-                embeddings = embeddings.cpu().numpy()
-
-                fig_umap = self.get_umap(embeddings, predicted_labels, title=f"UMAP Projection (Predicted Labels), Epoch: {self.current_epoch}")
-                self.logger.experiment.add_figure("val_umap_projection", fig_umap, global_step=self.current_epoch)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150)
+        # Plot classes
+        sns.scatterplot(
+            x=embeddings_2d[:, 0],
+            y=embeddings_2d[:, 1],
+            hue=labels,
+            alpha=0.7,
+            ax=axes[0]
+        )
+        axes[0].set_title(f"Classes @ Epoch: {self.current_epoch}")
+        axes[0].set_xlabel("UMAP-1")
+        axes[0].set_ylabel("UMAP-2")
+        axes[0].legend(
+            bbox_to_anchor=(0.5, -0.15),
+            loc="upper center",
+            title="Classes",
+        )
+        # Plot batch keys
+        sns.scatterplot(
+            x=embeddings_2d[:, 0],
+            y=embeddings_2d[:, 1],
+            hue=covs,
+            alpha=0.7,
+            ax=axes[1]
+        )
+        axes[1].set_title(f"Batch Keys @ Epoch: {self.current_epoch}")
+        axes[1].set_xlabel("UMAP-1")
+        axes[1].set_ylabel("UMAP-2")
+        axes[1].legend(
+            bbox_to_anchor=(0.5, -0.15),
+            loc="upper center",
+            title="BATCH_KEY",
+        )
+        self.logger.experiment.add_figure(f"{mode}_z_umap", fig, self.current_epoch)
+        plt.close(fig)

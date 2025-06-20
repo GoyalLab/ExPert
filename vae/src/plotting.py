@@ -125,6 +125,7 @@ def plot_performance_support_corr(summary: pd.DataFrame, o: str):
     plt.xlabel('Class support (log)')
     plt.ylabel('Macro f1-score')
     plt.savefig(o, dpi=300, bbox_inches='tight')
+    plt.close()
 
 def plot_model_results_mode(latent: ad.AnnData, mode: str, batch_key: str, cls_labels: list[str], plt_dir: str, cm: bool = True, add_key: str = '') -> None:
     for i, cl in enumerate([*cls_labels, batch_key]):
@@ -202,6 +203,21 @@ def get_model_results(
     summaries = pd.concat(summaries, axis=0)
     class_reports = pd.concat(class_reports, axis=0)
     latents = ad.concat(latents, axis=0)
+    # Calculate overall latent
+    sc.pp.neighbors(latents, use_rep='X')
+    sc.tl.umap(latents)
+    pp_plt_dir = os.path.join(plt_dir, 'per_perturbation')
+    os.makedirs(pp_plt_dir, exist_ok=True)
+    if plot:
+        pal = ['#919aa1', '#94c47d', '#ff7f0f']
+        # Plot train and val for every perturbation
+        for p in latents.obs.cls_label.unique():
+            latents.obs['mask'] = latents.obs['mode'].values.tolist()
+            latents.obs.loc[latents.obs.cls_label!=p, 'mask'] = 'other'
+            latents.obs['mask'] = pd.Categorical(latents.obs['mask'])
+            sc.pl.umap(latents, title=p, color='mask', palette=pal, return_fig=True, show=False)
+            plt.savefig(os.path.join(pp_plt_dir, f'{p}.png'), dpi=300, bbox_inches='tight')
+            plt.close()
     if save:
         logging.info(f'Saving results to: {version_dir}')
         latents.write_h5ad(os.path.join(version_dir, 'latent.h5ad'))

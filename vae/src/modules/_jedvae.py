@@ -1,5 +1,7 @@
 from typing import TYPE_CHECKING, Iterable
 
+from sympy import false
+
 from src.models.base import AttentionEncoder
 from src.modules._base import EmbeddingClassifier
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
@@ -78,6 +80,7 @@ class JEDVAE(VAE):
         use_attention_encoder: bool = False,
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
+        reduction: Literal['mean', 'sum'] = 'sum',
         extra_encoder_kwargs: dict | None = None,
         extra_decoder_kwargs: dict | None = None,
     ):
@@ -121,6 +124,7 @@ class JEDVAE(VAE):
         self._update_cls_params()
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
+        self.reduction = reduction
 
         # Setup normalizations for en- and decoder
         use_batch_norm_encoder = use_batch_norm == 'encoder' or use_batch_norm == 'both'
@@ -430,6 +434,8 @@ class JEDVAE(VAE):
         pos_mask = pos_mask * (1 - self_mask)  # now only i ≠ j positives are kept
         # Step 5: Construct mask for denominator A(i): all indices ≠ i (exclude self)
         logits_mask = 1 - self_mask  # mask with 0s on diagonal, 1s elsewhere
+        # Step 5.1: Take only the lower triangular part of the logits_mask
+        logits_mask = torch.tril(logits_mask, diagonal=-1)
         # Step 6: Compute softmax denominator: ∑_{a ∈ A(i)} exp(z_i • z_a / τ)
         denom = (exp_logits * logits_mask).sum(dim=1, keepdim=True)  # shape (n_obs, 1)
         # Step 7: Compute log-softmax for each pair: log( exp(z_i • z_p / τ) / denom )
@@ -472,9 +478,18 @@ class JEDVAE(VAE):
         pz: Distribution = generative_outputs[MODULE_KEYS.PZ_KEY]
         
         # Compute basic kl divergence between prior and posterior x distributions
-        kl_divergence_z = kl_divergence(qz, pz).sum(dim=-1)
-        # Calculate reconstruction loss
-        reconst_loss = -px.log_prob(x).sum(-1) * rl_weight
+        kl_divergence_z_mat = kl_divergence(qz, pz)
+        # Calculate reconstruction loss over batch and all features
+        reconst_loss_mat = -px.log_prob(x)
+        # Aggregate elbo losses over latent dimensions / input features
+        if self.reduction == 'sum':
+            kl_divergence_z = kl_divergence_z_mat.sum(-1)
+            reconst_loss = reconst_loss_mat.sum(-1) * rl_weight
+        elif self.reduction == 'mean':
+            kl_divergence_z = kl_divergence_z_mat.mean(-1)
+            reconst_loss = reconst_loss_mat.mean(-1) * rl_weight
+        else:
+            raise ValueError(f'reduction has to be either "sum" or "mean", got {self.reduction}')
         
         # weighted KL
         weighted_kl_local = kl_weight * kl_divergence_z
@@ -487,21 +502,24 @@ class JEDVAE(VAE):
             'loss': torch.mean(reconst_loss + weighted_kl_local),
             'reconstruction_loss': reconst_loss,
             'kl_local': kl_locals,
+            'true_labels': tensors[REGISTRY_KEYS.LABELS_KEY]
         }
         # Create extra metric container
         extra_metrics = {}
 
-        # Add contrastive loss
-        contr_loss = self._contrastive_loss(z, tensors, temperature=contrastive_temperature)
-        lo_kwargs['loss'] += contr_loss * contrastive_loss_weight
-        extra_metrics.update({'contrastive_loss': contr_loss})
+        # Add contrastive loss if it is specified
+        if contrastive_loss_weight is not None and contrastive_loss_weight > 0:
+            contr_loss = self._contrastive_loss(z, tensors, temperature=contrastive_temperature, reduction=self.reduction)
+            lo_kwargs['loss'] += contr_loss * contrastive_loss_weight
+            extra_metrics.update({'contrastive_loss': contr_loss})
         # Add classification based losses
         if classification_ratio is not None and classification_ratio > 0:
             ce_loss, true_labels, logits, align_loss = self.classification_loss(
                 tensors, 
                 use_posterior_mean, 
                 use_ext_emb,
-                alignment_loss_weight
+                alignment_loss_weight,
+                reduction=self.reduction
             )
             # Add z classification loss to overall loss
             lo_kwargs['loss'] += ce_loss * classification_ratio

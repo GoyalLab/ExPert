@@ -1,5 +1,6 @@
 import lightning.pytorch as pl
 import numpy as np
+from typing import Literal
 from src.data._contrastive_loader import ContrastiveAnnDataLoader
 from sklearn.model_selection import train_test_split
 
@@ -241,49 +242,7 @@ class SemiSupervisedDataSplitter(pl.LightningDataModule):
 
 
 class ContrastiveDataSplitter(pl.LightningDataModule):
-    """Creates data loaders ``train_set``, ``validation_set``, ``test_set``.
-
-    If ``train_size + validation_set < 1`` then ``test_set`` is non-empty.
-    The ratio between labeled and unlabeled data in adata will be preserved
-    in the train/test/val sets.
-
-    Parameters
-    ----------
-    adata_manager
-        :class:`~scvi.data.AnnDataManager` object that has been created via ``setup_anndata``.
-    train_size
-        float, or None (default is None, which is practicaly 0.9 and potentially adding small last
-        batch to validation cells)
-    validation_size
-        float, or None (default is None)
-    shuffle_set_split
-        Whether to shuffle indices before splitting. If `False`, the val, train, and test set
-        are split in the sequential order of the data according to `validation_size` and
-        `train_size` percentages.
-    n_samples_per_label
-        Number of subsamples for each label class to sample per epoch
-    pin_memory
-        Whether to copy tensors into device-pinned memory before returning them. Passed
-        into :class:`~scvi.data.AnnDataLoader`.
-    external_indexing
-        A list of data split indices in the order of training, validation, and test sets.
-        Validation and test set are not required and can be left empty.
-        Note that per group (train,valid,test) it will cover both the labeled and unlebeled parts
-    **kwargs
-        Keyword args for data loader. If adata has labeled data, data loader
-        class is :class:`~scvi.dataloaders.SemiSupervisedDataLoader`,
-        else data loader class is :class:`~scvi.dataloaders.AnnDataLoader`.
-
-    Examples
-    --------
-    >>> adata = scvi.data.synthetic_iid()
-    >>> scvi.model.SCVI.setup_anndata(adata, labels_key="labels")
-    >>> adata_manager = scvi.model.SCVI(adata).adata_manager
-    >>> unknown_label = "label_0"
-    >>> splitter = SemiSupervisedDataSplitter(adata, unknown_label)
-    >>> splitter.setup()
-    >>> train_dl = splitter.train_dataloader()
-    """
+    
 
     def __init__(
         self,
@@ -292,10 +251,11 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         validation_size: float | None = None,
         shuffle_set_split: bool = True,
         max_cells_per_batch: int = 24,
-        max_classes_per_batch = 20,
+        max_classes_per_batch: int = 20,
         last_first: bool = True,
         shuffle_classes: bool = True,
         pin_memory: bool = False,
+        use_contrastive_loader: Literal['train', 'val', 'both'] | None = 'train',
         external_indexing: list[np.array, np.array, np.array] | None = None,
         **kwargs,
     ):
@@ -311,9 +271,14 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         self.max_classes_per_batch = max_classes_per_batch
         self.last_first = last_first
         self.shuffle_classes = shuffle_classes
-
-        self.batch_size = self.data_loader_kwargs.get("batch_size", settings.batch_size)
-
+        self.use_contrastive_loader = use_contrastive_loader
+        # Fall back to product of max cells per batch * max classes per batch
+        _bs = self.data_loader_kwargs.get("batch_size")
+        if _bs is None:
+            self.batch_size = int(max_cells_per_batch * max_classes_per_batch)
+            self.data_loader_kwargs["batch_size"] = self.batch_size
+        else:
+            self.batch_size = _bs
         # Set indices and labels
         self.indices = range(adata_manager.adata.n_obs)
         labels_state_registry = adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
@@ -347,25 +312,41 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         self.test_idx = indices_test.astype(int)
 
         self.train_labels = self.labels[self.train_idx]
+        self.val_labels = self.labels[self.val_idx]
 
-        # Setup contrastive data loader
-        self.data_loader_class = ContrastiveAnnDataLoader
+        # Setup train data loader
+        self.data_loader_class = AnnDataLoader
+        # Set some defaults for data loader class
+        self.train_data_loader_kwargs = self.data_loader_kwargs.copy()
+        # Use contrastive loader for training
+        if self.use_contrastive_loader in ['train', 'both']:
+            self.data_loader_class = ContrastiveAnnDataLoader
+            self.train_data_loader_kwargs.update({
+                'labels': self.train_labels,
+                'max_cells_per_batch': self.max_cells_per_batch,
+                'max_classes_per_batch': self.max_classes_per_batch,
+            })
+        # Set validation loader
         self.val_loader_class = AnnDataLoader
-        # Set some defaults if needed
-        dl_kwargs = {}
-
-        self.data_loader_kwargs.update(dl_kwargs)
+        self.val_data_loader_kwargs = self.data_loader_kwargs.copy()
+        # Use contrastive loader for validation
+        if self.use_contrastive_loader in ['val', 'both']:
+            self.val_loader_class = ContrastiveAnnDataLoader
+            self.val_data_loader_kwargs.update({
+                'labels': self.val_labels,
+                'max_cells_per_batch': self.max_cells_per_batch,
+                'max_classes_per_batch': self.max_classes_per_batch,
+            })
 
     def train_dataloader(self):
         """Create the train data loader."""
         return self.data_loader_class(
             self.adata_manager,
-            labels=self.train_labels,
             indices=self.train_idx,
             shuffle=self.shuffle_classes,
             drop_last=self.drop_last,
             pin_memory=self.pin_memory,
-            **self.data_loader_kwargs,
+            **self.train_data_loader_kwargs,
         )
 
     def val_dataloader(self):
@@ -377,7 +358,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
                 shuffle=False,
                 drop_last=False,
                 pin_memory=self.pin_memory,
-                **self.data_loader_kwargs,
+                **self.val_data_loader_kwargs,
             )
         else:
             pass

@@ -1,3 +1,4 @@
+from cProfile import label
 import copy
 import logging
 
@@ -15,7 +16,7 @@ from scvi.data import AnnDataManager
 from scvi.data._utils import get_anndata_attribute
 from scvi.dataloaders._samplers import BatchDistributedSampler
 
-from src.data._contrastive_sampler import ContrastiveBatchSampler
+from src.data._contrastive_sampler import DistributedContrastiveBatchSampler, RandomContrastiveBatchSampler
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +77,12 @@ class ContrastiveAnnDataLoader(DataLoader):
     def __init__(
         self,
         adata_manager: AnnDataManager,
-        labels: list[int],
-        indices: list[int] | list[bool] | None = None, 
-        batch_size: int = 128,
-        max_cells_per_batch: int | None = 16,
-        max_classes_per_batch: int | None = 8,
-        shuffle: bool = True,
+        labels: list[int] | list[bool],
+        indices: list[int] | list[bool] | None = None,
+        batch_size: int = 512,
+        max_cells_per_batch: int = 32,
+        max_classes_per_batch: int = 16,
+        shuffle: bool = False,
         sampler: Sampler | None = None,
         drop_last: bool = False,
         drop_dataset_tail: bool = False,
@@ -91,32 +92,28 @@ class ContrastiveAnnDataLoader(DataLoader):
         load_sparse_tensor: bool = False,
         **kwargs,
     ):
+        # Set or get indices from adata manager
         if indices is None:
             indices = np.arange(adata_manager.adata.shape[0])
         else:
             if hasattr(indices, "dtype") and indices.dtype is np.dtype("bool"):
                 indices = np.where(indices)[0].ravel()
             indices = np.asarray(indices)
-
-        # Contrastive batching logic TODO: make this work
-        batch_sampler = ContrastiveBatchSampler(
-            indices=np.array(indices, copy=True),
-            cls_labels=np.array(labels, copy=True),
-            batch_size=batch_size,
-            max_cells_per_batch=max_cells_per_batch,
-            max_classes_per_batch=max_classes_per_batch,
-            last_first=True,
-            shuffle_classes=shuffle,
-        )
-        sampled_batches = batch_sampler.sample(copy=False, return_details=False)
-        indices = sampled_batches[ContrastiveBatchSampler.IDX_KEY]
         self.indices = indices
-        # Create torch dataset from current indices
+        # Create dataset
         self.dataset = adata_manager.create_torch_dataset(
             indices=indices,
             data_and_attributes=data_and_attributes,
             load_sparse_tensor=load_sparse_tensor,
         )
+        # Set labels
+        if labels is None:
+            labels = self.dataset[REGISTRY_KEYS.LABELS_KEY]
+        else:
+            if hasattr(labels, "dtype") and labels.dtype is np.dtype("bool"):
+                labels = np.where(labels)[0].ravel()
+            labels = np.asarray(labels)
+
         if "num_workers" not in kwargs:
             kwargs["num_workers"] = settings.dl_num_workers
         if "persistent_workers" not in kwargs:
@@ -130,18 +127,30 @@ class ContrastiveAnnDataLoader(DataLoader):
         # custom sampler for efficient minibatching on sparse matrices
         if sampler is None:
             if not distributed_sampler:
+                # Replace RandomSampler with ContrastiveSampler
+                sampler_cls = RandomContrastiveBatchSampler(
+                    self.dataset,
+                    labels,
+                    batch_size,
+                    max_cells_per_batch,
+                    max_classes_per_batch,
+                    shuffle=shuffle,
+                    drop_last=drop_last,
+                )
                 sampler = BatchSampler(
-                    sampler=SequentialSampler(self.dataset),
+                    sampler=sampler_cls,
                     batch_size=batch_size,
                     drop_last=drop_last,
                 )
             else:
-                sampler = BatchDistributedSampler(
+                sampler = DistributedContrastiveBatchSampler(
                     self.dataset,
-                    batch_size=batch_size,
+                    labels,
+                    batch_size,
+                    max_cells_per_batch,
+                    max_classes_per_batch,
                     drop_last=drop_last,
-                    drop_dataset_tail=drop_dataset_tail,
-                    shuffle=False,
+                    shuffle=shuffle,
                 )
             # do not touch batch size here, sampler gives batched indices
             # This disables PyTorch automatic batching, which is necessary
@@ -150,10 +159,7 @@ class ContrastiveAnnDataLoader(DataLoader):
 
         self.kwargs.update({"sampler": sampler})
 
-        def identity_collate(batch):
-            return batch
-
         if iter_ndarray:
-            self.kwargs.update({"collate_fn": identity_collate})
+            self.kwargs.update({"collate_fn": lambda x: x})
 
         super().__init__(self.dataset, **self.kwargs)
