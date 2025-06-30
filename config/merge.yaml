@@ -1,11 +1,11 @@
 # I/O
-datasheet: '/home/xlv0877/proj_home/ExPert/resources/datasets/meta/filtered_datasets_hg38.csv'
-output_dir: 'results/pp_and_merge'
+datasheet: 'resources/datasets/meta/filtered_datasets_hg38.csv'
+output_dir: 'results'
 
 # Pre-processing
 qc: true
-norm: true
-log_norm: true
+norm: false
+log_norm: false
 scale: false
 hvg: false
 # Merge & Harmonize
