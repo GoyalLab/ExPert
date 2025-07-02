@@ -5,6 +5,7 @@ import scanpy as sc
 import logging
 import anndata as ad
 from typing import Literal
+import logging
 
 
 class EmbeddingProcessor:
@@ -12,7 +13,6 @@ class EmbeddingProcessor:
 
     def __init__(
             self, 
-            adata_p: str, 
             emb_p: str, 
             p_col: str = 'perturbation', 
             p_type_col: str = 'perturbation_type',
@@ -22,14 +22,13 @@ class EmbeddingProcessor:
             misc_method: Literal['mean', 'gaussian', 'zeros'] = 'mean',
             std: float = 1e-3
         ):
-        self.adata_p = adata_p
+        # Init class settings
         self.emb_p = emb_p
         self.p_col = p_col
         self.p_type_col = p_type_col
         self.ctrl_key = ctrl_key
         self.unknown_key = unknown_key
         self.scaling_factor = scaling_factor
-        self.adata = None
         self.emb = None
         self.misc_method = misc_method
         self.std = std
@@ -47,7 +46,7 @@ class EmbeddingProcessor:
         return emb
 
     def _filter_emb(self, observed_genes: list[str]) -> pd.DataFrame:
-        available_targets = set(observed_genes).intersection(set(self.emb.keys()))
+        available_targets = set(observed_genes).intersection(self.emb.index)
         logging.info(f'Found {len(available_targets)}/{len(observed_genes)} perturbations in resource')
         return self.emb.loc[list(available_targets)]
     
@@ -77,21 +76,23 @@ class EmbeddingProcessor:
         emb_pos.index = f'{pos_key}{sep}' + emb_pos.index.astype(str)
         return pd.concat([emb_pos, emb_neg])
 
-    def _add_emb_to_adata(self, pos_key: str = 'pos', neg_key: str = 'neg', sep: str = ';',
+    def _add_emb_to_adata(self, adata: ad.AnnData, pos_key: str = 'pos', neg_key: str = 'neg', sep: str = ';',
                           direction_col_key: str = 'perturbation_direction', cls_emb_uns_key: str = 'cls_embedding') -> None:
-        self.adata.obs[direction_col_key] = self.adata.obs[self.p_type_col].str.startswith('CRISPRa').apply(
+        adata.obs[direction_col_key] = adata.obs[self.p_type_col].str.startswith('CRISPRa').apply(
             lambda x: pos_key if x else neg_key)
-        cls_labels = (self.adata.obs[direction_col_key].astype(str) + ';' + self.adata.obs[self.p_col].astype(str)).unique()
+        cls_labels = (adata.obs[direction_col_key].astype(str) + ';' + adata.obs[self.p_col].astype(str)).unique()
         self.emb.columns = 'dim_' + self.emb.columns.astype(str)
-        self.adata.uns[cls_emb_uns_key] = self.emb.loc[list(set(cls_labels).intersection(set(self.emb.index))), :]
+        adata.uns[cls_emb_uns_key] = self.emb.loc[list(set(cls_labels).intersection(set(self.emb.index))), :]
 
-    def process(self) -> None:
+    def process(self, adata: ad.AnnData) -> None:
         """Process and add class embedding key to adata."""
-        self.adata: ad.AnnData = sc.read(self.adata_p)
-        observed_genes = self.adata.obs[self.p_col].unique().tolist()
+        observed_genes = adata.obs[self.p_col].unique().tolist()
+        logging.info('Reading embedding.')
         self.emb = self._read_embedding()
+        logging.info(f'Filtering embedding for perturbed genes ({len(observed_genes)}).')
         self.emb = self._filter_emb(observed_genes)
         self.emb = self._add_misc_rows()
         self.emb *= self.scaling_factor
         self.emb = self._add_direction_to_emb()
-        self._add_emb_to_adata()
+        logging.info(f'Adding embedding to adata.')
+        self._add_emb_to_adata(adata)

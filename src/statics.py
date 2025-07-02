@@ -12,6 +12,7 @@ class _DATA_SHEET_NT(NamedTuple):
     BYTES: str = 'bytes'
     MEM: str = 'memory'
     MAX_MEM: str = 'max_memory'
+    PARTITION: str = 'partition'
 
 class _OBS_KEYS_NT(NamedTuple):
     DATASET_KEY: str = 'dataset'

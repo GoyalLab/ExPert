@@ -14,7 +14,6 @@ os.environ["PYTHONPATH"] = f"{workflow.basedir}:{os.environ.get('PYTHONPATH', ''
 config = load_configs(wf=workflow)
 
 ## PARAMETERS: I/O
-DATA = str(config.get('data_dir'))
 CACHE_DIR = str(config.get('cache_dir'))
 LOG = config.get('log_dir')
 # List of datasets to process
@@ -32,12 +31,14 @@ save_config(config, os.path.join(OUTPUT_DIR, 'config.yaml'))
 # Output files
 MERGED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset.h5ad')
 HARMONIZED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset_harmonized.h5ad')
+# download_datasets
+DWNL_DIR = os.path.join(CACHE_DIR, 'raw')
 # process_dataset
-PROCESS_DIR = os.path.join(DATA, 'processed')
+PROCESS_DIR = os.path.join(CACHE_DIR, 'processed')
 # filter_cells
-FILTER_DIR = os.path.join(DATA, 'filtered')
+FILTER_DIR = os.path.join(CACHE_DIR, 'filtered')
 # prepare_dataset
-PREPARE_DIR = os.path.join(DATA, 'prepared')
+PREPARE_DIR = os.path.join(CACHE_DIR, 'prepared')
 # HVG outputs
 HVG_DIR = os.path.join(OUTPUT_DIR, 'hvg')
 HVG_POOL = os.path.join(OUTPUT_DIR, 'hvg_pool.csv')
@@ -67,7 +68,7 @@ rule all:
 # 1. Download each dataset
 rule download_dataset:
     output:
-        raw = os.path.join(CACHE_DIR, "{dataset}.h5ad")
+        raw = os.path.join(DWNL_DIR, "{dataset}.h5ad")
     log:
         os.path.join(LOG, 'downloads', "{dataset}.log") 
     params:
@@ -77,7 +78,7 @@ rule download_dataset:
     resources:
         time = config['dwl_t'],
         mem = config['dwl_m'],
-        partition = config['dwl_p']
+        partition = config['partition']
     script:
         "workflow/scripts/download_dataset.py"
 
@@ -85,7 +86,7 @@ rule download_dataset:
 # 2. Preprocess each dataset
 rule process_dataset:
     input:
-        dataset_file = os.path.join(CACHE_DIR, "{dataset}.h5ad")
+        dataset_file = os.path.join(DWNL_DIR, "{dataset}.h5ad")
     output:
         processed = os.path.join(PROCESS_DIR, "{dataset}.h5ad")
     log:
@@ -107,7 +108,7 @@ rule process_dataset:
     resources:
         time = config['pp_t'],
         mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
-        partition = config['pp_p']
+        partition = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.PARTITION],
     script:
         "workflow/scripts/process_dataset.py"
 
@@ -117,13 +118,13 @@ if config['mixscale_filter']:
     # Setup mixscale environment for mixscale runs
     rule setup_mixscale:
         output:
-            setup_status = os.path.join(FILTER_DIR, ".setup.txt")
+            setup_status = os.path.join(LOG, ".mixscale_setup.txt")
         conda:
             "workflow/envs/mixscale.yaml"
         resources:
             time = '04:00:00',
             mem = '20GB',
-            partition = config['fc_p']
+            partition = config['partition']
         shell:
             """
             echo 'Settin up mixscale env'
@@ -133,7 +134,7 @@ if config['mixscale_filter']:
     rule filter_cells_by_efficiency:
         input:
             dataset_file = os.path.join(PROCESS_DIR, "{dataset}.h5ad"),
-            setup_status = os.path.join(FILTER_DIR, ".setup.txt")
+            setup_status = os.path.join(LOG, ".mixscale_setup.txt")
         output:
             filtered_file = os.path.join(FILTER_DIR, "{dataset}.h5ad")
         conda:
@@ -147,7 +148,7 @@ if config['mixscale_filter']:
         resources:
             time = config['fc_t'],
             mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MAX_MEM],
-            partition = config['fc_p']
+            partition = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.PARTITION],
         shell:
             """
             Rscript workflow/scripts/mixscale.R \\
@@ -175,7 +176,7 @@ rule determine_hvg:
     resources:
         time = config['hvg_t'],
         mem = config['hvg_m'],
-        partition = config['hvg_p']
+        partition = config['partition']
     script:
         "workflow/scripts/determine_hvgs.py"
 
@@ -191,7 +192,7 @@ rule build_gene_pool:
     resources:
         time = config['pool_t'],
         mem = config['pool_m'],
-        partition = config['pool_p']
+        partition = config['partition']
     script:
         "workflow/scripts/pool.py"
 
@@ -211,7 +212,7 @@ rule prepare_dataset:
     resources:
         time = config['prep_t'],
         mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
-        partition = config['prep_p']
+        partition = config['partition']
     script:
         "workflow/scripts/prepare_dataset.py"
 
@@ -232,7 +233,7 @@ rule merge_datasets:
     resources:
         time = config['merge_t'],
         mem = config['merge_m'],
-        partition = config['merge_p']
+        partition = config['partition']
     script:
         "workflow/scripts/merge.py"
 
@@ -244,7 +245,7 @@ HARMONIZED_OUTPUT_FILES = {'harmonized': HARMONIZED_OUTPUT_FILE}
 if correction_method == 'scANVI':
     print('Caching trained models')
     # HARMONIZED_OUTPUT_FILES.update({'model_file': MODEL_FILE})
-
+# TODO: switch partition to gpu if scvi is enabled
 rule harmonize:
     input:
         merged = MERGED_OUTPUT_FILE
@@ -258,6 +259,6 @@ rule harmonize:
     resources:
         time = config['harm_t'],
         mem = config['harm_m'],
-        partition = config['harm_p']
+        partition = config['partition']
     script:
         "workflow/scripts/harmonize.py"

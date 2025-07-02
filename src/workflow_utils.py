@@ -5,7 +5,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from src.statics import DATA_SHEET_KEYS, STRINGS, BOOLEANS, INTS, FLOATS
-from typing import List
+import logging
 
 
 def load_configs(wf, default_config="config/defaults.yaml"):
@@ -47,6 +47,10 @@ def determine_resources(config: dict, data_sheet: pd.DataFrame):
     # Update configs resource requirements based on the size of the input file
     min_mem = config['min_mem']
     max_mem = config['max_mem']
+    # Set default slurm partition
+    default_partition = config['partition']
+    # Check if there is a high memory allocation
+    himem_alloc = config.get('high_mem_partition', default_partition)
     # Only overwrite configs if memory is not given
     if DATA_SHEET_KEYS.MEM not in data_sheet.columns:
         # Fill memory column based on bytes given in metadata
@@ -65,6 +69,14 @@ def determine_resources(config: dict, data_sheet: pd.DataFrame):
         doubled = 2 * mem_val
         return f"{min(doubled, max_mem)}GB"
     data_sheet[DATA_SHEET_KEYS.MAX_MEM] = data_sheet[DATA_SHEET_KEYS.MEM].apply(calc_max_mem)
+    # Set partition for each dataset based on memory assigned to it
+    data_sheet[DATA_SHEET_KEYS.PARTITION] = default_partition
+    himem_mask = data_sheet[DATA_SHEET_KEYS.MEM].str.rstrip('GB').astype(int) > max_mem
+    highest_mem = data_sheet[DATA_SHEET_KEYS.MEM].str.rstrip('GB').astype(int).max()
+    if himem_mask.sum() > 0 and himem_alloc == default_partition:
+        logging.warning(f'Some datasets allocate more memory than the set max. memory ({max_mem}) and no high-memory partition is given. Defaulting to partition {default_partition} and max. allocation of {highest_mem}GB.')
+    data_sheet.loc[himem_mask,DATA_SHEET_KEYS.PARTITION] = himem_alloc
+    
 
 def read_data_sheet(config: dict):
     d = pd.read_csv(str(config['datasheet']))
@@ -93,7 +105,6 @@ def requires_gpu():
     return ['scANVI']
 
 def check_method(conf):
-    import logging
     import warnings
 
     methods = correction_methods()
