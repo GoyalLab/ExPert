@@ -5,7 +5,7 @@ import pandas as pd
 import logging
 import anndata as ad
 import scipy.sparse as sp
-from src.statics import P_COLS, CTRL_KEYS
+from src.statics import P_COLS, CTRL_KEYS, SETTINGS
 
 
 # credit to https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
@@ -118,7 +118,7 @@ def preprocess_dataset(
     # Check perturbation column
     if p_col not in adata.obs.columns:
         logging.info(f'"{p_col}" not found in adata.obs, looking for alternatives.')
-        candidate_p_cols = adata.obs.columns.intersection(set(P_COLS))
+        candidate_p_cols = adata.obs.columns.str.lower().intersection(set(P_COLS))
         if len(candidate_p_cols) == 0:
             raise ValueError(f'Could not find an alternative perturbation column in adata. Looked for {P_COLS}')
         # Fall back to first hit
@@ -127,7 +127,7 @@ def preprocess_dataset(
     # Check control key
     if np.sum(adata.obs[p_col]==ctrl_key) == 0:
         logging.info(f'{ctrl_key} not found in "{p_col}", looking for alternatives.')
-        all_ps = set(adata.obs[p_col].unique())
+        all_ps = set(adata.obs[p_col].str.lower().unique())
         candidate_ctrl_keys = all_ps.intersection(set(CTRL_KEYS))
         if len(candidate_ctrl_keys) == 0:
             raise ValueError(f'Could not find an alternative control key in "{p_col}". Looked for {CTRL_KEYS}')
@@ -146,7 +146,7 @@ def preprocess_dataset(
     # apply quality control measures
     if qc:
         logging.info(f'Quality control for dataset {name}')
-        mt_percent = 25 if cancer else 12           # set threshold higher for cancer
+        mt_percent = SETTINGS.MT_PERCENT_CANCER if cancer else SETTINGS.MT_PERCENT_NORMAL           # set threshold higher for cancer
         logging.info(f'Cancer: {cancer}, mt_per: {mt_percent}')
         quality_control_filter(adata, mt_per=mt_percent)
     if n_ctrl is not None:

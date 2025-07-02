@@ -172,7 +172,8 @@ def get_model_results(
         modes: list[str] = ['train', 'val'], 
         test_adata: ad.AnnData | None = None,
         save: bool = True, 
-        plot: bool = False
+        plot: bool = False,
+        max_classes: int = 200,
     ) -> tuple[pd.DataFrame, ad.AnnData]:
     version_dir = get_latest_tensor_dir(log_dir)
     plt_dir = os.path.join(version_dir, 'plots')
@@ -211,7 +212,7 @@ def get_model_results(
     if plot:
         pal = ['#919aa1', '#94c47d', '#ff7f0f']
         # Plot train and val for every perturbation
-        for p in latents.obs.cls_label.unique():
+        for p in latents.obs.cls_label.unique()[:max_classes]:
             latents.obs['mask'] = latents.obs['mode'].values.tolist()
             latents.obs.loc[latents.obs.cls_label!=p, 'mask'] = 'other'
             latents.obs['mask'] = pd.Categorical(latents.obs['mask'])

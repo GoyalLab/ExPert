@@ -1,4 +1,5 @@
 import logging
+from IPython import embed
 import pandas as pd
 import numpy as np
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
@@ -24,8 +25,8 @@ def _compute_weight(
     n_epochs_warmup: int | None,
     n_steps_warmup: int | None,
     n_epochs_stall: int | None,
-    max_weight: float = 1.0,
-    min_weight: float = 0.0,
+    max_weight: float | None = 1.0,
+    min_weight: float | None = 0.0,
 ) -> float:
     """Computes the classification weight for the current step or epoch.
 
@@ -48,6 +49,11 @@ def _compute_weight(
     min_weight
         Minimum scaling factor on classification loss during training.
     """
+    # Check min and max weights
+    if min_weight is None:
+        min_weight = 0.0
+    if max_weight is None:
+        max_weight = 0.0
     if min_weight > max_weight:
         raise ValueError(
             f"min_weight={min_weight} is larger than max_weight={max_weight}."
@@ -575,6 +581,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         average: str = "macro",
         use_posterior_mean: Literal["train", "val", "both"] | None = "val",
         log_class_distribution: bool = False,
+        log_full_val: bool = True,
+        freeze_encoder_epoch: int | None = None,
         **loss_kwargs,
     ):
         super().__init__(
@@ -607,6 +615,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.min_contr_weight = min_contr_weight
         self.use_contr_in_val = use_contr_in_val
         self.log_class_distribution = log_class_distribution
+        self.freeze_encoder_epoch = freeze_encoder_epoch
+        self.encoder_freezed = False
         # Alignment params
         self.n_steps_align_warmup = n_steps_align_warmup
         self.n_epochs_align_warmup = n_epochs_align_warmup
@@ -617,13 +627,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.n_classes = n_classes
         self.average = average
         self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
-        self.plot_umap = self.loss_kwargs.pop("plot_umap", False)
+        self.plot_umap = self.loss_kwargs.pop("plot_umap", None)
+        self.log_full_val = log_full_val
         # Initialize confusion matrix
         self.train_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
         self.val_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
+        self.full_val_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
         self.test_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
         # Save classes that have been seen during training
-        self.train_class_counts = Counter()
+        self.train_class_counts = []
         self.class_batch_counts = defaultdict(list)
     
     def log_with_mode(self, key: str, value: Any, mode: str, **kwargs):
@@ -821,6 +833,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         unique, counts = torch.unique(y, return_counts=True)
         for u, c in zip(unique.tolist(), counts.tolist()):
             self.class_batch_counts[u].append(c)
+        # Save number of classes / batch
+        self.train_class_counts.append(len(unique))
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -851,6 +865,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             prog_bar=True,
         )
         self.compute_and_log_metrics(loss_output, self.val_metrics, "validation")
+
+    def on_train_epoch_start(self):
+        if self.freeze_encoder_epoch is not None and self.current_epoch >= self.freeze_encoder_epoch and not self.encoder_frozen:
+            self.freeze_encoder()
+            self.encoder_frozen = True
+
+    def freeze_encoder(self):
+        self.module.z_encoder.eval()
+        for param in self.module.z_encoder.parameters():
+            param.requires_grad = False
     
     def on_train_epoch_end(self):
         if self.log_class_distribution:
@@ -867,15 +891,30 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             df.boxplot(ax=ax)
             ax.set_xlabel("Class")
             ax.set_ylabel("Samples per Batch")
-            ax.set_title("Per-Class Distribution of Samples per Batch (Boxplot)")
+            ax.set_title("Per-Class Distribution of Samples per Batch")
             self.logger.experiment.add_figure("train_class_batch_distribution", fig, self.current_epoch)
             plt.close(fig)
 
             # Reset for next epoch
             self.class_batch_counts = defaultdict(list)
-        if self.plot_umap:
-            self._plt_umap('train')
 
+            # Plot distribution of number of classes / batch
+            df = pd.DataFrame({'n_classes': self.train_class_counts})
+            fig, ax = plt.subplots(figsize=(5, 10))
+            df.boxplot(ax=ax)
+            ax.set_xlabel("")
+            ax.set_ylabel("Number of classes in Batch")
+            ax.set_title("Distribution of Number of Classes per Batch")
+            self.logger.experiment.add_figure("train_class_distribution", fig, self.current_epoch)
+            plt.close(fig)
+            # Reset for next epoch
+            self.train_class_counts = []
+
+        if self.plot_umap in ['train', 'both'] and self.current_epoch % 10 == 0:
+            train_data = self._get_mode_data('train')
+            self._plt_umap('train', train_data)
+
+    # Calculate accuracy & f1 for entire validation set, not just per batch
     def on_validation_epoch_end(self):
         """Plot class label confusion matrix and UMAP projection."""
         import pytorch_lightning as pl
@@ -900,42 +939,135 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                         fig,
                         global_step=self.current_epoch
                     )
-            if self.plot_umap:
-                self._plt_umap('val')
+            plt_umap = self.plot_umap in ['val', 'both']
+            if plt_umap or self.log_full_val:
+                # Get data from forward pass
+                val_data = self._get_mode_data('val')
+                # Plot UMAP for validation set
+                if plt_umap:
+                    self._plt_umap('val', val_data)
+                # Calculate performance metrics over entire validation set, not just batch
+                if self.log_full_val and self.classification_ratio > 0:
+                    self._log_full_val_metrics(val_data)
+                    
+    def _log_full_val_metrics(self, mode_data: dict[str, np.ndarray]) -> None:
+        true_labels = torch.tensor(mode_data.get('labels'))
+        predicted_labels = torch.tensor(mode_data.get('predicted_labels'))
 
-    def _plt_umap(self, mode: str):
-        # Perform forward pass on the entire training or validation dataloader
+        accuracy = tmf.classification.multiclass_accuracy(
+            predicted_labels,
+            true_labels,
+            self.n_classes,
+            average=self.average
+        )
+        f1 = tmf.classification.multiclass_f1_score(
+            predicted_labels,
+            true_labels,
+            self.n_classes,
+            average=self.average,
+        )
+        self.log(
+            "validation_full_accuracy",
+            accuracy,
+            on_epoch=True,
+            prog_bar=False,
+        )
+        self.log(
+            "validation_full_f1",
+            f1,
+            on_epoch=True,
+            prog_bar=False,
+        )
+        
+
+    def _get_mode_data(self, mode: str = 'val') -> dict[str, np.ndarray]:
         if mode == 'train':
             full_dataset = self.trainer.datamodule.train_dataloader()
         elif mode == 'val':
             full_dataset = self.trainer.datamodule.val_dataloader()
         else:
+            full_dataset = None
+
+        # Move batches to CUDA if available
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        def move_to_device(batch):
+            if isinstance(batch, dict):
+                return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            elif isinstance(batch, (list, tuple)):
+                return type(batch)(move_to_device(b) for b in batch)
+            elif isinstance(batch, torch.Tensor):
+                return batch.to(device)
+            else:
+                return batch
+
+        if full_dataset is not None:
             pass
-        import matplotlib.pyplot as plt
-        import seaborn as sns
 
         embeddings = []
         labels = []
+        predicted_labels = []
         covs = []
         # Collect results for all batches
         for _, batch in enumerate(full_dataset):
             with torch.no_grad():
-                inference_outputs, _, loss_output = self.forward(batch)
+                # Compute KL warmup
+                if "kl_weight" in self.loss_kwargs:
+                    self.loss_kwargs.update({"kl_weight": self.kl_weight})
+                # Compute CL warmup
+                self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
+                # Compute contrastive weight
+                self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight if self.use_contr_in_val else 0.0})
+                if self.max_align_weight is not None and self.max_align_weight > 0:
+                    self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
+                self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == mode or self.use_posterior_mean == "both"})
+                # Setup kwargs
+                input_kwargs = {}
+                input_kwargs.update(self.loss_kwargs)
+                # Add external embedding to batch
+                if input_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in input_kwargs:
+                    batch[REGISTRY_KEYS.CLS_EMB_KEY] = input_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
+                # Perform actual forward pass
+                inference_outputs, _, loss_output = self.forward(move_to_device(batch), loss_kwargs=input_kwargs)
+                # Save inference and generative output
                 embeddings.append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
                 covs.append(batch[REGISTRY_KEYS.BATCH_KEY].cpu())
                 labels.append(loss_output.true_labels)
+                # No classification (yet), skip batch
+                if loss_output.logits is not None:
+                    # Add predicted labels from each batch
+                    predicted_labels.append(torch.argmax(loss_output.logits, dim=-1))
         # Concat results pull to cpu, and reformat
         embeddings = torch.cat(embeddings, dim=0).cpu().numpy()
         labels = torch.cat(labels, dim=0).cpu().numpy().squeeze()
+        predicted_labels = torch.cat(predicted_labels, dim=0).cpu().numpy().squeeze() if len(predicted_labels) > 0 else np.array([])
         covs = torch.cat(covs, dim=0).cpu().numpy().squeeze()
+        
+        # Package data for return
+        return {
+            'embeddings': embeddings,
+            'labels': labels,
+            'predicted_labels': predicted_labels,
+            'covs': covs
+        }
+
+    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray]):
+        # Extract data from forward pass
+        embeddings = mode_data['embeddings']
+        labels = mode_data['labels']
         # Look for actual label encoding
         if "_code_to_label" in self.loss_kwargs:
             labels = [self.loss_kwargs["_code_to_label"][l] for l in labels]
         labels = pd.Categorical(labels)
-        covs = pd.Categorical(covs)
+        covs = pd.Categorical(mode_data['covs'])
 
-        """Plots a UMAP projection of validation latent space."""
-        umap = UMAP(n_neighbors=15, min_dist=0.1, metric="euclidean")
+        """Plots a UMAP projection of Z latent space."""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        # Use sc.tl.umap default arguments
+        umap = UMAP(
+            n_neighbors=15, min_dist=0.5, metric="euclidean",
+            n_components=2, spread=1.0, negative_sample_rate=5
+        )
         embeddings_2d = umap.fit_transform(embeddings)
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150)

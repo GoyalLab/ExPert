@@ -231,12 +231,15 @@ class ContrastiveBatchSampler:
         max_classes_per_batch: int | None = 20,
         last_first: bool = True,
         shuffle_classes: bool = True,
+        strict: bool = True,
     ):
         self.batch_size = batch_size
         self.max_cells_per_batch = max_cells_per_batch
         self.max_classes_per_batch = max_classes_per_batch
         self._check_setup()
+        self.class_limit = self.max_classes_per_batch if self.max_classes_per_batch is not None else 0
         self.shuffle_classes = shuffle_classes
+        self.strict = strict
         # Setup indices and labels
         self.indices = np.array(indices)
         self.n_indices = len(indices)
@@ -270,8 +273,9 @@ class ContrastiveBatchSampler:
         else:
             _class_pool = list(class_pool)
         
-        while batch_space > 0 and len(_class_pool) > 0:
+        while batch_space > 0 and len(_class_pool) >= self.class_limit:
             target_class = _class_pool[i]
+            cls_idx = i
             batch_space = self.batch_size - len(batch_idc)
             # Get all available indices of that class
             target_pool = idx_pools[target_class]
@@ -281,26 +285,26 @@ class ContrastiveBatchSampler:
             if self.max_cells_per_batch <= n_target_idc:
                 draw_n = self.max_cells_per_batch
             else:
-                # Just draw as many as there are left in class
-                draw_n = n_target_idc
-                # Remove class from class pool
+                # Remove class from available classes in pool
                 _class_pool.remove(target_class)
-                
+                # If we don't want strict sampling, just draw as many as there are left in class
+                draw_n = n_target_idc
+            # Move class indexer, because we just looked at a class pool
+            i += 1
             # Check if we can add enough cells to batch
             if draw_n > batch_space:
                 draw_n = batch_space
-            i += 1
+            # Cycle through all classes repeatedly until either batch is full or classes are empty
+            if i >= len(_class_pool):
+                i = 0
             if draw_n > 0:
                 # Randomly draw as many cells as we can from that class and add to batch
                 target_idc = np.random.choice(list(target_pool), draw_n, replace=False)
                 batch_idc.extend(target_idc)
                 # Remove those indices from class pool
                 target_pool -= set(target_idc)
-                classes_in_batch.append(i)
+                classes_in_batch.append(cls_idx)
                 cells_per_class.append(draw_n)
-            # Cycle through all classes repeatedly until either batch is full or classes are empty
-            if i >= len(_class_pool):
-                i = 0
         return batch_idc, classes_in_batch, cells_per_class
 
     def sample(self, copy: bool = False, return_details: bool = False) -> dict[str, np.ndarray | list]:
@@ -318,6 +322,12 @@ class ContrastiveBatchSampler:
         # Draw cells for each batch
         for _ in np.arange(self.n_batches):
             batch_idc, classes_in_batch, cells_per_class = self._fill_batch(class_pool=class_pool, idx_pools=idx_pools)
+            # Check for invalid batches
+            if len(batch_idc) != self.batch_size:
+                continue
+            # If strict, only include batch, if the composition is perfect
+            if self.strict and (len(np.unique(classes_in_batch)) != self.max_classes_per_batch or np.any(np.array(cells_per_class) != self.max_cells_per_batch)):
+                continue
             batches.extend(batch_idc)
             n_classes_per_batch.append(cells_per_class)
             n_idc_per_batch.append(len(batch_idc))

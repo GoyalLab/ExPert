@@ -18,12 +18,17 @@ class _OBS_KEYS_NT(NamedTuple):
     PERTURBATION_TYPE_KEY: str = 'perturbation'
     CELL_TYPE_KEY: str = 'celltype_broad'
 
+class _SETTINGS(NamedTuple):
+    MT_PERCENT_CANCER: int = 20
+    MT_PERCENT_NORMAL: int = 12
+
 def _perturbation_cols():
     return [
         'perturbation',
         'gene',
         'perturbation_1',
-        'target'
+        'target',
+        'gene_target'
     ]
 
 def _ctrl_keys():
@@ -31,7 +36,7 @@ def _ctrl_keys():
         'control',
         'ctrl',
         'non-targeting',
-        'NT'
+        'nt'
     ]
 
 def _booleans():
@@ -83,6 +88,7 @@ def _floats():
 
 DATA_SHEET_KEYS = _DATA_SHEET_NT()
 OBS_KEYS = _OBS_KEYS_NT()
+SETTINGS = _SETTINGS()
 STRINGS = _strings()
 BOOLEANS = _booleans()
 INTS = _ints()

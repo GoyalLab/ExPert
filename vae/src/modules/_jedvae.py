@@ -1,9 +1,7 @@
 from typing import TYPE_CHECKING, Iterable
 
-from sympy import false
-
 from src.models.base import AttentionEncoder
-from src.modules._base import EmbeddingClassifier
+from src.modules._base import EmbeddingClassifier, Encoder, DecoderSCVI
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 
 from typing import Iterable
@@ -11,13 +9,9 @@ from typing import Iterable
 import logging
 import torch
 import torch.nn.functional as F
-from torch.distributions import Normal
-from torch.nn.functional import one_hot
 
 from scvi.data import _constants
-from scvi.module import Classifier
 from scvi.module.base import (
-    BaseModuleClass,
     LossOutput,
     auto_move_data,
 )
@@ -28,9 +22,6 @@ from typing import Literal
 
 from torch.distributions import Distribution
 from scvi.model.base import BaseModelClass
-from scvi.nn import DecoderSCVI, Encoder
-
-import pdb
 
 
 class JEDVAE(VAE):
@@ -388,7 +379,7 @@ class JEDVAE(VAE):
             labelled_tensors: dict[str, torch.Tensor],
             temperature: float = 0.1,
             reduction: str = 'mean',
-            scale_by_temperature: bool = True,
+            scale_by_temperature: bool = False,
             eps: float = 1e-12
         ) -> torch.Tensor:
         """
@@ -509,7 +500,7 @@ class JEDVAE(VAE):
 
         # Add contrastive loss if it is specified
         if contrastive_loss_weight is not None and contrastive_loss_weight > 0:
-            contr_loss = self._contrastive_loss(z, tensors, temperature=contrastive_temperature, reduction=self.reduction)
+            contr_loss = self._contrastive_loss(z, tensors, temperature=contrastive_temperature)
             lo_kwargs['loss'] += contr_loss * contrastive_loss_weight
             extra_metrics.update({'contrastive_loss': contr_loss})
         # Add classification based losses
@@ -518,8 +509,7 @@ class JEDVAE(VAE):
                 tensors, 
                 use_posterior_mean, 
                 use_ext_emb,
-                alignment_loss_weight,
-                reduction=self.reduction
+                alignment_loss_weight
             )
             # Add z classification loss to overall loss
             lo_kwargs['loss'] += ce_loss * classification_ratio
