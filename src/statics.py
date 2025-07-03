@@ -35,9 +35,17 @@ def _perturbation_cols():
 def _ctrl_keys():
     return [
         'control',
-        'ctrl',
         'non-targeting',
         'nt'
+    ]
+
+def _gene_symbol_keys():
+    return [
+        'gene_symbol',
+        'gene_name',
+        'gene',
+        'gene symbol',
+        'gene name'
     ]
 
 def _booleans():
@@ -96,3 +104,4 @@ INTS = _ints()
 FLOATS = _floats()
 P_COLS = _perturbation_cols()
 CTRL_KEYS = _ctrl_keys()
+GENE_SYMBOL_KEYS = _gene_symbol_keys()

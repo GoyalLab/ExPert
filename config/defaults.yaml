@@ -38,7 +38,7 @@ seed: 42                                    # Set seed for reproducibility
 ## Slurm config:
 # Set RAM limits for all tasks that require loading datasets into memory
 min_mem: 100                  # Set minimum RAM (GB)
-max_mem: 240                  # Set maximum RAM (GB)
+max_mem: 220                  # Set maximum RAM (GB)
 partition: 'genomics'
 high_mem_partition: 'genomics-himem'
 gpu_partition: 'gengpu'
@@ -61,7 +61,7 @@ pool_m: '20GB'
 prep_t: '48:00:00'
 # 6. Merge
 merge_t: '48:00:00'
-merge_m: '300GB'
+merge_m: '200GB'
 # 7. Harmonize (requires gpu when used with scanvi)
 harm_t: '48:00:00'
 harm_m: '200GB'

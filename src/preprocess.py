@@ -5,7 +5,7 @@ import pandas as pd
 import logging
 import anndata as ad
 import scipy.sparse as sp
-from src.statics import P_COLS, CTRL_KEYS, SETTINGS
+from src.statics import P_COLS, CTRL_KEYS, GENE_SYMBOL_KEYS, SETTINGS
 
 
 # credit to https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
@@ -95,6 +95,25 @@ def single_perturbation_mask(meta: pd.DataFrame, p_col: str = 'perturbation'):
     )
     return mask
 
+def ens_to_symbol(adata: ad.AnnData) -> ad.AnnData:
+    # Look for possible gene symbol columns
+    gscl = adata.var.columns.intersection(set(GENE_SYMBOL_KEYS)).values
+    if len(gscl) == 0:
+        raise ValueError(f'Could not find a column that describes gene symbol mappings in adata.var, looked for {GENE_SYMBOL_KEYS}')
+    # Choose first hit if multiple
+    gsh = list(gscl)[0]
+    # Convert index
+    adata.var.reset_index(names='ensembl_id', inplace=True)
+    adata.var.set_index(gsh, inplace=True)
+    # Check for duplicate index conflicts
+    if adata.var_names.nunique() != adata.shape[0]:
+        logging.info(f'Found duplicate indices for ensembl to symbol mapping, highest number of conflicts: {adata.var_names.value_counts().max()}')
+        # Fix conflicts by choosing the gene with the higher harmonic mean of mean expression and normalized variance out of pool
+        adata.var['hm_var'] = (2 * adata.var.means * adata.var.variances_norm) / (adata.var.means + adata.var.variances_norm)
+        idx = adata.var.reset_index().groupby(gsh, observed=True).hm_var.idxmax().values
+        adata = adata[:,idx]
+    return adata
+
 
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
 def preprocess_dataset(
@@ -122,8 +141,9 @@ def preprocess_dataset(
         if len(candidate_p_cols) == 0:
             raise ValueError(f'Could not find an alternative perturbation column in adata. Looked for {P_COLS}')
         # Fall back to first hit
-        adata.obs[p_col] = adata.obs[candidate_p_cols[0]]
-        logging.info(f'Falling back to "{p_col}" as perturbation column')
+        p_col_hit = candidate_p_cols[0]
+        adata.obs[p_col] = adata.obs[p_col_hit]
+        logging.info(f'Using "{p_col_hit}" as perturbation column')
     # Check control key
     if np.sum(adata.obs[p_col]==ctrl_key) == 0:
         logging.info(f'{ctrl_key} not found in "{p_col}", looking for alternatives.')
@@ -133,7 +153,7 @@ def preprocess_dataset(
             raise ValueError(f'Could not find an alternative control key in "{p_col}". Looked for {CTRL_KEYS}')
         ctrl_key_hit = list(candidate_ctrl_keys)[0]
         adata.obs[p_col] = adata.obs[p_col].replace(ctrl_key_hit, ctrl_key)
-        logging.info(f'Falling back to "{ctrl_key_hit}" as control key')
+        logging.info(f'Using "{ctrl_key_hit}" as control key')
     # Filter for single perturbations only
     if single_perturbations_only:
         logging.info(f'Filtering column "{p_col}" for single perturbations only')
@@ -177,4 +197,8 @@ def preprocess_dataset(
         logging.info(f'Scaling and centering "{name}"')
         sc.pp.scale(adata)
     logging.info(f'Found {np.sum(adata.var.highly_variable)} highly variable genes out of {adata.n_vars} total genes')
+    # check if .var indices are gene symbols or ensembl ids
+    if adata.var_names.str.lower().str.startswith('ens').all():
+        logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
+        adata = ens_to_symbol(adata).copy()
     return adata
