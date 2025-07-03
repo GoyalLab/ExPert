@@ -239,6 +239,36 @@ class JEDVAE(VAE):
             return focal_loss.sum()
         else:
             return focal_loss
+
+    def geom_alignment_loss(
+            self, 
+            z_normalized: torch.Tensor, 
+            class_embeds: torch.Tensor, 
+            targets: torch.Tensor,
+            reduction: str = 'mean'
+        ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        z_normalized : (batch, d) - normalized latent vectors
+        class_embeds : (n_classes, d) - normalized class embeddings
+        targets : (batch,) - integer class labels
+        reduction: str - loss aggregation strategy
+
+        Returns
+        -------
+        alignment_loss : scalar Tensor
+        """
+        class_emb = F.normalize(class_embeds[targets], dim=1)
+        sim_z = torch.matmul(z_normalized, z_normalized.T)
+        sim_class = torch.matmul(class_emb, class_emb.T)
+        geometry_loss = F.mse_loss(sim_z, sim_class)
+        if reduction == 'mean':
+            return geometry_loss.mean()
+        elif reduction == 'sum':
+            return geometry_loss.sum()
+        else:
+            raise ValueError(f"Reduction has to be either 'sum', or 'mean'")
         
     def cosine_alignment_loss(
             self, 
@@ -316,7 +346,7 @@ class JEDVAE(VAE):
             )
         # Calculate alignment between zx and class projection if external embedding is given
         if alignment_loss_weight is not None and alignment_loss_weight > 0 and ext_emb is not None:
-            align_loss = self.cosine_alignment_loss(
+            align_loss = self.geom_alignment_loss(
                 z_normalized=cz, 
                 class_embeds=ext_emb, 
                 targets=y,

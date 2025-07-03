@@ -1,33 +1,34 @@
 
+from copy import deepcopy
 from src.modules._jedvae import JEDVAE
-from src.modules._splitter import ContrastiveDataSplitter, SemiSupervisedDataSplitter
+from src.modules._splitter import ContrastiveDataSplitter
 from src.utils.constants import REGISTRY_KEYS
-from src._train.plan import SemiSupervisedTrainingPlan, ContrastiveSupervisedTrainingPlan
-from src.utils.preprocess import _prep_adata
+from src._train.plan import ContrastiveSupervisedTrainingPlan
 from src.data._manager import EmbAnnDataManager
 
 import torch
+from torch import Tensor
+from torch.distributions import Distribution
 import warnings
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
 import logging
+import numpy.typing as npt
 from sklearn.utils.class_weight import compute_class_weight
 
 
 from collections.abc import Sequence
-from typing import Literal, Any
+from typing import Literal, Any, Iterator
 
 from anndata import AnnData
 
 # scvi imports
 from scvi.model._utils import get_max_epochs_heuristic
 from scvi.train import TrainRunner
-from scvi.data._manager import AnnDataManager
 from scvi.data._utils import get_anndata_attribute, _check_if_view
 from scvi.utils import setup_anndata_dsp
 from scvi.utils._docstrings import devices_dsp
-from scvi.train._callbacks import SubSampleLabels
 from scvi.model.base import (
     BaseModelClass,
     ArchesMixin,
@@ -83,8 +84,8 @@ class JEDVI(
         # Initialize indices and labels for this VAE
         self._set_indices_and_labels()
 
-        # Ignores unlabeled catgegory
-        n_labels = self.summary_stats.n_labels - 1
+        # Set number of classes
+        n_labels = self.summary_stats.n_labels
         n_cats_per_cov = (
             self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
             if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
@@ -116,8 +117,7 @@ class JEDVI(
             **_model_kwargs,
         )
 
-        self.unsupervised_history_ = None
-        self.semisupervised_history_ = None
+        self.supervised_history_ = None
         self.init_params_ = self._get_init_params(locals())
         self.was_pretrained = False
         self.n_labels = n_labels
@@ -143,7 +143,6 @@ class JEDVI(
         """Set indices for labeled and unlabeled cells. Prepare class embedding"""
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
-        self.unlabeled_category_ = labels_state_registry.unlabeled_category
 
         labels = get_anndata_attribute(
             self.adata,
@@ -152,9 +151,6 @@ class JEDVI(
         ).ravel()
         self._label_mapping = labels_state_registry.categorical_mapping
 
-        # set unlabeled and labeled indices
-        self._unlabeled_indices = np.argwhere(labels == self.unlabeled_category_).ravel()
-        self._labeled_indices = np.argwhere(labels != self.unlabeled_category_).ravel()
         self._code_to_label = dict(enumerate(self._label_mapping))
         # order class embedding according to label mapping and transform to matrix
         if REGISTRY_KEYS.CLS_EMB_KEY in self.adata.uns:
@@ -341,6 +337,104 @@ class JEDVI(
         model.was_pretrained = True
 
         return model
+    
+    @torch.inference_mode()
+    def get_latent_representation(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        give_mean: bool = True,
+        mc_samples: int = 5_000,
+        batch_size: int | None = None,
+        return_dist: bool = False,
+        dataloader: Iterator[dict[str, Tensor | None]] = None,
+    ) -> npt.NDArray | tuple[npt.NDArray, npt.NDArray]:
+        """Compute the latent representation of the data.
+
+        This is typically denoted as :math:`z_n`.
+
+        Parameters
+        ----------
+        adata
+            :class:`~anndata.AnnData` object with :attr:`~anndata.AnnData.var_names` in the same
+            order as the ones used to train the model. If ``None`` and ``dataloader`` is also
+            ``None``, it defaults to the object used to initialize the model.
+        indices
+            Indices of observations in ``adata`` to use. If ``None``, defaults to all observations.
+            Ignored if ``dataloader`` is not ``None``
+        give_mean
+            If ``True``, returns the mean of the latent distribution. If ``False``, returns an
+            estimate of the mean using ``mc_samples`` Monte Carlo samples.
+        mc_samples
+            Number of Monte Carlo samples to use for the estimator for distributions with no
+            closed-form mean (e.g., the logistic normal distribution). Not used if ``give_mean`` is
+            ``True`` or if ``return_dist`` is ``True``.
+        batch_size
+            Minibatch size for the forward pass. If ``None``, defaults to
+            ``scvi.settings.batch_size``. Ignored if ``dataloader`` is not ``None``
+        return_dist
+            If ``True``, returns the mean and variance of the latent distribution. Otherwise,
+            returns the mean of the latent distribution.
+        dataloader
+            An iterator over minibatches of data on which to compute the metric. The minibatches
+            should be formatted as a dictionary of :class:`~torch.Tensor` with keys as expected by
+            the model. If ``None``, a dataloader is created from ``adata``.
+
+        Returns
+        -------
+        An array of shape ``(n_obs, n_latent)`` if ``return_dist`` is ``False``. Otherwise, returns
+        a tuple of arrays ``(n_obs, n_latent)`` with the mean and variance of the latent
+        distribution.
+        """
+        from torch.distributions import Normal
+        from torch.nn.functional import softmax
+
+        from scvi.module._constants import MODULE_KEYS
+
+        self._check_if_trained(warn=False)
+        if adata is not None and dataloader is not None:
+            raise ValueError("Only one of `adata` or `dataloader` can be provided.")
+
+        if dataloader is None:
+            adata = self._validate_anndata(adata, extend_categories=True)
+            dataloader = self._make_data_loader(
+                adata=adata, indices=indices, batch_size=batch_size
+            )
+
+        zs: list[Tensor] = []
+        qz_means: list[Tensor] = []
+        qz_vars: list[Tensor] = []
+        for tensors in dataloader:
+            outputs: dict[str, Tensor | Distribution | None] = self.module.inference(
+                **self.module._get_inference_input(tensors)
+            )
+
+            if MODULE_KEYS.QZ_KEY in outputs:
+                qz: Distribution = outputs.get(MODULE_KEYS.QZ_KEY)
+                qzm: Tensor = qz.loc
+                qzv: Tensor = qz.scale.square()
+            else:
+                qzm: Tensor = outputs.get(MODULE_KEYS.QZM_KEY)
+                qzv: Tensor = outputs.get(MODULE_KEYS.QZV_KEY)
+                qz: Distribution = Normal(qzm, qzv.sqrt())
+
+            if return_dist:
+                qz_means.append(qzm.cpu())
+                qz_vars.append(qzv.cpu())
+                continue
+
+            z: Tensor = qzm if give_mean else outputs.get(MODULE_KEYS.Z_KEY)
+
+            if give_mean and getattr(self.module, "latent_distribution", None) == "ln":
+                samples = qz.sample([mc_samples])
+                z = softmax(samples, dim=-1).mean(dim=0)
+
+            zs.append(z.cpu())
+
+        if return_dist:
+            return torch.cat(qz_means).numpy(), torch.cat(qz_vars).numpy()
+        else:
+            return torch.cat(zs).numpy()
 
     def predict(
         self,
@@ -348,7 +442,8 @@ class JEDVI(
         indices: Sequence[int] | None = None,
         soft: bool = False,
         batch_size: int | None = None,
-    ) -> np.ndarray | pd.DataFrame:
+        return_latent: bool = False,
+    ) -> tuple[np.ndarray | pd.DataFrame, np.ndarray] | np.ndarray | pd.DataFrame:
         """Return cell label predictions.
 
         Parameters
@@ -378,6 +473,7 @@ class JEDVI(
         )
 
         y_pred = []
+        y_cz = []
         for _, tensors in enumerate(scdl):
             x = tensors[REGISTRY_KEYS.X_KEY]
             batch = tensors[REGISTRY_KEYS.BATCH_KEY]
@@ -389,7 +485,7 @@ class JEDVI(
             cat_key = REGISTRY_KEYS.CAT_COVS_KEY
             cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
 
-            pred, _ = self.module.classify(
+            pred, cz = self.module.classify(
                 x,
                 batch_index=batch,
                 cat_covs=cat_covs,
@@ -402,14 +498,16 @@ class JEDVI(
             if not soft:
                 pred = pred.argmax(dim=1)
             y_pred.append(pred.detach().cpu())
-
+            y_cz.append(cz.detach().cpu())
+        # Concatenate batch results
         y_pred = torch.cat(y_pred).numpy()
+        y_cz = torch.cat(y_cz).numpy()
         if not soft:
             predictions = []
             for p in y_pred:
                 predictions.append(self._code_to_label[p])
 
-            return np.array(predictions)
+            pred = np.array(predictions)
         else:
             n_labels = len(pred[0])
             pred = pd.DataFrame(
@@ -417,6 +515,9 @@ class JEDVI(
                 columns=self._label_mapping[:n_labels],
                 index=adata.obs_names[indices],
             )
+        if return_latent:
+            return pred, y_cz
+        else:
             return pred
         
     @devices_dsp.dedent
@@ -556,6 +657,33 @@ class JEDVI(
             # Case where correct AnnDataManager is found, replay registration as necessary.
             adata_manager.validate()
         return adata
+    
+    def create_test_data(self, adata: AnnData) -> AnnData:
+        import anndata as ad
+        # Subset test data features to the features the model has been trained on
+        model_genes = self.adata.var_names
+        v_mask = adata.var_names.isin(model_genes)
+        adata._inplace_subset_var(v_mask)
+        # Pad missing features with 0 vectors
+        missing_genes = model_genes.difference(adata.var_names)
+        n_missing = len(missing_genes)
+        if n_missing > 0:
+            logging.info(f'Found {n_missing} missing features in test data. Setting them to 0.')
+            # Copy .var info from model's adata
+            missing_var = self.adata[:,missing_genes].var
+            # Retain cell-specfic information
+            missing_obs = adata.obs.copy()
+            # Create empty expression for missing genes for all cells
+            missing_X = np.zeros((adata.shape[0], missing_genes.shape[0]))
+            missing_X = sp.csr_matrix(missing_X)
+            # Create padded adata object
+            missing_adata = AnnData(X=missing_X, obs=missing_obs, var=missing_var)
+            uns = deepcopy(adata.uns)
+            adata = ad.concat([adata, missing_adata], axis=1)
+            adata.obs = missing_obs
+            adata.uns = uns
+        # Sort .var to same order as observed in model's adata
+        return adata[:,self.adata.var_names].copy()
 
     @classmethod
     @setup_anndata_dsp.dedent
@@ -563,7 +691,6 @@ class JEDVI(
         cls,
         adata: AnnData,
         labels_key: str,
-        unlabeled_category: str,
         layer: str | None = None,
         class_emb_uns_key: str | None = 'cls_embedding',
         batch_key: str | None = None,
@@ -585,7 +712,7 @@ class JEDVI(
         anndata_fields = [
             LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=raw_counts),
             CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
-            LabelsWithUnlabeledObsField(REGISTRY_KEYS.LABELS_KEY, labels_key, unlabeled_category),
+            CategoricalObsField(REGISTRY_KEYS.LABELS_KEY, labels_key),
             NumericalObsField(REGISTRY_KEYS.SIZE_FACTOR_KEY, size_factor_key, required=False),
             CategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys),
             NumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys),

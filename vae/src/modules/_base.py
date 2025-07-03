@@ -345,12 +345,15 @@ class Encoder(nn.Module):
         var_activation: Callable | None = None,
         return_dist: bool = False,
         use_attention: bool = False,
+        use_feature_mask: bool = False,
+        drop_prob: float = 0.25,
         **kwargs,
     ):
         super().__init__()
 
         self.distribution = distribution
         self.var_eps = var_eps
+        self.n_input = n_input
         # Setup attention if needed
         self.use_attention = use_attention
         if self.use_attention:
@@ -368,6 +371,8 @@ class Encoder(nn.Module):
         self.mean_encoder = nn.Linear(n_hidden, n_output)
         self.var_encoder = nn.Linear(n_hidden, n_output)
         self.return_dist = return_dist
+        self.use_feature_mask = use_feature_mask
+        self.drop_prob = drop_prob
 
         if distribution == "ln":
             self.z_transformation = nn.Softmax(dim=-1)
@@ -396,6 +401,12 @@ class Encoder(nn.Module):
             tensors of shape ``(n_latent,)`` for mean and var, and sample
 
         """
+        if self.use_feature_mask:
+            # Sample mask: 1 for keep, 0 for drop
+            feature_mask = torch.bernoulli(torch.full((self.n_input,), 1 - self.drop_prob))  # shape: (num_features,)
+            feature_mask = feature_mask.view(1, -1)  # shape: (1, num_features)
+            feature_mask = feature_mask.expand(x.shape[0], -1)  # broadcast to full batch
+            x = x * feature_mask
         if self.use_attention:
             x = self.attn(x)
         # Parameters for latent distribution
