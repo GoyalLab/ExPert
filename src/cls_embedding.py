@@ -1,11 +1,12 @@
 import numpy as np
 import pandas as pd
 import pickle
-import scanpy as sc
 import logging
 import anndata as ad
 from typing import Literal
 import logging
+
+from src.statics import OBS_KEYS
 
 
 class EmbeddingProcessor:
@@ -14,9 +15,9 @@ class EmbeddingProcessor:
     def __init__(
             self, 
             emb_p: str, 
-            p_col: str = 'perturbation', 
-            p_type_col: str = 'perturbation_type',
-            ctrl_key: str = 'control', 
+            p_col: str = OBS_KEYS.PERTURBATION_KEY, 
+            p_type_col: str = OBS_KEYS.PERTURBATION_TYPE_KEY,
+            ctrl_key: str = OBS_KEYS.CELL_TYPE_KEY, 
             unknown_key: str = 'unknown', 
             scaling_factor: int = 1,
             misc_method: Literal['mean', 'gaussian', 'zeros'] = 'mean',

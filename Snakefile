@@ -47,22 +47,21 @@ OBS_DIR = os.path.join(OUTPUT_DIR, 'obs')
 # model output
 MODEL_DIR = os.path.join(OUTPUT_DIR, 'scanvi')
 MODEL_FILE = os.path.join(MODEL_DIR, 'model.pt')
+# define final pipeline endpoint, i.e. merged dataset or harmonized dataset
+OUTPUT_FILE = MERGED_OUTPUT_FILE if config['correction_method']=='skip' else HARMONIZED_OUTPUT_FILE
+# add gene embedding to output file
+if os.path.exists(config['gene_embedding']):
+    OUTPUT_FILE_W_EMB = f"{OUTPUT_FILE.rstrip('.h5ad')}_w_emb.h5ad"
+    ENPOINT = OUTPUT_FILE_W_EMB
+else:
+    ENPOINT = OUTPUT_FILE
 
 
-## START OF PIPELINE
-
-# define final pipeline endpoint, i.e. merged dataset or harmonized dataset, and other outputs
-OUTPUT_FILES = [MERGED_OUTPUT_FILE]
-correction_method = config['correction_method']
-if correction_method!='skip':
-    OUTPUT_FILES.append(HARMONIZED_OUTPUT_FILE)
-    if correction_method=='scANVI':
-        print('Caching trained models')
-        OUTPUT_FILES.append(MODEL_FILE)
+## PIPELINE START
 
 rule all:
     input:
-        *OUTPUT_FILES
+        ENPOINT
 
 
 # 1. Download each dataset
@@ -262,3 +261,20 @@ rule harmonize:
         partition = config['partition']
     script:
         "workflow/scripts/harmonize.py"
+
+# 8. Add gene embedding to merged dataset if that was given in params
+rule add_gene_embedding:
+    input:
+        input_file = OUTPUT_FILE
+    output:
+        output_file = OUTPUT_FILE_W_EMB
+    log:
+        os.path.join(LOG, "add_emb.log")
+    params:
+        embedding_file = config['gene_embedding'],
+    resources:
+        time = config['merge_t'],
+        mem = config['merge_m'],
+        partition = config['partition']
+    script:
+        "workflow/scripts/add_gene_embedding.py"

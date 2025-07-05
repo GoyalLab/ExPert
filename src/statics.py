@@ -16,8 +16,9 @@ class _DATA_SHEET_NT(NamedTuple):
 
 class _OBS_KEYS_NT(NamedTuple):
     DATASET_KEY: str = 'dataset'
-    PERTURBATION_TYPE_KEY: str = 'perturbation'
+    PERTURBATION_TYPE_KEY: str = 'perturbation_type'
     CELL_TYPE_KEY: str = 'celltype_broad'
+    PERTURBATION_KEY: str = 'perturbation'
 
 class _SETTINGS(NamedTuple):
     MT_PERCENT_CANCER: int = 20
@@ -75,7 +76,8 @@ def _strings():
         'perturbation_col', 
         'ctrl_key', 
         'correction_method', 
-        'merge_method'
+        'merge_method',
+        'gene_embedding'
     ]
 
 def _ints():
