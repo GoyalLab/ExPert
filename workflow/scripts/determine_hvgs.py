@@ -6,7 +6,7 @@ def hvg_pool(dataset_file, output_file, hvg=True):
         adata = ad.read(dataset_file, backed='r')
         # save hvg gene info
         if hvg:
-            pool_var = adata[:, adata.var.highly_variable].var
+            pool_var = adata[:, adata.var.highly_variable.astype(bool)].var
         else:
             pool_var = adata.var
         pool_var.to_csv(output_file, index=True)

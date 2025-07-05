@@ -34,10 +34,12 @@ def merge_datasets(
     # collect all .obs data from the datasets
     obs = collapse_obs(obs_files)
     # Add top level meta sheet information to obs
-    meta_sheet[OBS_KEYS.DATASET_KEY] = meta_sheet[DATA_SHEET_KEYS.INDEX].values
-    meta_sheet[OBS_KEYS.PERTURBATION_TYPE_KEY] = meta_sheet[DATA_SHEET_KEYS.PERTURBATION_TYPE].values
-    meta_sheet[OBS_KEYS.CELL_TYPE_KEY] = meta_sheet[DATA_SHEET_KEYS.CELL_TYPE].values
-    obs = obs.merge(meta_sheet[[OBS_KEYS.DATASET_KEY, OBS_KEYS.CELL_TYPE_KEY, OBS_KEYS.PERTURBATION_TYPE_KEY]], on=OBS_KEYS.DATASET_KEY)
+    meta = pd.DataFrame({
+        OBS_KEYS.DATASET_KEY: meta_sheet.index.values,
+        OBS_KEYS.PERTURBATION_TYPE_KEY: meta_sheet[DATA_SHEET_KEYS.PERTURBATION_TYPE].values,
+        OBS_KEYS.CELL_TYPE_KEY: meta_sheet[DATA_SHEET_KEYS.CELL_TYPE].values,
+    })
+    obs = obs.merge(meta, on=OBS_KEYS.DATASET_KEY)
     # reduce .var to the index
     var = pd.DataFrame(index=list(pool.index))
     logging.info(f'Prepared meta-set for merge with: {obs.shape[0]} cells, {pool.shape[0]} genes')
