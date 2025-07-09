@@ -279,7 +279,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
             self.data_loader_kwargs["batch_size"] = self.batch_size
         else:
             self.batch_size = _bs
-        # Set indices and labels
+        # Set indices, labels, and batch labels
         self.indices = range(adata_manager.adata.n_obs)
         labels_state_registry = adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         labels = get_anndata_attribute(
@@ -287,7 +287,14 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
             adata_manager.data_registry.labels.attr_name,
             labels_state_registry.original_key,
         ).ravel()
+        batch_state_registry = adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY)
+        batches = get_anndata_attribute(
+            adata_manager.adata,
+            adata_manager.data_registry.batch.attr_name,
+            batch_state_registry.original_key,
+        ).ravel()
         self.labels = labels
+        self.batches = batches
         self.pin_memory = pin_memory
         self.external_indexing = external_indexing
 
@@ -312,7 +319,9 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         self.test_idx = indices_test.astype(int)
 
         self.train_labels = self.labels[self.train_idx]
+        self.train_batches = self.batches[self.train_idx]
         self.val_labels = self.labels[self.val_idx]
+        self.val_batches = self.batches[self.val_idx]
 
         # Setup train data loader
         self.data_loader_class = AnnDataLoader
@@ -323,6 +332,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
             self.data_loader_class = ContrastiveAnnDataLoader
             self.train_data_loader_kwargs.update({
                 'labels': self.train_labels,
+                'batches': self.train_batches,
                 'max_cells_per_batch': self.max_cells_per_batch,
                 'max_classes_per_batch': self.max_classes_per_batch,
             })
@@ -334,6 +344,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
             self.val_loader_class = ContrastiveAnnDataLoader
             self.val_data_loader_kwargs.update({
                 'labels': self.val_labels,
+                'batches': self.val_batches,
                 'max_cells_per_batch': self.max_cells_per_batch,
                 'max_classes_per_batch': self.max_classes_per_batch,
             })

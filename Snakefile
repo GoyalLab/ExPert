@@ -188,6 +188,8 @@ rule build_gene_pool:
         pool = HVG_POOL
     log:
         os.path.join(LOG, 'pool.log')
+    params:
+        var_merge = config['var_merge']
     resources:
         time = config['pool_t'],
         mem = config['pool_m'],
@@ -232,7 +234,7 @@ rule merge_datasets:
     resources:
         time = config['merge_t'],
         mem = config['merge_m'],
-        partition = config['partition']
+        partition = config.get('merge_partition', config['partition'])
     script:
         "workflow/scripts/merge.py"
 
@@ -241,9 +243,7 @@ rule merge_datasets:
 
 # define output files of rule based on correction method
 HARMONIZED_OUTPUT_FILES = {'harmonized': HARMONIZED_OUTPUT_FILE}
-if correction_method == 'scANVI':
-    print('Caching trained models')
-    # HARMONIZED_OUTPUT_FILES.update({'model_file': MODEL_FILE})
+
 # TODO: switch partition to gpu if scvi is enabled
 rule harmonize:
     input:

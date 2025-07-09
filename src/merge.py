@@ -98,7 +98,7 @@ def _on_disk(input_pths, out_pth, obs, var, key='dataset'):
         meta_set.file.close()
 
 
-def _dask_vstack(input_pths, obs, var):
+def _dask_vstack(input_pths, obs: pd.DataFrame, var: pd.DataFrame):
     X = []
     for file in input_pths:
         logging.info(f'Adding {file} .X to meta-set')
@@ -125,7 +125,7 @@ def _umap(adata):
     sc.tl.umap(adata)
 
 
-def merge(input_pths, out_pth, obs, var, method='dask'):
+def merge(input_pths, out_pth: str, obs: pd.DataFrame, var: pd.DataFrame, method: str = 'dask'):
     if method == 'dask':
         metaset = _dask_vstack(input_pths, obs=obs, var=var)
         logging.info(f'Saving metaset AnnData to {out_pth}')

@@ -5,12 +5,12 @@ import scipy.sparse as sp
 import anndata as ad
 from pathlib import Path
 import numpy as np
-import scanpy as sc
 from src.utils import read_ad
 import dask.array as da
+from typing import Iterable
 
 
-def _filter(d, dataset_name, hvg_pool, zero_pad=True):
+def _filter(d: ad.AnnData, dataset_name: str, hvg_pool: Iterable[str], zero_pad: bool = True):
     # extract .X, obs and var from dataset and delete input
     X, obs, var = d.X, d.obs, d.var
     # ensure .X is in csc format
@@ -54,7 +54,7 @@ def _filter(d, dataset_name, hvg_pool, zero_pad=True):
     return ad.AnnData(X=X, obs=obs, var=var)
 
 
-def prepare_merge(input_pth, pool_genes, out, zero_pad=True):
+def prepare_merge(input_pth: str, pool_genes: Iterable[str], out: str, zero_pad: bool = True):
     if input_pth.endswith('.h5ad'):
         logging.info(f'Preparing file: {input_pth}')
         name = Path(input_pth).stem

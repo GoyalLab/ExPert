@@ -77,6 +77,7 @@ class ContrastiveAnnDataLoader(DataLoader):
     def __init__(
         self,
         adata_manager: AnnDataManager,
+        batches: list[int] | list[bool],
         labels: list[int] | list[bool],
         indices: list[int] | list[bool] | None = None,
         batch_size: int = 512,
@@ -129,11 +130,12 @@ class ContrastiveAnnDataLoader(DataLoader):
             if not distributed_sampler:
                 # Replace RandomSampler with ContrastiveSampler
                 sampler_cls = RandomContrastiveBatchSampler(
-                    self.dataset,
-                    labels,
-                    batch_size,
-                    max_cells_per_batch,
-                    max_classes_per_batch,
+                    dataset=self.dataset,
+                    cls_labels=labels,
+                    batches=batches,
+                    batch_size=batch_size,
+                    max_cells_per_batch=max_cells_per_batch,
+                    max_classes_per_batch=max_classes_per_batch,
                     shuffle=shuffle,
                     drop_last=drop_last,
                 )
@@ -146,6 +148,7 @@ class ContrastiveAnnDataLoader(DataLoader):
                 sampler = DistributedContrastiveBatchSampler(
                     self.dataset,
                     labels,
+                    batches,
                     batch_size,
                     max_cells_per_batch,
                     max_classes_per_batch,

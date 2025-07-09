@@ -2,21 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
-
 import collections
 from collections.abc import Callable, Iterable
-from typing import Literal
+from typing import Literal, Iterable, Optional
 
 from torch.distributions import Normal
 
 
 def _identity(x):
     return x
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Iterable, Optional
 
 
 class FunnelFCLayers(nn.Module):
@@ -272,29 +266,47 @@ class FCLayers(nn.Module):
     
 
 class FeatureAttention(nn.Module):
-    """Simple self-attention mechanism over input features."""
-    def __init__(
-        self,
-        n_input: int,
-        scale_fn: Callable[[int], float] = torch.sqrt,
-    ):
+    """
+    Per-sample self-attention mechanism over input features.
+    For each sample in the batch, computes attention between its features.
+    """
+    def __init__(self, n_input: int):
         super().__init__()
-        self.query = nn.Linear(n_input, n_input)
-        self.key = nn.Linear(n_input, n_input)
-        self.value = nn.Linear(n_input, n_input)
-        self.scale = scale_fn(n_input)
+        self.query = nn.Linear(n_input, n_input, bias=False)
+        self.key = nn.Linear(n_input, n_input, bias=False)
+        self.value = nn.Linear(n_input, n_input, bias=False)
 
-    def forward(self, x: torch.Tensor, feature_mask=None):
-        # x: (batch, features)
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
-        attn_weights = (q @ k.T) / self.scale
+    def forward(self, x: torch.Tensor, feature_mask: torch.Tensor = None):
+        """
+        Args:
+            x: Tensor of shape (batch, features)
+            feature_mask: Optional mask of shape (batch, features) with 0s for features to mask
+
+        Returns:
+            attended: Tensor of shape (batch, features)
+        """
+
+        # Compute dot product between all features for each sample
+        q = self.query(x)               # (batch, features)
+        k = self.key(x)                 # (batch, features)
+        v = self.value(x)               # (batch, features)
+
+        # Compute attention: (batch, features, features)
+        attn_weights = torch.bmm(q.unsqueeze(2), k.unsqueeze(1))  # per sample
+
         if feature_mask is not None:
-            attn_weights.masked_fill(feature_mask==0, -1e9)
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        attended = attn_weights * v
+            # Mask has shape (batch, features) --> (batch, 1, features)
+            attn_weights = attn_weights.masked_fill(
+                feature_mask.unsqueeze(1) == 0, -1e9
+            )
+        # Normalize attention weights
+        attn_weights = torch.softmax(attn_weights, dim=-1)  # (batch, features, features)
+
+        # Apply attention: (batch, features, features) x (batch, features, 1) --> (batch, features, 1)
+        attended = torch.bmm(attn_weights, v.unsqueeze(-1)).squeeze(-1)  # (batch, features)
+
         return attended
+
 
 # Encoder
 class Encoder(nn.Module):
@@ -344,7 +356,7 @@ class Encoder(nn.Module):
         var_eps: float = 1e-4,
         var_activation: Callable | None = None,
         return_dist: bool = False,
-        use_attention: bool = False,
+        use_attention: Literal['input', 'hidden', 'output'] | None = 'hidden',
         use_feature_mask: bool = False,
         drop_prob: float = 0.25,
         **kwargs,
@@ -354,10 +366,18 @@ class Encoder(nn.Module):
         self.distribution = distribution
         self.var_eps = var_eps
         self.n_input = n_input
-        # Setup attention if needed
+        # Setup attention if not None
         self.use_attention = use_attention
-        if self.use_attention:
-            self.attn = FeatureAttention(n_input=n_input)
+        if self.use_attention is not None:
+            if self.use_attention == 'input':
+                if n_input > 1000:
+                    logging.warning(f'Got large input for attention layer ({n_input}), could lead to memory explosions.')
+                attn_dim = n_input
+            elif self.use_attention == 'hidden':
+                attn_dim = n_hidden
+            else:
+                attn_dim = n_output
+            self.attn = FeatureAttention(n_input=attn_dim)
         # Setup encoder layers
         self.encoder = FunnelFCLayers(
             n_in=n_input,
@@ -401,18 +421,29 @@ class Encoder(nn.Module):
             tensors of shape ``(n_latent,)`` for mean and var, and sample
 
         """
+        feature_mask = None
         if self.use_feature_mask:
             # Sample mask: 1 for keep, 0 for drop
             feature_mask = torch.bernoulli(torch.full((self.n_input,), 1 - self.drop_prob))  # shape: (num_features,)
             feature_mask = feature_mask.view(1, -1)  # shape: (1, num_features)
             feature_mask = feature_mask.expand(x.shape[0], -1)  # broadcast to full batch
+            feature_mask = feature_mask.to(x.device)
             x = x * feature_mask
-        if self.use_attention:
-            x = self.attn(x)
+        # Use attention on features
+        if self.use_attention is not None and self.use_attention == 'input':
+            x = self.attn(x, feature_mask)
         # Parameters for latent distribution
         q = self.encoder(x, *cat_list)
+        # Apply attention over encoded features
+        if self.use_attention is not None and self.use_attention == 'hidden':
+            q = self.attn(q, feature_mask)
+        # Project to mean and variance
         q_m = self.mean_encoder(q)
         q_v = self.var_activation(self.var_encoder(q)) + self.var_eps
+        # Apply attention over latent mean and var
+        if self.use_attention is not None and self.use_attention == 'output':
+            q_m = self.attn(q_m, feature_mask)
+        # Create Normal distribution and sample a latent
         dist = Normal(q_m, q_v.sqrt())
         latent = self.z_transformation(dist.rsample())
         if self.return_dist:
@@ -574,7 +605,7 @@ class EmbeddingClassifier(nn.Module):
         self.temperature = temperature
         self.return_latents = return_latents
 
-        # 1. Base encoder
+        # Initialize layers
         if n_hidden > 0 and n_layers > 0:
             self.encoder = FCLayers(
                 n_in=n_input,
@@ -588,7 +619,8 @@ class EmbeddingClassifier(nn.Module):
                 **kwargs,
             )
         else:
-            self.encoder = nn.Identity()
+            # Set encoder to a single linear layer
+            self.encoder = nn.Linear(n_input, class_embed_dim)
             class_embed_dim = n_input
 
         # 2. Check compatibility
@@ -608,7 +640,7 @@ class EmbeddingClassifier(nn.Module):
         else:
             self.attn = None
 
-    def forward(self, x, class_embeds=None, **kwargs):
+    def forward(self, x, class_embeds: torch.Tensor | None = None):
         """
         Parameters
         ----------
@@ -621,7 +653,8 @@ class EmbeddingClassifier(nn.Module):
 
         if class_embeds is None:
             class_embeds = self.learned_class_embeds
-        class_embeds = class_embeds.to(z.device)
+        else:
+            class_embeds = class_embeds.to(z.device)
 
         if self.use_cosine_similarity:
             z_norm = F.normalize(z, dim=-1)            # (batch, d)

@@ -5,6 +5,7 @@ import pandas as pd
 import logging
 import anndata as ad
 import scipy.sparse as sp
+from typing import Iterable
 from src.statics import P_COLS, CTRL_KEYS, GENE_SYMBOL_KEYS, SETTINGS
 
 
@@ -114,6 +115,13 @@ def ens_to_symbol(adata: ad.AnnData) -> ad.AnnData:
         adata = adata[:,idx]
     return adata
 
+def _find_match_idx(target: Iterable[str], ref: Iterable[str]) -> int:
+    t = np.array(target)
+    r = np.array(ref)
+    target_idc, _ = np.where(t.reshape(-1, 1)==r)
+    if target_idc.shape[0] == 0:
+        raise ValueError(f'Could not find match between target: {t} and reference: {r}.')
+    return target_idc[0]
 
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
 def preprocess_dataset(
@@ -137,23 +145,18 @@ def preprocess_dataset(
     # Check perturbation column
     if p_col not in adata.obs.columns:
         logging.info(f'"{p_col}" not found in adata.obs, looking for alternatives.')
-        candidate_p_cols = adata.obs.columns.str.lower().intersection(set(P_COLS))
-        if len(candidate_p_cols) == 0:
-            raise ValueError(f'Could not find an alternative perturbation column in adata. Looked for {P_COLS}')
-        # Fall back to first hit
-        p_col_hit = candidate_p_cols[0]
+        p_col_idx = _find_match_idx(adata.obs.columns.str.lower(), ref=P_COLS)
+        p_col_hit = adata.obs.columns[p_col_idx]
         adata.obs[p_col] = adata.obs[p_col_hit]
-        logging.info(f'Using "{p_col_hit}" as perturbation column')
+        logging.info(f'Found "{p_col_hit}" as perturbation column')
     # Check control key
     if np.sum(adata.obs[p_col]==ctrl_key) == 0:
         logging.info(f'{ctrl_key} not found in "{p_col}", looking for alternatives.')
-        all_ps = set(adata.obs[p_col].str.lower().unique())
-        candidate_ctrl_keys = all_ps.intersection(set(CTRL_KEYS))
-        if len(candidate_ctrl_keys) == 0:
-            raise ValueError(f'Could not find an alternative control key in "{p_col}". Looked for {CTRL_KEYS}')
-        ctrl_key_hit = list(candidate_ctrl_keys)[0]
-        adata.obs[p_col] = adata.obs[p_col].replace(ctrl_key_hit, ctrl_key)
-        logging.info(f'Using "{ctrl_key_hit}" as control key')
+        all_ps = adata.obs[p_col].unique()
+        ctrl_idx = _find_match_idx(pd.Series(all_ps).str.lower(), ref=CTRL_KEYS)
+        ctrl_key_hit = all_ps[ctrl_idx]
+        adata.obs[p_col] = pd.Series(adata.obs[p_col].str.replace(ctrl_key_hit, ctrl_key))
+        logging.info(f'Found "{ctrl_key_hit}" as control key')
     # Filter for single perturbations only
     if single_perturbations_only:
         logging.info(f'Filtering column "{p_col}" for single perturbations only')

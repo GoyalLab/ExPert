@@ -1,6 +1,5 @@
 from typing import TYPE_CHECKING, Iterable
 
-from src.models.base import AttentionEncoder
 from src.modules._base import EmbeddingClassifier, Encoder, DecoderSCVI
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 
@@ -68,10 +67,12 @@ class JEDVAE(VAE):
         use_layer_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'none',
         var_activation: Callable[[torch.Tensor], torch.Tensor] | None = None,
         l1_lambda: float | None = 1e-5,
-        use_attention_encoder: bool = False,
+        use_attention_encoder: Literal['input', 'hidden', 'output'] | None = 'hidden',
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
         reduction: Literal['mean', 'sum'] = 'sum',
+        use_feature_mask: bool = True,
+        drop_prob: float = 0.5,
         extra_encoder_kwargs: dict | None = None,
         extra_decoder_kwargs: dict | None = None,
     ):
@@ -132,11 +133,9 @@ class JEDVAE(VAE):
         _extra_encoder_kwargs = extra_encoder_kwargs or {}
         _extra_decoder_kwargs = extra_decoder_kwargs or {}
 
-        # Select encoder class
-        _encoder = AttentionEncoder if use_attention_encoder else Encoder
 
         # Re-Init encoder for X (rna-seq)
-        self.z_encoder = _encoder(
+        self.z_encoder = Encoder(
             n_input=n_input_encoder, 
             n_output=n_latent, 
             n_hidden=n_hidden,
@@ -146,6 +145,9 @@ class JEDVAE(VAE):
             use_batch_norm=use_batch_norm_encoder, 
             use_layer_norm=use_layer_norm_encoder,
             var_activation=var_activation,
+            use_attention=use_attention_encoder,
+            use_feature_mask=use_feature_mask,
+            drop_prob=drop_prob,
             **_extra_encoder_kwargs,
             return_dist=True,
         )

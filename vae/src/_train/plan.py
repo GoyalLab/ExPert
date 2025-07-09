@@ -12,7 +12,7 @@ from scvi.module.base import BaseModuleClass, LossOutput
 from scvi.train._metrics import ElboMetric
 from scvi.train._constants import METRIC_KEYS
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from typing import Literal, Any
 from umap import UMAP
@@ -187,10 +187,6 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
         self.average = average
         self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
         self.plot_umap = self.loss_kwargs.pop("plot_umap", False)
-        # Initialize confusion matrix
-        self.train_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
-        self.val_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
-        self.test_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
     
     def log_with_mode(self, key: str, value: Any, mode: str, **kwargs):
         """Log with mode."""
@@ -280,15 +276,6 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
         true_labels = loss_output.true_labels.squeeze(-1)
         logits = loss_output.logits
         predicted_labels = torch.argmax(logits, dim=-1)
-
-        # Update confusion matrix
-        if mode == 'train':
-            confusion_metric = self.train_confmat
-        elif mode == 'val':
-            confusion_metric = self.val_confmat
-        else:
-            confusion_metric = self.test_confmat
-        confusion_metric.update(predicted_labels, true_labels)
 
         accuracy = tmf.classification.multiclass_accuracy(
             predicted_labels,
@@ -461,23 +448,6 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
         import seaborn as sns
 
         if self.current_epoch % 10 == 0:
-            if self.plot_cm:
-                confusion_matrix = self.val_confmat.compute()
-                self.val_confmat.reset()
-                
-                # Log confusion matrix as a heatmap if using tensorboard
-                if isinstance(self.logger, pl.loggers.TensorBoardLogger):
-                    fig = plt.figure(figsize=(10, 10), dpi=150)
-                    sns.heatmap(confusion_matrix.cpu().numpy(), annot=False)
-                    plt.title(f'Validation Confusion Matrix (Epoch: {self.current_epoch})')
-                    plt.close()
-                    
-                    # Log figure to tensorboard
-                    self.logger.experiment.add_figure(
-                        'validation_confusion_matrix',
-                        fig,
-                        global_step=self.current_epoch
-                    )
             if self.plot_umap:
                 # Perform forward pass on the validation set to get embeddings
                 full_dataset = self.trainer.datamodule.val_dataloader()
@@ -583,6 +553,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         log_class_distribution: bool = False,
         log_full_val: bool = True,
         freeze_encoder_epoch: int | None = None,
+        cls_emb: torch.Tensor | None = None,
+        incl_n_unseen: int | None = 200,
         **loss_kwargs,
     ):
         super().__init__(
@@ -601,12 +573,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             **loss_kwargs,
         )
         # CLS params
+        self.n_classes = n_classes
         self.n_steps_cls_warmup = n_steps_cls_warmup
         self.n_epochs_cls_warmup = n_epochs_cls_warmup
         self.n_epochs_cls_stall = n_epochs_cls_stall
         self.max_cls_weight = max_cls_weight
         self.min_cls_weight = min_cls_weight
         self.use_posterior_mean = use_posterior_mean
+        self.cls_emb = cls_emb
+        self.incl_n_unseen = incl_n_unseen
         # Contrastive params
         self.n_steps_contr_warmup = n_steps_contr_warmup
         self.n_epochs_contr_warmup = n_epochs_contr_warmup
@@ -624,16 +599,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.max_align_weight = max_align_weight
         self.min_align_weight = min_align_weight
         # Misc
-        self.n_classes = n_classes
         self.average = average
         self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
         self.plot_umap = self.loss_kwargs.pop("plot_umap", None)
         self.log_full_val = log_full_val
-        # Initialize confusion matrix
-        self.train_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
-        self.val_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
-        self.full_val_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
-        self.test_confmat = MulticlassConfusionMatrix(num_classes=n_classes)
         # Save classes that have been seen during training
         self.train_class_counts = []
         self.class_batch_counts = defaultdict(list)
@@ -726,32 +695,20 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         true_labels = loss_output.true_labels.squeeze(-1)
         logits = loss_output.logits
         predicted_labels = torch.argmax(logits, dim=-1)
-
-        # Update confusion matrix
-        if mode == 'train':
-            confusion_metric = self.train_confmat
-        elif mode == 'val':
-            confusion_metric = self.val_confmat
-        else:
-            confusion_metric = self.test_confmat
-        confusion_metric.update(predicted_labels, true_labels)
+        # Assign unknown to classes that are outside of the training classes
+        predicted_labels = predicted_labels.masked_fill((predicted_labels >= self.n_classes), self.n_classes)
 
         accuracy = tmf.classification.multiclass_accuracy(
             predicted_labels,
             true_labels,
-            self.n_classes,
+            self.n_classes+1,
             average=self.average
         )
         f1 = tmf.classification.multiclass_f1_score(
             predicted_labels,
             true_labels,
-            self.n_classes,
+            self.n_classes+1,
             average=self.average,
-        )
-        ce = tmf.classification.multiclass_calibration_error(
-            logits,
-            true_labels,
-            self.n_classes,
         )
 
         self.log_with_mode(
@@ -778,14 +735,23 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             on_epoch=True,
             batch_size=loss_output.n_obs_minibatch,
         )
-        self.log_with_mode(
-            METRIC_KEYS.CALIBRATION_ERROR_KEY,
-            ce,
-            mode,
-            on_step=False,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
+
+    def _get_batch_class_embedding(self, mode: Literal['sample', 'fixed'] = 'sample', batch_idx: int | None = None) -> torch.Tensor:
+        # Always include embedding for classes we actually observe during training
+        if mode == 'fixed' or self.incl_n_unseen is None or self.incl_n_unseen == 0:
+            return torch.Tensor(self.cls_emb[:self.n_classes,:].toarray())
+        # Randomly include other unseen classes
+        unseen_class_idc = np.arange(self.n_classes, self.cls_emb.shape[0])
+        # Draw classes based on batch index (for reproducibility)
+        rng = np.random.default_rng(seed=batch_idx)
+        sampled_unseen = rng.choice(
+            unseen_class_idc,
+            size=min(self.incl_n_unseen, len(unseen_class_idc)),
+            replace=False
         )
+        full_idx = np.concatenate([np.arange(self.n_classes), sampled_unseen])
+        return torch.Tensor(self.cls_emb[full_idx,:].toarray())
+
 
     def training_step(self, batch, batch_idx):
         """Training step for supervised training."""
@@ -802,8 +768,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
         # Add external embedding to batch
-        if input_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in input_kwargs:
-            batch[REGISTRY_KEYS.CLS_EMB_KEY] = input_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
+        if self.cls_emb is not None:
+            # Add embedding for classes that are not in the training data
+            batch[REGISTRY_KEYS.CLS_EMB_KEY] = self._get_batch_class_embedding(mode='sample', batch_idx=batch_idx)
+        # Perform full forward pass of model
         _, _, loss_output = self.forward(batch, loss_kwargs=input_kwargs)
         loss = loss_output.loss
         self.log(
@@ -853,8 +821,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
         # Add external embedding to batch
-        if input_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in input_kwargs:
-            batch[REGISTRY_KEYS.CLS_EMB_KEY] = input_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
+        if self.cls_emb is not None:
+            # Add embedding for classes that are not in the training data
+            batch[REGISTRY_KEYS.CLS_EMB_KEY] = self._get_batch_class_embedding(mode='fixed')
         _, _, loss_output = self.forward(batch, loss_kwargs=input_kwargs)
         loss = loss_output.loss
         self.log(
@@ -917,28 +886,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     # Calculate accuracy & f1 for entire validation set, not just per batch
     def on_validation_epoch_end(self):
         """Plot class label confusion matrix and UMAP projection."""
-        import pytorch_lightning as pl
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-
         if self.current_epoch % 10 == 0:
-            if self.plot_cm:
-                confusion_matrix = self.val_confmat.compute()
-                self.val_confmat.reset()
-                
-                # Log confusion matrix as a heatmap if using tensorboard
-                if isinstance(self.logger, pl.loggers.TensorBoardLogger):
-                    fig = plt.figure(figsize=(10, 10), dpi=150)
-                    sns.heatmap(confusion_matrix.cpu().numpy(), annot=False)
-                    plt.title(f'Validation Confusion Matrix (Epoch: {self.current_epoch})')
-                    plt.close()
-                    
-                    # Log figure to tensorboard
-                    self.logger.experiment.add_figure(
-                        'validation_confusion_matrix',
-                        fig,
-                        global_step=self.current_epoch
-                    )
             plt_umap = self.plot_umap in ['val', 'both']
             if plt_umap or self.log_full_val:
                 # Get data from forward pass

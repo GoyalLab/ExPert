@@ -60,8 +60,8 @@ class JEDVI(
     ):
     _module_cls = JEDVAE
     _training_plan_cls = ContrastiveSupervisedTrainingPlan
-    _LATENT_QZM_KEY = "gpvi_latent_qzm"
-    _LATENT_QZV_KEY = "gpvi_latent_qzv"
+    _LATENT_QZM_KEY = "jedvi_latent_qzm"
+    _LATENT_QZV_KEY = "jedvi_latent_qzv"
 
 
     def __init__(
@@ -136,38 +136,43 @@ class JEDVI(
         else:
             labels_key = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY).original_key
             labels = self.adata.obs[labels_key].values
-            class_weights = compute_class_weight(method, classes=self._label_mapping[:-1], y=labels)
+            class_weights = compute_class_weight(method, classes=self._label_mapping, y=labels)
             return torch.tensor(class_weights, dtype=torch.float32)
 
     def _set_indices_and_labels(self):
         """Set indices for labeled and unlabeled cells. Prepare class embedding"""
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
-
-        labels = get_anndata_attribute(
-            self.adata,
-            self.adata_manager.data_registry.labels.attr_name,
-            self.original_label_key,
-        ).ravel()
         self._label_mapping = labels_state_registry.categorical_mapping
 
         self._code_to_label = dict(enumerate(self._label_mapping))
         # order class embedding according to label mapping and transform to matrix
         if REGISTRY_KEYS.CLS_EMB_KEY in self.adata.uns:
-            if 'CLS_EMB_INIT' not in self.adata.uns:
+            if REGISTRY_KEYS.CLS_EMB_INIT not in self.adata.uns:
                 cls_emb: pd.DataFrame = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY]
                 if not isinstance(cls_emb, pd.DataFrame):
                     logging.warning(f'Class embedding has to be a dataframe with labels as index, got {cls_emb.__class__}. Falling back to internal embedding.')
                 else:
+                    emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY]
                     # Order external embedding to match label mapping and convert to csr matrix
-                    _label_series = pd.Series(self._code_to_label.values())[:-1]
-                    _label_overlap = _label_series.isin(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].index)
+                    _label_series = pd.Series(self._code_to_label.values())
+                    _label_overlap = _label_series.isin(emb.index)
                     _shared_labels = _label_series[_label_overlap].values
+                    _unseen_labels = emb.index.difference(_shared_labels)
                     n_missing = _label_overlap.shape[0] - _label_overlap.sum()
                     if n_missing > 0:
                         raise ValueError(f'Found {n_missing} missing labels in cls embedding: {_label_series[~_label_overlap]}')
-                    self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = sp.csr_matrix(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].loc[_shared_labels].values)
-                    self.adata.uns['CLS_EMB_INIT'] = {'n_labels': _shared_labels.shape[0]}
+                    # Re-order embedding: first training labels then rest
+                    cls_emb = pd.concat([emb.loc[_shared_labels], emb.loc[_unseen_labels]], axis=0)
+                    # Include entire embedding in model's adata
+                    self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = sp.csr_matrix(cls_emb.values)
+                    # Save registration with this model
+                    self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT] = {
+                        'model': self.__class__,
+                        'labels': cls_emb.index,
+                        'n_train_labels': _shared_labels.shape[0], 
+                        'n_unseen_labels': _unseen_labels.shape[0],
+                    }
             else:
                 logging.info(f'Class embedding has already been initialized with {self.__class__} for this adata.')
             self.n_dims_emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
@@ -461,6 +466,8 @@ class JEDVI(
             labels. Otherwise, uses a sample from the posterior distribution - this
             means that the predictions will be stochastic.
         """
+        is_new = adata is not None
+        # validate adata or get it from model
         adata = self._validate_anndata(adata)
 
         if indices is None:
@@ -472,12 +479,17 @@ class JEDVI(
             batch_size=batch_size,
         )
 
+        # Get gene embedding from test adata
+        cls_embedding, idx_to_label = None, None
+        if REGISTRY_KEYS.CLS_EMB_KEY in adata.uns and is_new:
+            cls_embedding = torch.Tensor(adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].values)
+            idx_to_label = adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].index.values
+
         y_pred = []
         y_cz = []
         for _, tensors in enumerate(scdl):
             x = tensors[REGISTRY_KEYS.X_KEY]
             batch = tensors[REGISTRY_KEYS.BATCH_KEY]
-            ext_cls_emb = tensors.get(REGISTRY_KEYS.CLS_EMB_KEY)
 
             cont_key = REGISTRY_KEYS.CONT_COVS_KEY
             cont_covs = tensors[cont_key] if cont_key in tensors.keys() else None
@@ -490,7 +502,7 @@ class JEDVI(
                 batch_index=batch,
                 cat_covs=cat_covs,
                 cont_covs=cont_covs,
-                class_embeds=ext_cls_emb
+                class_embeds=cls_embedding
             )
             # Predict based on X
             if self.module.classifier.logits:
@@ -505,14 +517,18 @@ class JEDVI(
         if not soft:
             predictions = []
             for p in y_pred:
-                predictions.append(self._code_to_label[p])
+                if cls_embedding is None:
+                    label = self._code_to_label[p]
+                else:
+                    label = idx_to_label[p]
+                predictions.append(label)
 
             pred = np.array(predictions)
         else:
             n_labels = len(pred[0])
             pred = pd.DataFrame(
                 y_pred,
-                columns=self._label_mapping[:n_labels],
+                columns=self._label_mapping[:n_labels] if cls_embedding is None else idx_to_label,
                 index=adata.obs_names[indices],
             )
         if return_latent:
@@ -592,11 +608,13 @@ class JEDVI(
         )
 
         plan_kwargs = train_params.pop('plan_kwargs', {})
+        
+        cls_emb = None
         # Add external labels to training if included during setup
         if REGISTRY_KEYS.CLS_EMB_KEY in self.adata_manager.data_registry:
             cls_emb_registry = self.adata_manager.data_registry[REGISTRY_KEYS.CLS_EMB_KEY]
             # Add external embedding to plan parameters
-            plan_kwargs[REGISTRY_KEYS.CLS_EMB_KEY] = get_anndata_attribute(
+            cls_emb = get_anndata_attribute(
                 self.adata,
                 cls_emb_registry.attr_name,
                 cls_emb_registry.attr_key,
@@ -607,7 +625,12 @@ class JEDVI(
         # Share code to label mapping with training plan
         plan_kwargs['_code_to_label'] = self._code_to_label.copy()
         # create training plan
-        training_plan = self._training_plan_cls(module=self.module, n_classes=self.n_labels, **plan_kwargs)
+        training_plan = self._training_plan_cls(
+            module=self.module, 
+            n_classes=self.n_labels, 
+            cls_emb=cls_emb,
+            **plan_kwargs
+        )
         check_val_every_n_epoch = train_params.pop('check_val_every_n_epoch', 1)
      
         # create training runner

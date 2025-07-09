@@ -77,6 +77,7 @@ def _strings():
         'ctrl_key', 
         'correction_method', 
         'merge_method',
+        'var_merge',
         'gene_embedding'
     ]
 
@@ -107,3 +108,5 @@ FLOATS = _floats()
 P_COLS = _perturbation_cols()
 CTRL_KEYS = _ctrl_keys()
 GENE_SYMBOL_KEYS = _gene_symbol_keys()
+# Collect all params for hash
+PARAM_KEYS = [*STRINGS, *BOOLEANS, *INTS, *FLOATS]

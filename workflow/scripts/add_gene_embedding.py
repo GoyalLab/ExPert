@@ -12,7 +12,7 @@ def _add_emb(adata_p: str, emb_p: str, output_path: str, **kwargs):
     adata = sc.read(adata_p)
     ep.process(adata)
     logging.info(f'Writing adata with gene embedding to {output_path}')
-    adata.write_h5ad(output_path)
+    adata.write_h5ad(output_path, compression='gzip')
 
 if __name__ == "__main__":
     # handle logging

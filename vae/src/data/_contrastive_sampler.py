@@ -4,9 +4,9 @@ import pandas as pd
 import logging
 import math
 from typing import Optional
-from rdflib import Dataset
+
 import torch
-from torch.utils.data import Sampler
+from torch.utils.data import Sampler, Dataset
 import torch.distributed as dist
 
 
@@ -15,6 +15,7 @@ class RandomContrastiveBatchSampler(Sampler):
         self,
         dataset: Dataset,
         cls_labels: list[int] | list[bool],
+        batches: list[int] | list[bool],
         batch_size: int = 512,
         max_cells_per_batch: int = 32,
         max_classes_per_batch: int = 16,
@@ -28,6 +29,7 @@ class RandomContrastiveBatchSampler(Sampler):
         self.shuffle = shuffle
         self.seed = seed
         self.cls_labels = np.array(cls_labels)
+        self.batches = np.array(batches)
         self.batch_size = batch_size
         self.max_cells_per_batch = max_cells_per_batch
         self.max_classes_per_batch = max_classes_per_batch
@@ -45,18 +47,20 @@ class RandomContrastiveBatchSampler(Sampler):
         else:
             indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
         labels = self.cls_labels[indices]
+        batches = self.batches[indices]
 
         # Create batches using contrastive logic
         sampler = self.batch_sampler_cls(
             indices=indices,
             cls_labels=labels,
+            batch_labels=batches,
             batch_size=self.batch_size,
             max_cells_per_batch=self.max_cells_per_batch,
             max_classes_per_batch=self.max_classes_per_batch,
             last_first=True,
             shuffle_classes=self.shuffle,
         )
-        batch_dict = sampler.sample(copy=False, return_details=False)
+        batch_dict = sampler.sample(copy=True, return_details=False)
         return np.array(batch_dict[sampler.IDX_KEY])
 
     def __iter__(self):
@@ -75,6 +79,7 @@ class DistributedContrastiveBatchSampler(Sampler):
         self,
         dataset: Dataset,
         cls_labels: list[int] | list[bool],
+        batches: list[int] | list[bool],
         batch_size: int = 512,
         max_cells_per_batch: int = 32,
         max_classes_per_batch: int = 16,
@@ -117,6 +122,7 @@ class DistributedContrastiveBatchSampler(Sampler):
         self.seed = seed
 
         self.cls_labels = np.array(cls_labels)
+        self.batches = np.array(batches)
         self.batch_size = batch_size
         self.max_cells_per_batch = max_cells_per_batch
         self.max_classes_per_batch = max_classes_per_batch
@@ -132,11 +138,13 @@ class DistributedContrastiveBatchSampler(Sampler):
         else:
             indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
         labels = self.cls_labels[indices]
+        batches = self.batches[indices]
 
         # Create batches using contrastive logic
         sampler = self.batch_sampler_cls(
             indices=indices,
             cls_labels=labels,
+            batch_labels=batches,
             batch_size=self.batch_size,
             max_cells_per_batch=self.max_cells_per_batch,
             max_classes_per_batch=self.max_classes_per_batch,
@@ -222,9 +230,11 @@ class ContrastiveBatchSampler:
         if self.batch_size % self.max_classes_per_batch != 0:
             logging.warning(f'Batch size is not directly divisible by {self.max_classes_per_batch}. This could lead to performance issues.')
 
+    # TODO: sample equally from each batch, i.e. max_cells_per_batch / n_batches
     def __init__(
         self,
         indices: np.ndarray,
+        batch_labels: np.ndarray,
         cls_labels: np.ndarray,
         batch_size: int = 480,
         max_cells_per_batch: int | None = 24,
@@ -232,6 +242,7 @@ class ContrastiveBatchSampler:
         last_first: bool = True,
         shuffle_classes: bool = True,
         strict: bool = True,
+        split_batches: bool = False,
     ):
         self.batch_size = batch_size
         self.max_cells_per_batch = max_cells_per_batch
@@ -240,10 +251,12 @@ class ContrastiveBatchSampler:
         self.class_limit = self.max_classes_per_batch if self.max_classes_per_batch is not None else 0
         self.shuffle_classes = shuffle_classes
         self.strict = strict
+        self.split_batches = split_batches
         # Setup indices and labels
         self.indices = np.array(indices)
         self.n_indices = len(indices)
-        self.cls_labels = pd.Series(cls_labels)
+        self.cls_labels = pd.Series(cls_labels, name='cls_label')
+        self.batch_labels = pd.Series(batch_labels, name='batch')
         # Count number of cells per class
         self.cells_per_class = self.cls_labels.value_counts()
         # Define number of unique classes in data
@@ -257,6 +270,76 @@ class ContrastiveBatchSampler:
         # Sample from smallest classes first to ensure that they will be included in training
         if last_first:
             self.class_pool = self.class_pool[::-1]
+        # Draw equal number of cells per batch label
+        if self.split_batches:
+            self.n_batches = np.floor(self.n_indices / self.batch_size)
+            self.unique_batches = self.batch_labels.unique()
+            self.n_cells_per_batch = int(self.max_cells_per_batch / len(self.unique_batches))
+            self.idx_pools = {
+                cls: {
+                    b: set(self.indices[(self.cls_labels == cls) & (self.batch_labels == b)])
+                    for b in self.unique_batches
+                } for cls in self.cells_per_class.index.values
+            }
+
+    def _fill_batch_split(self, class_pool: list[int], idx_pools: dict[int, dict[int, set[int]]]) -> tuple[list[int], list[int], list[int]]:
+        # Set batch size
+        batch_space = self.batch_size
+        # Collect indices from random classes for a batch
+        batch_idc = []
+        # Keep drawing cells from classes until batch bin is full
+        i = 0
+        classes_in_batch = []
+        cells_per_class = []
+        # Randomly walk through the available classes
+        if self.shuffle_classes:
+            _class_pool = list(np.random.permutation(class_pool))
+        else:
+            _class_pool = list(class_pool)
+        
+        while batch_space > 0 and len(_class_pool) >= self.class_limit:
+            target_class = _class_pool[i]
+            # Chcek available space in batch
+            batch_space = self.batch_size - len(batch_idc)
+            # Get all available indices of that class
+            current_class_pool = idx_pools[target_class]
+            # Go through every batch label and draw cells
+            n_drawn_total = 0
+            # Check total number of items in class
+            n_min = np.min([len(current_class_pool[bl]) for bl in self.unique_batches])
+            if self.n_cells_per_batch > n_min:
+                # Remove class from available classes in pool
+                _class_pool.remove(target_class)
+                # If we don't want strict sampling, just draw as many as there are left in class
+                draw_n = n_min
+            else:
+                draw_n = self.n_cells_per_batch
+            # Collect equal amounts of samples from each batch
+            for batch_label in self.unique_batches:
+                target_pool = current_class_pool[batch_label]
+
+                # Check if we can add enough cells to batch
+                if draw_n > batch_space:
+                    draw_n = batch_space
+                # Draw samples
+                if draw_n > 0:
+                    # Randomly draw as many cells as we can from that class and add to batch
+                    target_idc = np.random.choice(list(target_pool), draw_n, replace=False)
+                    batch_idc.extend(target_idc)
+                    # Remove those indices from class pool
+                    target_pool -= set(target_idc)
+                n_drawn_total += draw_n
+            # Update total statistics of batch
+            if n_drawn_total > 0:
+                classes_in_batch.append(i)
+                cells_per_class.append(draw_n)
+            # Move class indexer, because we just looked at a class pool
+            i += 1
+            # Cycle through all classes repeatedly until either batch is full or classes are empty
+            if i >= len(_class_pool):
+                i = 0
+            
+        return batch_idc, classes_in_batch, cells_per_class
 
     def _fill_batch(self, class_pool: list[int], idx_pools: list[set[int]]) -> tuple[list[int], list[int], list[int]]:
         # Set batch size
@@ -312,6 +395,7 @@ class ContrastiveBatchSampler:
         n_classes_per_batch = []
         n_idc_per_batch = []
         classes_in_batches = []
+
         # Make copies of classes and indices
         if copy:
             class_pool = deepcopy(self.class_pool)
@@ -321,7 +405,10 @@ class ContrastiveBatchSampler:
             idx_pools = self.idx_pools
         # Draw cells for each batch
         for _ in np.arange(self.n_batches):
-            batch_idc, classes_in_batch, cells_per_class = self._fill_batch(class_pool=class_pool, idx_pools=idx_pools)
+            if self.split_batches:
+                batch_idc, classes_in_batch, cells_per_class = self._fill_batch_split(class_pool=class_pool, idx_pools=idx_pools)
+            else:
+                batch_idc, classes_in_batch, cells_per_class = self._fill_batch(class_pool=class_pool, idx_pools=idx_pools)
             # Check for invalid batches
             if len(batch_idc) != self.batch_size:
                 continue
