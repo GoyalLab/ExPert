@@ -19,6 +19,8 @@ class _OBS_KEYS_NT(NamedTuple):
     PERTURBATION_TYPE_KEY: str = 'perturbation_type'
     CELL_TYPE_KEY: str = 'celltype_broad'
     PERTURBATION_KEY: str = 'perturbation'
+    POOL_PERTURBATION_KEY: str = 'pool_perturbation'
+    CTRL_KEY: str = 'control'
 
 class _SETTINGS(NamedTuple):
     MT_PERCENT_CANCER: int = 20
@@ -73,6 +75,7 @@ def _strings():
         'data_dir', 
         'cache_dir', 
         'log_dir', 
+        'plot_dir',
         'perturbation_col', 
         'ctrl_key', 
         'correction_method', 

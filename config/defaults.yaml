@@ -4,9 +4,11 @@ datasheet: 'path/to/your/datasheet.csv'
 output_dir: 'results'                       # Final pipeline outputs, i.e. merged dataset (h5ad), filtered cell meta, and highly variable gene information will be saved to this directory
 cache_dir: 'data_cache'                     # NOTICE: Datasets will be downloaded to this directory and multiple copies of it will be saved here, so make sure there is enough disk space
 log_dir: 'logs'
+plot_dir: 'plots'                           # Change to '' if you don't want meta overview plots
 ## Pre-processing:
 perturbation_col: 'perturbation'            # Column name to look for in .obs that specifies the perturbation label
 ctrl_key: 'control'                         # Column value in .obs[perturbation_col] that represents control cells
+use_perturbation_pool: true                 # Filter every dataset for biggest common set of perturbations
 qc: true                                    # Do quality control on cells (e.g. check for percentage of mitochondiral counts)
 norm: false                                 # Apply sc.pp.normalize_total()
 log_norm: false                             # Apply log1p scaling

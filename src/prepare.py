@@ -50,11 +50,11 @@ def _filter(d: ad.AnnData, dataset_name: str, hvg_pool: Iterable[str], zero_pad:
     dask_order = da.from_array(sorted_by_pool_idx, chunks=X.chunks[1])
     X = X[:, dask_order]
     var = var.iloc[sorted_by_pool_idx]
-    # Create update AnnData
+    # Create updated AnnData
     return ad.AnnData(X=X, obs=obs, var=var)
 
 
-def prepare_merge(input_pth: str, pool_genes: Iterable[str], out: str, zero_pad: bool = True):
+def prepare_merge(input_pth: str, pool_genes: Iterable[str], out: str, zero_pad: bool = True, **kwargs):
     if input_pth.endswith('.h5ad'):
         logging.info(f'Preparing file: {input_pth}')
         name = Path(input_pth).stem
@@ -64,6 +64,18 @@ def prepare_merge(input_pth: str, pool_genes: Iterable[str], out: str, zero_pad:
         adata.obs['dataset'] = name
         # subset to pre-calculated gene pool
         adata = _filter(adata, name, pool_genes, zero_pad=zero_pad)
+        # Convert adata.X to csr
+        if not isinstance(adata.X, sp.csr_matrix):
+            adata.X = sp.csr_matrix(adata.X)
+        # Filter for a minimum number of cells per perturbation
+        mcpp = kwargs.get('min_cells_per_perturbation')
+        if mcpp > 0:
+            p_col = kwargs.get('perturbation_col', 'perturbation')
+            cpp = adata.obs[p_col].value_counts()
+            filtered_perturbations = cpp[cpp >= mcpp].index
+            filter_mask = adata.obs[p_col].isin(filtered_perturbations)
+            adata._inplace_subset_obs(filter_mask)
+            logging.info(f'Filtering for a minimum of {mcpp} cells per perturbation. N perturbations: {filtered_perturbations.shape[0]}/{cpp.shape[0]}')
         # save prepared adata
         adata.write_h5ad(out, compression='gzip')
         return adata.obs

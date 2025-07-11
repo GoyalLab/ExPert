@@ -22,6 +22,7 @@ if __name__ == "__main__":
         process_dataset(
             dataset_file=snakemake.input.dataset_file,
             output_path=snakemake.output.processed,
+            perturbation_pool_file=snakemake.input.perturbation_pool_file,
             cancer=snakemake.params.is_cancer,
             name=snakemake.params.name,
             qc=snakemake.params.qc,

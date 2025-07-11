@@ -28,7 +28,7 @@ def hash(s: str, d: int = 4):
 
 
 def get_param_hash(p: dict, dataset_indices: list[str], d: int = 8):
-    blacklist = {'datasets', 'log_dir', 'data_dir', 'cache_dir'}
+    blacklist = {'datasets', 'log_dir', 'data_dir', 'cache_dir', 'plot_dir'}
     ps = p.copy()
     # sort dict
     ps = dict(sorted(p.items()))

@@ -5,6 +5,8 @@ from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 
 from typing import Iterable
 
+import numpy as np
+
 import logging
 import torch
 import torch.nn.functional as F
@@ -70,8 +72,9 @@ class JEDVAE(VAE):
         use_attention_encoder: Literal['input', 'hidden', 'output'] | None = 'hidden',
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
+        use_class_similarity_loss: bool = True,
         reduction: Literal['mean', 'sum'] = 'sum',
-        use_feature_mask: bool = True,
+        use_feature_mask: bool = False,
         drop_prob: float = 0.5,
         extra_encoder_kwargs: dict | None = None,
         extra_decoder_kwargs: dict | None = None,
@@ -116,6 +119,7 @@ class JEDVAE(VAE):
         self._update_cls_params()
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
+        self.use_class_similarity_loss = use_class_similarity_loss
         self.reduction = reduction
 
         # Setup normalizations for en- and decoder
@@ -216,13 +220,36 @@ class JEDVAE(VAE):
         # Classify based on x and class external embeddings if provided
         return self.classifier(z, class_embeds)
     
+    def _class_similarity_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        reduction: str = 'sum',
+        penalize_cls_uncertaintly: bool = True,
+        soft: bool = False,
+    ) -> torch.Tensor:
+        # Get similarity scores for each target class
+        cls_mask = targets == torch.arange(logits.shape[1]).to(logits.device)
+        cls_mask = torch.zeros_like(logits).masked_fill(cls_mask, 1.0).bool()
+        cls_sims = logits[cls_mask]
+        # Calculate cosine difference of cells and treat that as loss to minimize
+        cs_scores = 1 - cls_sims
+        # + overall similarity of cell to classes (classification uncertainty)
+        if penalize_cls_uncertaintly:
+            cs_scores += logits[~cls_mask].mean(dim=-1)
+        cs_loss = cs_scores.mean() if reduction == 'mean' else cs_scores.sum()
+        if not soft:
+            return cs_loss
+        else:
+            return cs_scores
+
     def focal_loss(
         self, 
         logits: torch.Tensor, 
         targets: torch.Tensor, 
         alpha: torch.Tensor | None = None, 
         gamma: float = 2.0, 
-        reduction: str ='sum'
+        reduction: str = 'sum'
     ) -> torch.Tensor:
         """
         logits: Tensor of shape (batch_size, num_classes)
@@ -543,6 +570,11 @@ class JEDVAE(VAE):
                 use_ext_emb,
                 alignment_loss_weight
             )
+            # Add class cosine difference loss
+            if self.use_class_similarity_loss:
+                cls_sim_loss = self._class_similarity_loss(logits=logits, targets=true_labels)
+                # Overwrite classification loss
+                ce_loss = cls_sim_loss
             # Add z classification loss to overall loss
             lo_kwargs['loss'] += ce_loss * classification_ratio
             

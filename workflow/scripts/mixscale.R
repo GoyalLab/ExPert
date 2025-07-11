@@ -9,8 +9,6 @@ parser$add_argument("-d", "--min_deg", required = F, default = 5,
                     help = "Minimum number of differentially expressed genes vs. control per perturbation, default is 5 (int)")
 parser$add_argument("-t", "--threshold", required = F, default = 2,
                     help = "Number of standart deviations from control group to filter cells for, default is 2 (float)")
-parser$add_argument("-m", "--min_cells_per_perturbation", required = F, default = 50,
-                    help = "Minimum number of cells / perturbation to pass filtering, default is 50 (int)")
 parser$add_argument("-p", "--pcol", required = F, default = "perturbation",
                     help = "Column that labels the perturbation in meta data, default is 'perturbation' (string)")
 parser$add_argument("-c", "--ctrl", required = F, default = "control",
@@ -31,7 +29,6 @@ adata_p <- args$input
 out_p <- args$output
 min_deg <- args$min_deg
 ctrl_dev <- args$threshold
-min_cells_per_perturbation <- args$min_cells_per_perturbation
 perturbation_col <- args$pcol
 ctrl_key <- args$ctrl
 save_seurat <- args$save_seurat
@@ -58,12 +55,8 @@ message("Saving meta-data.")
 write.csv(seurat_obj@meta.data, file = paste0(file_path_sans_ext(out_p), '_obs.csv'), quote = F)
 # 4. Subset by mixscale score threshold and include control cells in filtering
 message("Filtering dataset based on absolute mixscore > ", ctrl_dev)
-# 4.2 Filtering for perturbations with n cells > min_cells_per_perturbation
-valid_p_mask <- seurat_obj@meta.data %>% group_by(!!sym(perturbation_col)) %>% summarize(valid=n()>=min_cells_per_perturbation)
-valid_ps <- valid_p_mask[valid_p_mask$valid,] %>% pull(!!sym(perturbation_col))
-valid_mask <- seurat_obj@meta.data[[perturbation_col]] %in% valid_ps
-# 4.3 Filter with combined mask
-mask = (abs(seurat_obj$mixscale_score) > ctrl_dev) | (seurat_obj$is_ctrl) | (valid_mask)
+# 4.1 Filter with combined mask
+mask = (abs(seurat_obj$mixscale_score) > ctrl_dev) | (seurat_obj$is_ctrl)
 seurat_obj$mixscale_mask <- mask
 seurat_obj <- subset(seurat_obj, subset = mixscale_mask)
 

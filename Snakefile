@@ -25,10 +25,12 @@ check_config(config)
 # Generate hash code for each run config and use as output directory
 CONFIG_HASH = get_param_hash(config, DATASET_NAMES)
 OUTPUT_DIR = os.path.join(str(config['output_dir']), CONFIG_HASH)
+PLT_DIR = os.path.join(OUTPUT_DIR, config['plot_dir']) if config['plot_dir'] != '' else None
 # save used params in output directory
 save_config(config, os.path.join(OUTPUT_DIR, 'config.yaml'))
 
 # Output files
+PERTURBATION_POOL_FILE = os.path.join(OUTPUT_DIR, 'perturbation_pool.csv')
 MERGED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset.h5ad')
 HARMONIZED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset_harmonized.h5ad')
 # download_datasets
@@ -64,7 +66,7 @@ rule all:
         ENPOINT
 
 
-# 1. Download each dataset
+# 0. Download each dataset
 rule download_dataset:
     output:
         raw = os.path.join(DWNL_DIR, "{dataset}.h5ad")
@@ -81,11 +83,30 @@ rule download_dataset:
     script:
         "workflow/scripts/download_dataset.py"
 
+# 1. Create meta data overview and build perturbation pool for filtering
+rule meta_info:
+    input:
+        input_files = expand(os.path.join(DWNL_DIR, "{dataset}.h5ad"), dataset=DATASET_NAMES)
+    output:
+        perturbation_pool_file = PERTURBATION_POOL_FILE
+    log:
+        os.path.join(LOG, 'meta_info.log')
+    params:
+        plt_dir = PLT_DIR
+    resources:
+        time = config['dwl_t'],
+        mem = config['dwl_m'],
+        partition = config['partition'],
+    script:
+        "workflow/scripts/info.py"
 
 # 2. Preprocess each dataset
 rule process_dataset:
     input:
-        dataset_file = os.path.join(DWNL_DIR, "{dataset}.h5ad")
+        **{
+            'dataset_file': os.path.join(DWNL_DIR, "{dataset}.h5ad"),
+            'perturbation_pool_file': PERTURBATION_POOL_FILE if config['use_perturbation_pool'] else None
+        }
     output:
         processed = os.path.join(PROCESS_DIR, "{dataset}.h5ad")
     log:
@@ -143,7 +164,6 @@ if config['mixscale_filter']:
             perturbation_col = config['perturbation_col'],
             ctrl_key = config['ctrl_key'],
             min_deg = config['min_deg'],
-            min_cells_per_perturbation = config['min_cells_per_perturbation']
         resources:
             time = config['fc_t'],
             mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MAX_MEM],
@@ -155,7 +175,6 @@ if config['mixscale_filter']:
             -o {output.filtered_file} \\
             -d {params.min_deg} \\
             -t {params.ctrl_dev} \\
-            -m {params.min_cells_per_perturbation} \\
             -p {params.perturbation_col} \\
             -c {params.ctrl_key}
             """
@@ -209,7 +228,8 @@ rule prepare_dataset:
     log:
         os.path.join(LOG, 'prepare', "{dataset}.log")
     params:
-        zero_pad = config['zero_padding']
+        zero_pad = config['zero_padding'],
+        kwargs = config,
     resources:
         time = config['prep_t'],
         mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],

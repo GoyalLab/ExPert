@@ -901,17 +901,19 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def _log_full_val_metrics(self, mode_data: dict[str, np.ndarray]) -> None:
         true_labels = torch.tensor(mode_data.get('labels'))
         predicted_labels = torch.tensor(mode_data.get('predicted_labels'))
+        # Assign unknown to classes that are outside of the training classes
+        predicted_labels = predicted_labels.masked_fill((predicted_labels >= self.n_classes), self.n_classes)
 
         accuracy = tmf.classification.multiclass_accuracy(
             predicted_labels,
             true_labels,
-            self.n_classes,
+            self.n_classes+1,
             average=self.average
         )
         f1 = tmf.classification.multiclass_f1_score(
             predicted_labels,
             true_labels,
-            self.n_classes,
+            self.n_classes+1,
             average=self.average,
         )
         self.log(
@@ -926,7 +928,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             on_epoch=True,
             prog_bar=False,
         )
-        
 
     def _get_mode_data(self, mode: str = 'val') -> dict[str, np.ndarray]:
         if mode == 'train':
@@ -972,8 +973,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 input_kwargs = {}
                 input_kwargs.update(self.loss_kwargs)
                 # Add external embedding to batch
-                if input_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in input_kwargs:
-                    batch[REGISTRY_KEYS.CLS_EMB_KEY] = input_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
+                if self.cls_emb is not None:
+                    # Add embedding for classes that are not in the training data
+                    batch[REGISTRY_KEYS.CLS_EMB_KEY] = self._get_batch_class_embedding(mode='fixed')
                 # Perform actual forward pass
                 inference_outputs, _, loss_output = self.forward(move_to_device(batch), loss_kwargs=input_kwargs)
                 # Save inference and generative output
@@ -1025,7 +1027,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             y=embeddings_2d[:, 1],
             hue=labels,
             alpha=0.7,
-            ax=axes[0]
+            ax=axes[0],
         )
         axes[0].set_title(f"Classes @ Epoch: {self.current_epoch}")
         axes[0].set_xlabel("UMAP-1")
@@ -1041,7 +1043,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             y=embeddings_2d[:, 1],
             hue=covs,
             alpha=0.7,
-            ax=axes[1]
+            ax=axes[1],
         )
         axes[1].set_title(f"Batch Keys @ Epoch: {self.current_epoch}")
         axes[1].set_xlabel("UMAP-1")

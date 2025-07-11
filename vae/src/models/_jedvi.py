@@ -184,7 +184,6 @@ class JEDVI(
     def from_scvi_model(
         cls,
         scvi_model: SCVI,
-        unlabeled_category: str,
         labels_key: str | None = None,
         adata: AnnData | None = None,
         **model_kwargs,
@@ -257,15 +256,14 @@ class JEDVI(
         # Setup adata
         cls.setup_anndata(
             adata,
-            unlabeled_category=unlabeled_category,
             **scvi_setup_args,
         )
-        gedvi_model = cls(adata, **non_kwargs, **kwargs, **model_kwargs)
+        model = cls(adata, **non_kwargs, **kwargs, **model_kwargs)
         scvi_state_dict = scvi_model.module.state_dict()
-        gedvi_model.module.load_state_dict(scvi_state_dict, strict=False)
-        gedvi_model.was_pretrained = True
+        model.module.load_state_dict(scvi_state_dict, strict=False)
+        model.was_pretrained = True
 
-        return gedvi_model
+        return model
     
     @classmethod
     def from_base_model(
@@ -466,7 +464,6 @@ class JEDVI(
             labels. Otherwise, uses a sample from the posterior distribution - this
             means that the predictions will be stochastic.
         """
-        is_new = adata is not None
         # validate adata or get it from model
         adata = self._validate_anndata(adata)
 
@@ -480,10 +477,19 @@ class JEDVI(
         )
 
         # Get gene embedding from test adata
-        cls_embedding, idx_to_label = None, None
-        if REGISTRY_KEYS.CLS_EMB_KEY in adata.uns and is_new:
-            cls_embedding = torch.Tensor(adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].values)
-            idx_to_label = adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].index.values
+        cls_emb, idx_to_label = None, None
+        # Predict on entire class embedding used during training of model
+        if REGISTRY_KEYS.CLS_EMB_KEY in self.adata_manager.data_registry:
+            cls_emb_registry = self.adata_manager.data_registry[REGISTRY_KEYS.CLS_EMB_KEY]
+            # Add external embedding to plan parameters
+            cls_emb = get_anndata_attribute(
+                self.adata,
+                cls_emb_registry.attr_name,
+                cls_emb_registry.attr_key,
+            )
+            cls_emb = torch.tensor(cls_emb.todense(), dtype=torch.float32)
+            # Get full list of perturbations for embedding
+            idx_to_label = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels']
 
         y_pred = []
         y_cz = []
@@ -502,11 +508,8 @@ class JEDVI(
                 batch_index=batch,
                 cat_covs=cat_covs,
                 cont_covs=cont_covs,
-                class_embeds=cls_embedding
+                class_embeds=cls_emb
             )
-            # Predict based on X
-            if self.module.classifier.logits:
-                pred = torch.nn.functional.softmax(pred, dim=-1)
             if not soft:
                 pred = pred.argmax(dim=1)
             y_pred.append(pred.detach().cpu())
@@ -517,7 +520,7 @@ class JEDVI(
         if not soft:
             predictions = []
             for p in y_pred:
-                if cls_embedding is None:
+                if cls_emb is None:
                     label = self._code_to_label[p]
                 else:
                     label = idx_to_label[p]
@@ -528,7 +531,7 @@ class JEDVI(
             n_labels = len(pred[0])
             pred = pd.DataFrame(
                 y_pred,
-                columns=self._label_mapping[:n_labels] if cls_embedding is None else idx_to_label,
+                columns=self._label_mapping[:n_labels] if cls_emb is None else idx_to_label,
                 index=adata.obs_names[indices],
             )
         if return_latent:

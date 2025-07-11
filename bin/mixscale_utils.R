@@ -145,6 +145,12 @@ mixscale_pipeline <- function(
     verbose = F, cache = F,
     clear_mem = F
 ) {
+  # Check number of perturbations
+  if (length(unique(seurat_obj@meta.data[[condition_col]])) < 2) {
+    message("No perturbations found in this dataset. Returning object unchanged.")
+    seurat_obj$mixscale_score = 0
+    return(seurat_obj)
+  }
   if ((sum(dim(seurat_obj@assays[[assay]]@scale.data))==0) || (!cache)) {
     # Pre-process data
     message("Pre-processing")
