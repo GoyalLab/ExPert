@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+import numpy as np
 import collections
 from collections.abc import Callable, Iterable
 from typing import Literal, Iterable, Optional
@@ -13,6 +14,84 @@ def _identity(x):
     return x
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Iterable
+
+
+
+class Block(nn.Module):
+    """Simple layer block"""
+
+    def __init__(
+            self, 
+            n_input: int, 
+            n_output: int,
+            n_head: int,
+            use_batch_norm: bool = False,
+            use_layer_norm: bool = True,
+            use_activation: bool = True,
+            use_attention: bool = True,
+            dropout_rate: float = 0.1,
+            activation_fn: nn.Module = nn.ReLU,
+            bias: bool = True,
+        ):
+        super().__init__()
+        # Save hyperparameters
+        self.use_batch_norm = use_batch_norm
+        self.use_layer_norm = use_layer_norm
+        self.use_activation = use_activation
+        self.use_attention = use_attention
+        self.dropout_rate = dropout_rate
+        # Init modules
+        head_size = n_input // n_head
+        self.root = nn.Linear(n_input, n_output, bias=bias)
+        if self.use_attention:
+            self.attn = MultiHeadAttention(num_heads=n_head, n_input=n_input, head_size=head_size, dropout_rate=dropout_rate)
+        else:
+            self.attn = _identity
+        self.feedfw = nn.Linear(n_input, n_output, bias=bias)
+        if self.use_batch_norm:
+            self.batch_norm = nn.BatchNorm1d(n_output)
+        else:
+            self.batch_norm = _identity
+        if self.use_layer_norm:
+            self.layer_norm_1 = nn.LayerNorm(n_input)
+            self.layer_norm_2 = nn.LayerNorm(n_input)
+        else:
+            self.layer_norm_1, self.layer_norm_2 = _identity, _identity
+        self.activation = activation_fn()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.proj = nn.Linear(n_output, n_output)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply multi-head self attention and add new branch of x
+        if self.use_attention:
+            x = x + self.attn(self.layer_norm_1(x))
+        # Apply layer norm
+        if self.use_layer_norm:
+            x = self.layer_norm_2(x)
+        # Branch off into residual pathway
+        r = self.feedfw(x)
+        # Project main branch
+        x = self.root(x)
+        # Apply batch norm
+        if self.use_batch_norm:
+            r = self.batch_norm(r)
+        # Apply activation
+        if self.use_activation:
+            r = self.activation(r)
+        # Use final projection layer
+        r = self.proj(r)
+        # Apply dropout
+        if self.dropout_rate > 0:
+            r = self.dropout(r)
+        # Add second branch to x
+        x = x + r
+        return x
+
+
 class FunnelFCLayers(nn.Module):
     def __init__(
         self,
@@ -20,70 +99,90 @@ class FunnelFCLayers(nn.Module):
         n_out: int,
         n_cat_list: Optional[Iterable[int]] = None,
         n_layers: int = 2,
-        n_hidden: int = 256,
+        min_attn_dim: int = 512,
         dropout_rate: float = 0.1,
         use_batch_norm: bool = True,
         use_layer_norm: bool = False,
         use_activation: bool = True,
+        use_attention: bool = True,
+        n_head: int = 4,
         bias: bool = True,
+        inverted: bool = False,
         inject_covariates: bool = True,
         activation_fn: nn.Module = nn.ReLU,
+        **kwargs,
     ):
         super().__init__()
+
         self.inject_covariates = inject_covariates
         self.use_activation = use_activation
-        self.use_batch_norm = use_batch_norm
         self.use_layer_norm = use_layer_norm
-        self.dropout_rate = dropout_rate
-        self.activation_fn = activation_fn
+        self.use_attention = use_attention
+        self.min_attn_dim = min_attn_dim
+        self.kwargs = kwargs
 
-        # Determine covariate size
+        # Init modules
+        self.layer_norm = nn.LayerNorm(n_out)
+
         self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in (n_cat_list or [])]
         self.cat_dim = sum(self.n_cat_list)
 
-        # Create funnel architecture dims
-        hidden_dims = [int(n_hidden * (0.5 ** i)) for i in range(n_layers)]
-        hidden_dims = [d for d in hidden_dims if d > n_out] + [n_out]
-
+        # Geometric decay or growth
+        hidden_dims = np.geomspace(n_in, n_out, num=n_layers + 1).astype(int)
+        # Ensure its divisible by n_heads if attention is used
+        if use_attention:
+            if inverted:
+                hidden_dims -= np.concatenate(((hidden_dims % n_head)[:-1], [0]))
+            else:
+                hidden_dims -= np.concatenate(([0], (hidden_dims % n_head)[1:]))
+        # Init layers
         self.layers = nn.ModuleList()
-        input_dim = n_in + self.cat_dim  # for first layer
 
-        for i, h_dim in enumerate(hidden_dims):
-            layer = []
-            layer.append(nn.Linear(input_dim, h_dim, bias=bias))
-
-            if self.use_batch_norm:
-                layer.append(nn.BatchNorm1d(h_dim))
-            if self.use_layer_norm:
-                layer.append(nn.LayerNorm(h_dim))
-            if self.use_activation:
-                layer.append(activation_fn())
-            if self.dropout_rate > 0:
-                layer.append(nn.Dropout(self.dropout_rate))
-
-            self.layers.append(nn.Sequential(*layer))
-            input_dim = h_dim + self.cat_dim if inject_covariates else h_dim
+        for i in range(n_layers):
+            in_dim = hidden_dims[i] + self.cat_dim * self.inject_into_layer(i)
+            out_dim = hidden_dims[i + 1]
+            # Determine whether to to use attention for block, never use on the first layer
+            is_attention_block = use_attention and in_dim <= min_attn_dim and i > 0
+            # Create block for each layer
+            block = Block(
+                n_input=in_dim, 
+                n_output=out_dim, 
+                n_head=n_head,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                use_activation=use_activation,
+                use_attention=is_attention_block,
+                dropout_rate=dropout_rate,
+                activation_fn=activation_fn,
+                bias=bias
+            )
+            self.layers.append(block)
+    
+    def inject_into_layer(self, layer_num) -> bool:
+        """Helper to determine if covariates should be injected."""
+        return layer_num == 0 or (layer_num > 0 and self.inject_covariates)
 
     def forward(self, x: torch.Tensor, *cat_list: torch.Tensor) -> torch.Tensor:
         # One-hot encode categorical covariates
         one_hot_cat_list = []
-        for n_cat, cat in zip(self.n_cat_list, cat_list):
+        for n_cat, cat in zip(self.n_cat_list, cat_list, strict=False):
             if n_cat > 1:
-                if cat.size(-1) == 1:
-                    cat = cat.squeeze(-1)
+                cat = cat.squeeze(-1) if cat.dim() == 2 and cat.size(-1) == 1 else cat
                 one_hot = F.one_hot(cat, num_classes=n_cat).float()
                 one_hot_cat_list.append(one_hot)
 
         for i, layer in enumerate(self.layers):
-            if i == 0 or self.inject_covariates:
+            if self.inject_into_layer(i):
                 if one_hot_cat_list:
                     cat_input = torch.cat(one_hot_cat_list, dim=-1)
                     cat_input = cat_input.expand(x.shape[0], cat_input.shape[-1])
                     x = torch.cat([x, cat_input], dim=-1)
             x = layer(x)
-
+        # Apply layer norm
+        if self.use_layer_norm:
+            x = self.layer_norm(x)
         return x
-
+    
 
 class FCLayers(nn.Module):
     """A helper class to build fully-connected layers for a neural network.
@@ -270,11 +369,14 @@ class FeatureAttention(nn.Module):
     Per-sample self-attention mechanism over input features.
     For each sample in the batch, computes attention between its features.
     """
-    def __init__(self, n_input: int):
+    def __init__(self, n_input: int, head_size: int | None = None, dropout_rate: float = 0.1):
         super().__init__()
-        self.query = nn.Linear(n_input, n_input, bias=False)
-        self.key = nn.Linear(n_input, n_input, bias=False)
-        self.value = nn.Linear(n_input, n_input, bias=False)
+        self.head_size = n_input if head_size is None else head_size 
+        self.query = nn.Linear(n_input, self.head_size, bias=False)
+        self.key = nn.Linear(n_input, self.head_size, bias=False)
+        self.value = nn.Linear(n_input, self.head_size, bias=False)
+        self.dropout_rate = dropout_rate
+        self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x: torch.Tensor, feature_mask: torch.Tensor = None):
         """
@@ -292,20 +394,41 @@ class FeatureAttention(nn.Module):
         v = self.value(x)               # (batch, features)
 
         # Compute attention: (batch, features, features)
-        attn_weights = torch.bmm(q.unsqueeze(2), k.unsqueeze(1))  # per sample
+        attn_weights = torch.bmm(q.unsqueeze(2), k.unsqueeze(1)) * self.head_size**-0.5     # per sample, scale by attention head size
 
         if feature_mask is not None:
             # Mask has shape (batch, features) --> (batch, 1, features)
             attn_weights = attn_weights.masked_fill(
-                feature_mask.unsqueeze(1) == 0, -1e9
+                feature_mask.unsqueeze(1) == 0, -torch.inf
             )
-        # Normalize attention weights
+        # Normalize attention weights to sum to 1
         attn_weights = torch.softmax(attn_weights, dim=-1)  # (batch, features, features)
-
+        # Apply dropout
+        if self.dropout_rate > 0:
+            attn_weights = self.dropout(attn_weights)
         # Apply attention: (batch, features, features) x (batch, features, 1) --> (batch, features, 1)
         attended = torch.bmm(attn_weights, v.unsqueeze(-1)).squeeze(-1)  # (batch, features)
 
         return attended
+    
+
+class MultiHeadAttention(nn.Module):
+    """Multiple FeatureAttention heads in parallel."""
+
+    def __init__(self, num_heads: int, n_input: int, head_size: int | None = None, dropout_rate: float = 0.1):
+        super().__init__()
+        self.heads = nn.ModuleList([FeatureAttention(n_input=n_input, head_size=head_size) for _ in range(num_heads)])
+        attn_dim = int(head_size * num_heads)
+        self.proj = nn.Linear(attn_dim, n_input)
+        self.dropout_rate = dropout_rate
+        self.dropout = nn.Dropout(dropout_rate)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([h(x) for h in self.heads], dim=-1)
+        x = self.proj(x)
+        if self.dropout_rate > 0:
+            x = self.dropout(x)
+        return x
 
 
 # Encoder
@@ -350,13 +473,11 @@ class Encoder(nn.Module):
         n_output: int,
         n_cat_list: Iterable[int] = None,
         n_layers: int = 1,
-        n_hidden: int = 128,
         dropout_rate: float = 0.1,
         distribution: str = "normal",
         var_eps: float = 1e-4,
         var_activation: Callable | None = None,
         return_dist: bool = False,
-        use_attention: Literal['input', 'hidden', 'output'] | None = 'hidden',
         use_feature_mask: bool = False,
         drop_prob: float = 0.25,
         **kwargs,
@@ -366,30 +487,17 @@ class Encoder(nn.Module):
         self.distribution = distribution
         self.var_eps = var_eps
         self.n_input = n_input
-        # Setup attention if not None
-        self.use_attention = use_attention
-        if self.use_attention is not None:
-            if self.use_attention == 'input':
-                if n_input > 1000:
-                    logging.warning(f'Got large input for attention layer ({n_input}), could lead to memory explosions.')
-                attn_dim = n_input
-            elif self.use_attention == 'hidden':
-                attn_dim = n_hidden
-            else:
-                attn_dim = n_output
-            self.attn = FeatureAttention(n_input=attn_dim)
         # Setup encoder layers
         self.encoder = FunnelFCLayers(
             n_in=n_input,
-            n_out=n_hidden,
+            n_out=n_output,
             n_cat_list=n_cat_list,
             n_layers=n_layers,
-            n_hidden=n_hidden,
             dropout_rate=dropout_rate,
             **kwargs,
         )
-        self.mean_encoder = nn.Linear(n_hidden, n_output)
-        self.var_encoder = nn.Linear(n_hidden, n_output)
+        self.mean_encoder = nn.Linear(n_output, n_output)
+        self.var_encoder = nn.Linear(n_output, n_output)
         self.return_dist = return_dist
         self.use_feature_mask = use_feature_mask
         self.drop_prob = drop_prob
@@ -429,20 +537,11 @@ class Encoder(nn.Module):
             feature_mask = feature_mask.expand(x.shape[0], -1)  # broadcast to full batch
             feature_mask = feature_mask.to(x.device)
             x = x * feature_mask
-        # Use attention on features
-        if self.use_attention is not None and self.use_attention == 'input':
-            x = self.attn(x, feature_mask)
         # Parameters for latent distribution
         q = self.encoder(x, *cat_list)
-        # Apply attention over encoded features
-        if self.use_attention is not None and self.use_attention == 'hidden':
-            q = self.attn(q, feature_mask)
         # Project to mean and variance
         q_m = self.mean_encoder(q)
         q_v = self.var_activation(self.var_encoder(q)) + self.var_eps
-        # Apply attention over latent mean and var
-        if self.use_attention is not None and self.use_attention == 'output':
-            q_m = self.attn(q_m, feature_mask)
         # Create Normal distribution and sample a latent
         dist = Normal(q_m, q_v.sqrt())
         latent = self.z_transformation(dist.rsample())
@@ -491,7 +590,6 @@ class DecoderSCVI(nn.Module):
         n_output: int,
         n_cat_list: Iterable[int] = None,
         n_layers: int = 1,
-        n_hidden: int = 128,
         inject_covariates: bool = True,
         use_batch_norm: bool = False,
         use_layer_norm: bool = False,
@@ -501,14 +599,14 @@ class DecoderSCVI(nn.Module):
         super().__init__()
         self.px_decoder = FunnelFCLayers(
             n_in=n_input,
-            n_out=n_hidden,
+            n_out=n_output,
             n_cat_list=n_cat_list,
             n_layers=n_layers,
-            n_hidden=n_hidden,
             dropout_rate=0,
             inject_covariates=inject_covariates,
             use_batch_norm=use_batch_norm,
             use_layer_norm=use_layer_norm,
+            inverted=True,
             **kwargs,
         )
 
@@ -518,15 +616,15 @@ class DecoderSCVI(nn.Module):
         elif scale_activation == "softplus":
             px_scale_activation = nn.Softplus()
         self.px_scale_decoder = nn.Sequential(
-            nn.Linear(n_hidden, n_output),
+            nn.Linear(n_output, n_output),
             px_scale_activation,
         )
 
         # dispersion: here we only deal with gene-cell dispersion case
-        self.px_r_decoder = nn.Linear(n_hidden, n_output)
+        self.px_r_decoder = nn.Linear(n_output, n_output)
 
         # dropout
-        self.px_dropout_decoder = nn.Linear(n_hidden, n_output)
+        self.px_dropout_decoder = nn.Linear(n_output, n_output)
 
     def forward(
         self,
@@ -607,11 +705,10 @@ class EmbeddingClassifier(nn.Module):
 
         # Initialize layers
         if n_hidden > 0 and n_layers > 0:
-            self.encoder = FCLayers(
+            self.encoder = FunnelFCLayers(
                 n_in=n_input,
                 n_out=class_embed_dim,
                 n_layers=n_layers,
-                n_hidden=n_hidden,
                 dropout_rate=dropout_rate,
                 use_batch_norm=use_batch_norm,
                 use_layer_norm=use_layer_norm,
@@ -655,7 +752,7 @@ class EmbeddingClassifier(nn.Module):
             class_embeds = self.learned_class_embeds
         else:
             class_embeds = class_embeds.to(z.device)
-
+        # Calculate classification logits
         if self.use_cosine_similarity:
             z_norm = F.normalize(z, dim=-1)            # (batch, d)
             c_norm = F.normalize(class_embeds, dim=-1) # (n_labels, d)

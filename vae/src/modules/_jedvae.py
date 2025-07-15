@@ -69,7 +69,6 @@ class JEDVAE(VAE):
         use_layer_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'none',
         var_activation: Callable[[torch.Tensor], torch.Tensor] | None = None,
         l1_lambda: float | None = 1e-5,
-        use_attention_encoder: Literal['input', 'hidden', 'output'] | None = 'hidden',
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
         use_class_similarity_loss: bool = True,
@@ -101,8 +100,6 @@ class JEDVAE(VAE):
             use_size_factor_key=False,
             use_observed_lib_size=True,
             var_activation=var_activation,
-            extra_encoder_kwargs=extra_encoder_kwargs,
-            extra_decoder_kwargs=extra_decoder_kwargs,
         )
 
         # Setup scvi part of model
@@ -149,7 +146,6 @@ class JEDVAE(VAE):
             use_batch_norm=use_batch_norm_encoder, 
             use_layer_norm=use_layer_norm_encoder,
             var_activation=var_activation,
-            use_attention=use_attention_encoder,
             use_feature_mask=use_feature_mask,
             drop_prob=drop_prob,
             **_extra_encoder_kwargs,
@@ -165,6 +161,7 @@ class JEDVAE(VAE):
             use_batch_norm=use_batch_norm_decoder, 
             use_layer_norm=use_layer_norm_decoder,
             scale_activation="softmax",
+            inject_covariates=deeply_inject_covariates,
             **_extra_decoder_kwargs,
         )
 
@@ -229,7 +226,7 @@ class JEDVAE(VAE):
         soft: bool = False,
     ) -> torch.Tensor:
         # Get similarity scores for each target class
-        cls_mask = targets == torch.arange(logits.shape[1]).to(logits.device)
+        cls_mask = targets == torch.arange(logits.shape[1], device=logits.device)
         cls_mask = torch.zeros_like(logits).masked_fill(cls_mask, 1.0).bool()
         cls_sims = logits[cls_mask]
         # Calculate cosine difference of cells and treat that as loss to minimize
@@ -439,7 +436,7 @@ class JEDVAE(VAE):
             temperature: float = 0.1,
             reduction: str = 'mean',
             scale_by_temperature: bool = False,
-            eps: float = 1e-12
+            eps: float = 1e-12,
         ) -> torch.Tensor:
         """
         Calculate contrastive loss as defined by Khosla et al., 2020.
@@ -484,8 +481,6 @@ class JEDVAE(VAE):
         pos_mask = pos_mask * (1 - self_mask)  # now only i ≠ j positives are kept
         # Step 5: Construct mask for denominator A(i): all indices ≠ i (exclude self)
         logits_mask = 1 - self_mask  # mask with 0s on diagonal, 1s elsewhere
-        # Step 5.1: Take only the lower triangular part of the logits_mask
-        logits_mask = torch.tril(logits_mask, diagonal=-1)
         # Step 6: Compute softmax denominator: ∑_{a ∈ A(i)} exp(z_i • z_a / τ)
         denom = (exp_logits * logits_mask).sum(dim=1, keepdim=True)  # shape (n_obs, 1)
         # Step 7: Compute log-softmax for each pair: log( exp(z_i • z_p / τ) / denom )

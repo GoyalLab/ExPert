@@ -1013,9 +1013,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         """Plots a UMAP projection of Z latent space."""
         import matplotlib.pyplot as plt
         import seaborn as sns
-        # Use sc.tl.umap default arguments, apart from n_neighbors
+        # Use sc.tl.umap default arguments
         umap = UMAP(
-            n_neighbors=5, min_dist=0.5, metric="euclidean",
+            n_neighbors=15, min_dist=0.5, metric="euclidean",
             n_components=2, spread=1.0, negative_sample_rate=5
         )
         embeddings_2d = umap.fit_transform(embeddings)

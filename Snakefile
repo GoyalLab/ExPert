@@ -1,5 +1,5 @@
 import os
-from src.workflow_utils import load_configs, get_param_hash, save_config, read_data_sheet, check_config
+from src.workflow_utils import load_configs, get_param_hash, save_config, read_data_sheet, check_config, get_job_resources
 from src.statics import DATA_SHEET_KEYS
 import numpy as np
 
@@ -20,8 +20,7 @@ LOG = config.get('log_dir')
 DATASET_SHEET = read_data_sheet(config)
 DATASET_NAMES = DATASET_SHEET.index.tolist()
 
-## CHECK PARAMS & BUILD I/O PATHS
-check_config(config)
+## BUILD I/O PATHS
 # Generate hash code for each run config and use as output directory
 CONFIG_HASH = get_param_hash(config, DATASET_NAMES)
 OUTPUT_DIR = os.path.join(str(config['output_dir']), CONFIG_HASH)
@@ -77,9 +76,7 @@ rule download_dataset:
         name = lambda wildcards: wildcards.dataset,
         cache = config['cache']
     resources:
-        time = config['dwl_t'],
-        mem = config['dwl_m'],
-        partition = config['partition']
+        **get_job_resources(config['resources'], job_name='download_dataset')
     script:
         "workflow/scripts/download_dataset.py"
 
@@ -94,9 +91,7 @@ rule meta_info:
     params:
         plt_dir = PLT_DIR
     resources:
-        time = config['dwl_t'],
-        mem = config['dwl_m'],
-        partition = config['partition'],
+        **get_job_resources(config['resources'], job_name='meta_info')
     script:
         "workflow/scripts/info.py"
 
@@ -126,7 +121,7 @@ rule process_dataset:
         ctrl_key = config['ctrl_key'],
         seed = config['seed']
     resources:
-        time = config['pp_t'],
+        time = config['resources']['jobs']['process_dataset']['time'],
         mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
         partition = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.PARTITION],
     script:
@@ -142,9 +137,7 @@ if config['mixscale_filter']:
         conda:
             "workflow/envs/mixscale.yaml"
         resources:
-            time = '04:00:00',
-            mem = '20GB',
-            partition = config['partition']
+            **get_job_resources(config['resources'], job_name='setup_mixscale')
         shell:
             """
             echo 'Settin up mixscale env'
@@ -165,8 +158,8 @@ if config['mixscale_filter']:
             ctrl_key = config['ctrl_key'],
             min_deg = config['min_deg'],
         resources:
-            time = config['fc_t'],
-            mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MAX_MEM],
+            time = config['resources']['jobs']['filter_cells_by_efficiency']['time'],
+            mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
             partition = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.PARTITION],
         shell:
             """
@@ -192,9 +185,7 @@ rule determine_hvg:
     output:
         os.path.join(HVG_DIR, "{dataset}_hvgs.csv")
     resources:
-        time = config['hvg_t'],
-        mem = config['hvg_m'],
-        partition = config['partition']
+        **get_job_resources(config['resources'], job_name='determine_hvg')
     script:
         "workflow/scripts/determine_hvgs.py"
 
@@ -210,9 +201,7 @@ rule build_gene_pool:
     params:
         var_merge = config['var_merge']
     resources:
-        time = config['pool_t'],
-        mem = config['pool_m'],
-        partition = config['partition']
+        **get_job_resources(config['resources'], job_name='build_gene_pool')
     script:
         "workflow/scripts/pool.py"
 
@@ -231,14 +220,15 @@ rule prepare_dataset:
         zero_pad = config['zero_padding'],
         kwargs = config,
     resources:
-        time = config['prep_t'],
+        time = config['resources']['jobs']['prepare_dataset']['time'],
         mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
-        partition = config['partition']
+        partition = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.PARTITION],
     script:
         "workflow/scripts/prepare_dataset.py"
 
 
 # 6. Merge datasets into meta-set
+
 rule merge_datasets:
     input:
         obs_files = expand(os.path.join(OBS_DIR, "{dataset}.csv"), dataset=DATASET_NAMES),
@@ -252,19 +242,16 @@ rule merge_datasets:
         meta_sheet = DATASET_SHEET,
         merge_method = config['merge_method']
     resources:
-        time = config['merge_t'],
-        mem = config['merge_m'],
-        partition = config.get('merge_partition', config['partition'])
+        **get_job_resources(config['resources'], job_name='merge_datasets')
     script:
         "workflow/scripts/merge.py"
 
 
 # 7. Harmonize merged set (optional)
-
 # define output files of rule based on correction method
 HARMONIZED_OUTPUT_FILES = {'harmonized': HARMONIZED_OUTPUT_FILE}
-
-# TODO: switch partition to gpu if scvi is enabled
+# Check if we want a gpu
+partition_prio = 'gpu' if config['correction_method'] == 'scanvi' else None
 rule harmonize:
     input:
         merged = MERGED_OUTPUT_FILE
@@ -276,13 +263,11 @@ rule harmonize:
         method = config['correction_method'],
         model_dir = MODEL_DIR
     resources:
-        time = config['harm_t'],
-        mem = config['harm_m'],
-        partition = config['partition']
+        **get_job_resources(config['resources'], job_name='harmonize', partition_prio=partition_prio)
     script:
         "workflow/scripts/harmonize.py"
 
-# 8. Add gene embedding to merged dataset if that was given in params
+# 8. Add gene embedding to merged dataset if that was given in params (optional)
 rule add_gene_embedding:
     input:
         input_file = OUTPUT_FILE
@@ -293,8 +278,6 @@ rule add_gene_embedding:
     params:
         embedding_file = config['gene_embedding'],
     resources:
-        time = config['merge_t'],
-        mem = config['merge_m'],
-        partition = config['partition']
+        **get_job_resources(config['resources'], job_name='add_gene_embedding')
     script:
         "workflow/scripts/add_gene_embedding.py"
