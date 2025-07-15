@@ -7,7 +7,7 @@ class _DATA_SHEET_NT(NamedTuple):
     P_INDEX: str = 'publication index'
     D_INDEX: str = 'dataset index'
     CANCER: str = 'cancer'
-    PERTURBATION_TYPE: str = 'perturbation'
+    PERTURBATION_TYPE: str = 'perturbation_type'
     CELL_TYPE: str = 'cell type'
     BYTES: str = 'bytes'
     MEM: str = 'memory'

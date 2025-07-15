@@ -43,31 +43,61 @@ seed: 42                                    # Set seed for reproducibility
 
 ## Slurm config:
 # Set RAM limits for all tasks that require loading datasets into memory
-min_mem: 100                  # Set minimum RAM (GB)
-max_mem: 220                  # Set maximum RAM (GB)
-partition: 'genomics'
-high_mem_partition: 'genomics-himem'
-gpu_partition: 'gengpu'
-## Pre-set limits for each job, Preprocess most dataset dependent
-# 1. Download
-dwl_t: '48:00:00'
-dwl_m: '20GB'
-# 2. Preprocess
-pp_t: '48:00:00'
-# 2.1 Filter cells
-fc_t: '48:00:00'
-fc_m: '200GB'
-# 3. HVGs
-hvg_t: '4:00:00'
-hvg_m: '20GB'
-# 4. Gene pool
-pool_t: '4:00:00'
-pool_m: '20GB'
-# 5. Prepare for merge
-prep_t: '48:00:00'
-# 6. Merge
-merge_t: '48:00:00'
-merge_m: '200GB'
-# 7. Harmonize (requires gpu when used with scanvi)
-harm_t: '48:00:00'
-harm_m: '200GB'
+resources:
+  time:
+    short: '4:00:00'
+    medium: '24:00:00'
+    long: '48:00:00'
+    default: '48:00:00'
+
+  memory:
+    min_mem: 20                 # Minimum RAM (GB)
+    default: 100
+    max_mem: 220                # Maximum RAM (GB) of default partition, tries to switch to high_mem if more is needed
+
+  partitions:                   # Set your slurm partitions here
+    default: 'normal'                 
+    high_mem: ''
+    gpu: ''
+
+  jobs:
+    download_dataset:
+      time: '48:00:00'
+      mem: '20GB'
+
+    meta_info:
+      time: '48:00:00'
+      mem: '20GB'
+
+    process_dataset:
+      time: '48:00:00'
+
+    setup_mixscale:
+      time: '4:00:00'
+      mem: '20GB'
+
+    filter_cells_by_efficiency:
+      time: '48:00:00'
+
+    determine_hvg:
+      time: '4:00:00'
+      mem: '20GB'
+
+    build_gene_pool:
+      time: '4:00:00'
+      mem: '20GB'
+
+    prepare_dataset:
+      time: '48:00:00'
+
+    merge_datasets:
+      time: '48:00:00'
+      mem: '200GB'
+
+    harmonize:
+      time: '48:00:00'
+      mem: '200GB'
+
+    add_gene_embedding:
+      time: '48:00:00'
+      mem: '200GB'

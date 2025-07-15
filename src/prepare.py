@@ -66,7 +66,8 @@ def prepare_merge(input_pth: str, pool_genes: Iterable[str], out: str, zero_pad:
         adata = _filter(adata, name, pool_genes, zero_pad=zero_pad)
         # Convert adata.X to csr
         if not isinstance(adata.X, sp.csr_matrix):
-            adata.X = sp.csr_matrix(adata.X)
+            logging.info('Converting to CSR matrix.')
+            adata.X = sp.csr_matrix(adata.X.compute())
         # Filter for a minimum number of cells per perturbation
         mcpp = kwargs.get('min_cells_per_perturbation')
         if mcpp > 0:

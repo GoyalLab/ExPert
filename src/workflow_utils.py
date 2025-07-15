@@ -8,6 +8,15 @@ from src.statics import DATA_SHEET_KEYS, STRINGS, BOOLEANS, INTS, FLOATS
 import logging
 
 
+def recursive_update(d1, d2):
+    for k, v in d2.items():
+        if (
+            k in d1 and isinstance(d1[k], dict) and isinstance(v, dict)
+        ):
+            recursive_update(d1[k], v)
+        else:
+            d1[k] = v
+
 def load_configs(wf, default_config="config/defaults.yaml"):
     # Load default config
     config = load_configfile(default_config)
@@ -15,20 +24,19 @@ def load_configs(wf, default_config="config/defaults.yaml"):
     # Update with any additional config files (from --configfile)
     for cf in wf.overwrite_configfiles:
         update_config = load_configfile(cf)
-        config.update(update_config)
+        recursive_update(config, update_config)
 
     # Update with command-line options (from --config)
-    config.update(wf.overwrite_config)
-    # TODO: Check config for invalid arguments
-    # check_inputs(config)
+    recursive_update(config, wf.overwrite_config)
+    # Check config parameters
+    check_config(config)
     return config
 
 def hash(s: str, d: int = 4):
     return hashlib.shake_128(s.encode('utf-8')).hexdigest(d)
 
-
 def get_param_hash(p: dict, dataset_indices: list[str], d: int = 8):
-    blacklist = {'datasets', 'log_dir', 'data_dir', 'cache_dir', 'plot_dir'}
+    blacklist = {'log_dir', 'output_dir', 'cache_dir', 'plot_dir', 'resources'}
     ps = p.copy()
     # sort dict
     ps = dict(sorted(p.items()))
@@ -43,14 +51,57 @@ def save_config(c: dict, o: str):
     with open(o, 'w') as f:
         yaml.dump(c, f, default_flow_style=False)
 
+def get_default_resources(resource_config: dict, default_key: str = 'default') -> dict[str, str]:
+    o = {
+        'time': resource_config['time'][default_key],
+        'mem': resource_config['memory'][default_key],
+    }
+    partition = resource_config['partitions'][default_key]
+    if partition != '':
+        o['partition'] = partition
+    return o
+
+def get_job_resources(resource_config: dict, job_name: str, partition_prio: str | None = None) -> dict[str, str]:
+    # Check if there are resource specification for that job name
+    if job_name not in resource_config['jobs']:
+        logging.warning(f'Could not resource config for job {job_name}, falling back to defaults.')
+        return get_default_resources()
+    # Get resource configs for job from defaults.yaml with updates by user
+    time: str = resource_config['jobs'][job_name]['time']
+    mem: str = resource_config['jobs'][job_name]['mem']
+    partition: str = resource_config['partitions']['default']
+    # Get maximum memory cap of default partition
+    max_default_mem: int = resource_config['memory']['max_mem']
+    # Try to set to high memory partition if given
+    if int(mem.rstrip('GB')) > max_default_mem:
+        hi_mem_partition = resource_config['partitions']['high_mem']
+        if hi_mem_partition != '':
+            partition = hi_mem_partition
+        # Else set memory to default partition limit
+        else:
+            mem = str(max_default_mem)+'GB'
+    # Try to set partition to given prio if found in config, fall back to previous partition if not
+    if partition_prio is not None:
+        partition = resource_config['partitions'].get(partition_prio, partition)
+    o = {'time': time, 'mem': mem}
+    if partition != '':
+        o['partition'] = partition
+    return o
+
+
 def determine_resources(config: dict, data_sheet: pd.DataFrame):
     # Update configs resource requirements based on the size of the input file
-    min_mem = config['min_mem']
-    max_mem = config['max_mem']
-    # Set default slurm partition
-    default_partition = config['partition']
+    resource_config: dict = config['resources']
+    # Determine overall memory range
+    mem_config: dict = resource_config['memory']
+    min_mem = mem_config['min_mem']
+    max_mem = mem_config['max_mem']
+    # Determine partitions
+    partition_config: dict = resource_config['partitions']
+    default_partition: str = partition_config['default']
+    gpu_partition: str = partition_config.get('gpu', None)
     # Check if there is a high memory allocation
-    himem_alloc = config.get('high_mem_partition', default_partition)
+    himem_alloc: str = partition_config.get('high_mem', default_partition)
     # Only overwrite configs if memory is not given
     if DATA_SHEET_KEYS.MEM not in data_sheet.columns:
         # Fill memory column based on bytes given in metadata
@@ -76,7 +127,6 @@ def determine_resources(config: dict, data_sheet: pd.DataFrame):
     if himem_mask.sum() > 0 and himem_alloc == default_partition:
         logging.warning(f'Some datasets allocate more memory than the set max. memory ({max_mem}) and no high-memory partition is given. Defaulting to partition {default_partition} and max. allocation of {highest_mem}GB.')
     data_sheet.loc[himem_mask,DATA_SHEET_KEYS.PARTITION] = himem_alloc
-    
 
 def read_data_sheet(config: dict):
     d = pd.read_csv(str(config['datasheet']))
