@@ -100,7 +100,7 @@ rule process_dataset:
     input:
         **{
             'dataset_file': os.path.join(DWNL_DIR, "{dataset}.h5ad"),
-            'perturbation_pool_file': PERTURBATION_POOL_FILE if config['use_perturbation_pool'] else None
+            'perturbation_pool_file': PERTURBATION_POOL_FILE if config['use_perturbation_pool'] else ''
         }
     output:
         processed = os.path.join(PROCESS_DIR, "{dataset}.h5ad")
@@ -193,9 +193,9 @@ rule determine_hvg:
 # 4. Determine pool of genes to include in meta set
 rule build_gene_pool:
     input:
-       hvg_files = expand(os.path.join(HVG_DIR, "{dataset}_hvgs.csv"), dataset=DATASET_NAMES)
+        hvg_files = expand(os.path.join(HVG_DIR, "{dataset}_hvgs.csv"), dataset=DATASET_NAMES)
     output:
-        pool = HVG_POOL
+        HVG_POOL
     log:
         os.path.join(LOG, 'pool.log')
     params:

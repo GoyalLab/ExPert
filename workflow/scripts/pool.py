@@ -40,7 +40,7 @@ if __name__ == "__main__":
     try:
         build_pool(
             hvg_files=snakemake.input.hvg_files,
-            pool_output=snakemake.output.pool,
+            pool_output=snakemake.output[0],
             method=snakemake.params.var_merge
         )
     except NameError:
