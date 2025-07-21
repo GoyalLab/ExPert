@@ -17,11 +17,12 @@ class EmbeddingProcessor:
             emb_p: str, 
             p_col: str = OBS_KEYS.PERTURBATION_KEY, 
             p_type_col: str = OBS_KEYS.PERTURBATION_TYPE_KEY,
-            ctrl_key: str = OBS_KEYS.CELL_TYPE_KEY, 
+            ctrl_key: str = OBS_KEYS.CTRL_KEY,
             unknown_key: str = 'unknown', 
             scaling_factor: int = 1,
             misc_method: Literal['mean', 'gaussian', 'zeros'] = 'mean',
-            std: float = 1e-3
+            std: float = 1e-3,
+            filter_embedding: bool = True,
         ):
         # Init class settings
         self.emb_p = emb_p
@@ -33,6 +34,7 @@ class EmbeddingProcessor:
         self.emb = None
         self.misc_method = misc_method
         self.std = std
+        self.filter_embedding = filter_embedding
 
     def _read_embedding(self) -> pd.DataFrame:
         if self.emb_p.endswith('.pickle'):
@@ -70,12 +72,22 @@ class EmbeddingProcessor:
         zero_rows = pd.DataFrame(np.concatenate([ctrl_row, unknown_row], axis=0), index=[self.ctrl_key, self.unknown_key])
         return pd.concat([self.emb, zero_rows], axis=0)
 
-    def _add_direction_to_emb(self, pos_key: str = 'pos', neg_key: str = 'neg', sep: str = ';') -> pd.DataFrame:
-        emb_pos = self.emb.copy()
-        emb_neg = emb_pos * -1
-        emb_neg.index = f'{neg_key}{sep}' + emb_neg.index.astype(str)
-        emb_pos.index = f'{pos_key}{sep}' + emb_pos.index.astype(str)
-        return pd.concat([emb_pos, emb_neg])
+    def _add_direction_to_emb(self, pos_key: str | None = 'pos', neg_key: str | None = 'neg', sep: str = ';') -> pd.DataFrame:
+        if pos_key is None and neg_key is None:
+            logging.info('Saving embedding to adata without direction.')
+            return self.emb
+        emb_list = []
+        if pos_key is not None:
+            logging.info(f'Adding {pos_key} direction to embedding.')
+            emb_pos = self.emb.copy()
+            emb_pos.index = f'{pos_key}{sep}' + emb_pos.index.astype(str)
+            emb_list.append(emb_pos)
+        if neg_key is not None:
+            logging.info(f'Adding {neg_key} direction to embedding.')
+            emb_neg = self.emb * -1
+            emb_neg.index = f'{neg_key}{sep}' + emb_neg.index.astype(str)
+            emb_list.append(emb_neg)
+        return pd.concat(emb_list)
 
     def _add_emb_to_adata(self, adata: ad.AnnData, pos_key: str = 'pos', neg_key: str = 'neg', sep: str = ';',
                           direction_col_key: str = 'perturbation_direction', cls_emb_uns_key: str = 'cls_embedding') -> None:
@@ -83,17 +95,21 @@ class EmbeddingProcessor:
             lambda x: pos_key if x else neg_key)
         cls_labels = (adata.obs[direction_col_key].astype(str) + ';' + adata.obs[self.p_col].astype(str)).unique()
         self.emb.columns = 'dim_' + self.emb.columns.astype(str)
-        adata.uns[cls_emb_uns_key] = self.emb.loc[list(set(cls_labels).intersection(set(self.emb.index))), :]
+        if self.filter_embedding:
+            adata.uns[cls_emb_uns_key] = self.emb.loc[list(set(cls_labels).intersection(set(self.emb.index))), :]
+        else:
+            adata.uns[cls_emb_uns_key] = self.emb
 
-    def process(self, adata: ad.AnnData) -> None:
+    def process(self, adata: ad.AnnData, pos_key: str | None = 'pos', neg_key: str | None = 'neg') -> None:
         """Process and add class embedding key to adata."""
         observed_genes = adata.obs[self.p_col].unique().tolist()
         logging.info('Reading embedding.')
         self.emb = self._read_embedding()
-        logging.info(f'Filtering embedding for perturbed genes ({len(observed_genes)}).')
-        self.emb = self._filter_emb(observed_genes)
+        if self.filter_embedding:
+            logging.info(f'Filtering embedding for perturbed genes ({len(observed_genes)}).')
+            self.emb = self._filter_emb(observed_genes)
         self.emb = self._add_misc_rows()
         self.emb *= self.scaling_factor
-        self.emb = self._add_direction_to_emb()
+        self.emb = self._add_direction_to_emb(pos_key=pos_key, neg_key=neg_key)
         logging.info(f'Adding embedding to adata.')
         self._add_emb_to_adata(adata)
