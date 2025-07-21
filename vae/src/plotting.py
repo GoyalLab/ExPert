@@ -9,6 +9,7 @@ import logging
 import scanpy as sc
 from typing import List
 import scipy.sparse as sp
+import torch.nn as nn
 
 from src.utils.constants import MODULE_KEYS
 
@@ -127,6 +128,78 @@ def plot_performance_support_corr(summary: pd.DataFrame, o: str):
     plt.savefig(o, dpi=300, bbox_inches='tight')
     plt.close()
 
+def plot_soft_predictions(model: nn.Module, adata: ad.AnnData | None = None, mode: str = 'val', plt_dir: str | None = None, n: int = 10) -> pd.DataFrame:
+    from sklearn.metrics import precision_recall_fscore_support
+    from tqdm import tqdm
+
+    if adata is None:
+        # Fall back to model's adata
+        adata = model.adata
+    else:
+        # Validate new adata
+        model._validate_anndata(adata)
+    # Split into sets
+    idx = model.train_indices if mode == 'train' else model.validation_indices
+    data = adata[idx].copy()
+    data.obs['idx'] = idx
+    data = data[data.obs.perturbation!='control']
+    soft_predictions = model.predict(indices=data.obs['idx'].values, soft=True)
+    # Plot wo ctrl
+    n_labels = adata.uns['CLS_EMB_INIT']['n_train_labels']
+    y = data.obs._scvi_labels.values
+    labels = data.obs.cls_label.values
+    max_idx = np.argsort(soft_predictions, axis=1)
+    # Look at top N predictions (can be useful for pathways etc.)
+    top_n_predictions = []
+    for top_n in tqdm(np.arange(1, n+1)):
+        top_predictions = max_idx[:,-top_n:]
+        hit_mask = top_predictions == np.array(y)[:, np.newaxis]
+        hit_idx = np.argmax(hit_mask, axis=1)
+        is_hit = np.any(hit_mask, axis=1).astype(int)
+        # Default to actual prediction if label is not in top n predictions
+        stats_per_label = pd.DataFrame(
+            {
+                'y': np.concatenate([y[is_hit==1], y[is_hit==0]]),
+                'idx': np.concatenate([(top_n+1-hit_idx[is_hit==1])/(top_n+1), np.repeat(0, np.sum(is_hit==0))]),
+                'label': np.concatenate([labels[is_hit==1], labels[is_hit==0]]),
+                'prediction': np.concatenate([y[is_hit==1], top_predictions[is_hit==0][:,-1]])
+            }
+        )
+        # Calculate metrics for new predictions
+        precision, recall, f1, support = precision_recall_fscore_support(stats_per_label.y, stats_per_label.prediction, average=None)
+        
+        # Add to dataframe
+        metrics = pd.DataFrame(
+            {
+                'y': stats_per_label.y.unique(), 'cls_label': stats_per_label.label.unique(),
+                'precision': precision[:n_labels], 'recall': recall[:n_labels], 'f1': f1[:n_labels], 'support': support[:n_labels], 'top_n': top_n
+            }
+        )
+        metrics = metrics.merge(stats_per_label.groupby('y')['idx'].mean(), left_on='y', right_index=True)
+        top_n_predictions.append(metrics)
+    top_n_predictions = pd.concat(top_n_predictions, axis=0)
+    top_n_predictions['mode'] = mode
+    # Return results without plotting them
+    if plt_dir is None:
+        return top_n_predictions
+    # Plot results
+    f1_p = os.path.join(plt_dir, f'{mode}_f1_top_{n}_predictions_wo_ctrl.svg')
+
+    plt.figure(dpi=120)
+    top_n_predictions_no_ctrl = top_n_predictions[~top_n_predictions.cls_label.str.endswith('control')]
+    ax = sns.boxplot(top_n_predictions_no_ctrl, x='top_n', y='f1', hue='top_n', legend=False)
+    # Display means on top of boxes
+    means = top_n_predictions_no_ctrl.groupby('top_n')['f1'].mean()
+    for i, top_n_value in enumerate(sorted(top_n_predictions['top_n'].unique())):
+        ax.text(i, 1.0, f'{means[top_n_value]:.2f}', 
+                horizontalalignment='center', verticalalignment='bottom', fontsize=10)
+    plt.xlabel('Number of top predictions')
+    plt.ylim([0.0, 1.0])
+    plt.ylabel('F1-score per class')
+    plt.title(f'Validation F1-score distribution over top predictions (N={model.summary_stats.n_labels})', pad=20)
+    plt.savefig(f1_p, dpi=300, bbox_inches='tight')
+    return top_n_predictions
+
 def plot_model_results_mode(latent: ad.AnnData, mode: str, batch_key: str, cls_labels: list[str], plt_dir: str, cm: bool = True, add_key: str = '') -> None:
     for i, cl in enumerate([*cls_labels, batch_key]):
         logging.info(f'Plotting {mode} for label: {cl}')
@@ -135,13 +208,13 @@ def plot_model_results_mode(latent: ad.AnnData, mode: str, batch_key: str, cls_l
         plt.close()
         # plot confusion matrix
         if cl != batch_key and cm:
-            cm_p = os.path.join(plt_dir, f'{mode}_cm_{cl}.png')
+            cm_p = os.path.join(plt_dir, f'{mode}_cm_{cl}.svg')
             yt = latent.obs[cl]
             yp = latent.obs[MODULE_KEYS.PREDICTION_KEY].str.split(';').str[i]
             plot_confusion(yt, yp, plt_file=cm_p)
     if cm:
         # plot confusion matrix for exact label
-        cm_p = os.path.join(plt_dir, f'{mode}_cm_cls_label.png')
+        cm_p = os.path.join(plt_dir, f'{mode}_cm_cls_label.svg')
         yt = latent.obs['cls_label']
         yp = latent.obs[MODULE_KEYS.PREDICTION_KEY]
         plot_confusion(yt, yp, plt_file=cm_p)
@@ -165,6 +238,96 @@ def predict_novel(model, adata: ad.AnnData, cls_label: str, out_dir: str | None 
         test_report.to_csv(os.path.join(out_dir, f'{mode}_report.csv'))
         adata.write_h5ad(os.path.join(out_dir, f'{mode}_adata.h5ad'))
 
+def plot_cls_masks(latents: ad.AnnData, plt_dir: str, max_classes: int = 100):
+    pp_plt_dir = os.path.join(plt_dir, 'per_perturbation')
+    os.makedirs(pp_plt_dir, exist_ok=True)
+    pal = ['#919aa1', '#94c47d', '#ff7f0f']
+    # Plot train and val for every perturbation
+    for p in latents.obs.cls_label.unique()[:max_classes]:
+        latents.obs['mask'] = latents.obs['mode'].values.tolist()
+        latents.obs.loc[latents.obs.cls_label!=p, 'mask'] = 'other'
+        latents.obs['mask'] = pd.Categorical(latents.obs['mask'])
+        sc.pl.umap(latents, title=p, color='mask', palette=pal, return_fig=True, show=False)
+        plt.savefig(os.path.join(pp_plt_dir, f'{p}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+def plot_interactive_latent(latent: ad.AnnData, report: pd.DataFrame | None = None, color_options: list[str] = ['perturbation', 'dataset', 'mode'], deep_mode: bool = True):
+    import plotly.graph_objects as go
+    import pandas as pd
+    import plotly.io as pio
+    pio.renderers.default = "notebook"
+
+    # Extract umap data from latent
+    umap = pd.DataFrame(latent.obsm['X_umap'], columns=['UMAP_1', 'UMAP_2'])
+    umap = pd.concat([umap, latent.obs.reset_index()], axis=1)
+    # Define color options
+    default_color = color_options[0]
+    hover_info_cols = ['perturbation', 'celltype', 'mode', 'dataset', 'mixscale_score']
+    # Add classification validation performance to plot
+    if report is not None and 'val-f1-score' not in umap.columns:
+        tmp = report.loc[report['mode']=='val',['cls_label', 'f1-score']].copy()
+        tmp['val-f1-score'] = tmp['f1-score'].values
+        umap = umap.merge(tmp[['cls_label', 'val-f1-score']], on='cls_label', how='left')
+        hover_info_cols.append('val-f1-score')
+
+    # Generate hovertemplate
+    hovertemplate = "<br>".join(
+        f"{col}: "+"%{customdata[" + f"{i}" + "]}"
+        for i, col in enumerate(hover_info_cols)
+    ) + "<extra></extra>"
+
+    # Create figure with traces for each color option (one per label)
+    fig = go.Figure()
+
+    for i, label in enumerate(color_options):
+        for val in umap[label].unique():
+            df_subset = umap[umap[label] == val]
+            # Add trace for each coloring option
+            fig.add_trace(go.Scattergl(
+                x=df_subset['UMAP_1'],
+                y=df_subset['UMAP_2'],
+                mode='markers',
+                marker=dict(size=4, opacity=0.5),
+                name=str(val),
+                visible=(i == 0),  # show only first color group at start
+                hovertext=df_subset[label],
+                legendgroup=val,
+                hovertemplate=hovertemplate,
+                customdata=df_subset[hover_info_cols].values
+            ))
+
+    # Create dropdown menu for color switch
+    n_labels = [len(umap[label].unique()) for label in color_options]
+    visibility_blocks = []
+    i = 0
+    for n in n_labels:
+        vis = [False] * sum(n_labels)
+        vis[i:i + n] = [True] * n
+        visibility_blocks.append(vis)
+        i += n
+
+    # Add dropdown
+    fig.update_layout(
+        updatemenus=[dict(
+            type="dropdown",
+            direction="down",
+            buttons=[
+                dict(label=label,
+                    method="update",
+                    args=[{"visible": visibility_blocks[i]},
+                        {"title": f"Color by {label}"}])
+                for i, label in enumerate(color_options)
+            ],
+            x=1.5,
+            y=1.0
+        )],
+        title=f"Color by {default_color}",
+        xaxis_title="UMAP_1",
+        yaxis_title="UMAP_2"
+    )
+    fig.show()
+
+
 def get_model_results(
         model, 
         cls_labels: list[str], 
@@ -174,6 +337,7 @@ def get_model_results(
         save: bool = True, 
         plot: bool = False,
         max_classes: int = 200,
+        save_ad: bool = False,
     ) -> tuple[pd.DataFrame, ad.AnnData]:
     version_dir = get_latest_tensor_dir(log_dir)
     plt_dir = os.path.join(version_dir, 'plots')
@@ -182,6 +346,7 @@ def get_model_results(
     summaries = []
     class_reports = []
     latents = []
+    soft_predictions = []
     for mode in modes:
         logging.info(f'Processing {mode} set')
         latent = get_model_latent(model, mode).copy()
@@ -195,7 +360,9 @@ def get_model_results(
         if plot:
             calc_umap(latent)
             plot_model_results_mode(latent, mode, batch_key, cls_labels, plt_dir)
-            plot_performance_support_corr(class_report, os.path.join(plt_dir, f'{mode}_support_corr.png'))
+            plot_performance_support_corr(class_report, os.path.join(plt_dir, f'{mode}_support_corr.svg'))
+            soft_predictions_mode = plot_soft_predictions(model, mode=mode, plt_dir=plt_dir)
+            soft_predictions.append(soft_predictions_mode)
             if 'zg' in latent.obsm:
                 calc_umap(latent, rep='zg')
                 plot_model_results_mode(latent, mode, batch_key, cls_labels, plt_dir, cm=False, add_key='zg')
@@ -204,27 +371,20 @@ def get_model_results(
     summaries = pd.concat(summaries, axis=0)
     class_reports = pd.concat(class_reports, axis=0)
     latents = ad.concat(latents, axis=0)
+    soft_predictions = pd.concat(soft_predictions, axis=0)
     # Calculate overall latent
     sc.pp.neighbors(latents, use_rep='X')
     sc.tl.umap(latents)
-    pp_plt_dir = os.path.join(plt_dir, 'per_perturbation')
-    os.makedirs(pp_plt_dir, exist_ok=True)
-    if plot:
-        pal = ['#919aa1', '#94c47d', '#ff7f0f']
-        # Plot train and val for every perturbation
-        for p in latents.obs.cls_label.unique()[:max_classes]:
-            latents.obs['mask'] = latents.obs['mode'].values.tolist()
-            latents.obs.loc[latents.obs.cls_label!=p, 'mask'] = 'other'
-            latents.obs['mask'] = pd.Categorical(latents.obs['mask'])
-            sc.pl.umap(latents, title=p, color='mask', palette=pal, return_fig=True, show=False)
-            plt.savefig(os.path.join(pp_plt_dir, f'{p}.png'), dpi=300, bbox_inches='tight')
-            plt.close()
+    if plot and max_classes > 0:
+        logging.info('Plotting class masks for run.')
+        plot_cls_masks(latents, plt_dir=plt_dir, max_classes=max_classes)
     if save:
         logging.info(f'Saving results to: {version_dir}')
         latents.write_h5ad(os.path.join(version_dir, 'latent.h5ad'))
-        model.save(dir_path=os.path.join(version_dir, 'model'), save_anndata=False, overwrite=True)
+        model.save(dir_path=os.path.join(version_dir, 'model'), save_anndata=save_ad, overwrite=True)
         summaries.to_csv(os.path.join(version_dir, 'summary.csv'))
         class_reports.to_csv(os.path.join(version_dir, 'report.csv'))
+        soft_predictions.to_csv(os.path.join(version_dir, 'soft_predictions.csv'))
     if test_adata is not None:
         # Predict on novel data
         logging.info('Running model with novel test data.')
