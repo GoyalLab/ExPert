@@ -1,5 +1,6 @@
 
 from copy import deepcopy
+from src.utils.preprocess import scale_1d_array
 from src.modules._jedvae import JEDVAE
 from src.modules._splitter import ContrastiveDataSplitter
 from src.utils.constants import REGISTRY_KEYS
@@ -82,7 +83,7 @@ class JEDVI(
         _model_kwargs = dict(model_kwargs)
         self._model_kwargs = _model_kwargs
         # Initialize indices and labels for this VAE
-        self._set_indices_and_labels()
+        self._setup()
 
         # Set number of classes
         n_labels = self.summary_stats.n_labels
@@ -103,8 +104,7 @@ class JEDVI(
             n_labels=n_labels,
             n_latent=n_latent,
             n_hidden=n_hidden,
-            n_layers_encoder=n_layers,
-            n_layers_decoder=n_layers,
+            n_layers=n_layers,
             dropout_rate_encoder=dropout_rate,
             dropout_rate_decoder=dropout_rate_decoder,
             class_embed_dim=self.n_dims_emb,
@@ -121,10 +121,12 @@ class JEDVI(
         self.init_params_ = self._get_init_params(locals())
         self.was_pretrained = False
         self.n_labels = n_labels
-        # TODO: give more detailed summary
+        # Give model summary
+        self.n_unseen_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_unseen_labels'] if REGISTRY_KEYS.CLS_EMB_INIT in adata.uns else None
         self._model_summary_string = (
             f"{self.__class__} Model with the following params: \n"
             f"n_classes: {self.n_labels}, "
+            f"n_unseen_classes: {self.n_unseen_labels}"
         )
 
     def _get_cls_weights(
@@ -139,12 +141,12 @@ class JEDVI(
             class_weights = compute_class_weight(method, classes=self._label_mapping, y=labels)
             return torch.tensor(class_weights, dtype=torch.float32)
 
-    def _set_indices_and_labels(self):
-        """Set indices for labeled and unlabeled cells. Prepare class embedding"""
+    def _setup(self):
+        """Setup adata for training. Prepare class embedding"""
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
         self._label_mapping = labels_state_registry.categorical_mapping
-
+        self.n_unseen_labels = None
         self._code_to_label = dict(enumerate(self._label_mapping))
         # order class embedding according to label mapping and transform to matrix
         if REGISTRY_KEYS.CLS_EMB_KEY in self.adata.uns:
@@ -159,6 +161,7 @@ class JEDVI(
                     _label_overlap = _label_series.isin(emb.index)
                     _shared_labels = _label_series[_label_overlap].values
                     _unseen_labels = emb.index.difference(_shared_labels)
+                    self.n_unseen_labels = _unseen_labels
                     n_missing = _label_overlap.shape[0] - _label_overlap.sum()
                     if n_missing > 0:
                         raise ValueError(f'Found {n_missing} missing labels in cls embedding: {_label_series[~_label_overlap]}')
@@ -719,6 +722,7 @@ class JEDVI(
         labels_key: str,
         layer: str | None = None,
         class_emb_uns_key: str | None = 'cls_embedding',
+        class_certainty_key: str | None = None,
         batch_key: str | None = None,
         size_factor_key: str | None = None,
         cast_to_csr: bool = True,
@@ -745,9 +749,12 @@ class JEDVI(
         ]
         # Add class embedding matrix with shape (n_labels, class_emb_dim)
         if class_emb_uns_key is not None and class_emb_uns_key in adata.uns:
-            anndata_fields.append(
-                StringUnsField(REGISTRY_KEYS.CLS_EMB_KEY, class_emb_uns_key)
-            )
+            anndata_fields.append(StringUnsField(REGISTRY_KEYS.CLS_EMB_KEY, class_emb_uns_key))
+        # Add class score per cell, ensure its scaled [0, 1]
+        if class_certainty_key is not None:
+            scaled_class_cert_key = f'{class_certainty_key}_scaled'
+            adata.obs[scaled_class_cert_key] = scale_1d_array(adata.obs[class_certainty_key].astype(float).values)
+            anndata_fields.append(NumericalObsField(REGISTRY_KEYS.CLS_CERT_KEY, scaled_class_cert_key, required=False))
         # Create AnnData manager
         adata_manager = EmbAnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(adata, **kwargs)

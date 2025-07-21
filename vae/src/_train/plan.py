@@ -1,78 +1,80 @@
-import logging
-from IPython import embed
 import pandas as pd
 import numpy as np
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 import torch
 import torchmetrics.functional as tmf
-from torchmetrics.classification import MulticlassConfusionMatrix
 
 from scvi.train import TrainingPlan
 from scvi.module.base import BaseModuleClass, LossOutput
 from scvi.train._metrics import ElboMetric
 from scvi.train._constants import METRIC_KEYS
 
-from typing import TYPE_CHECKING, Iterable
-
 from typing import Literal, Any
 from umap import UMAP
-from collections import Counter, defaultdict
+from collections import defaultdict
 
+
+def _sigmoid_schedule(t, T, k):
+    """Normalized sigmoid: 0 at t=0, 1 at t=T."""
+    midpoint = T / 2
+    raw = 1 / (1 + np.exp(-k * (t - midpoint) / T))
+    min_val = 1 / (1 + np.exp(k / 2))       # sigmoid(0)
+    max_val = 1 / (1 + np.exp(-k / 2))      # sigmoid(T)
+    return (raw - min_val) / (max_val - min_val)
+
+def _exponential_schedule(t, T, k):
+    """Normalized exponential: 0 at t=0, 1 at t=T."""
+    raw = 1 - np.exp(-k * t / T)
+    max_val = 1 - np.exp(-k)
+    return raw / max_val
 
 def _compute_weight(
     epoch: int,
     step: int,
     n_epochs_warmup: int | None,
     n_steps_warmup: int | None,
-    n_epochs_stall: int | None,
+    n_epochs_stall: int | None = None,
     max_weight: float | None = 1.0,
     min_weight: float | None = 0.0,
+    schedule: Literal["linear", "sigmoid", "exponential"] = "sigmoid",
+    anneal_k: float = 10.0
 ) -> float:
-    """Computes the classification weight for the current step or epoch.
-
-    If both `n_epochs_warmup` and `n_steps_warmup` are None, `max_weight` is returned.
-
-    Parameters
-    ----------
-    epoch
-        Current epoch.
-    step
-        Current step.
-    n_epochs_warmup
-        Number of training epochs to scale weight on classification loss from
-        `min_weight` to `max_weight`.
-    n_steps_warmup
-        Number of training steps (minibatches) to scale weight on classification loss from
-        `min_weight` to `max_weight`.
-    max_weight
-        Maximum scaling factor on classification loss during training.
-    min_weight
-        Minimum scaling factor on classification loss during training.
-    """
-    # Check min and max weights
     if min_weight is None:
         min_weight = 0.0
     if max_weight is None:
         max_weight = 0.0
     if min_weight > max_weight:
-        raise ValueError(
-            f"min_weight={min_weight} is larger than max_weight={max_weight}."
-        )
-    # Start warmup at this epoch
-    if n_epochs_stall is not None:
-        if epoch < n_epochs_stall:
-            return 0.0
-        else:
-            epoch -= n_epochs_stall
+        raise ValueError(f"min_weight={min_weight} is larger than max_weight={max_weight}.")
 
+    # Apply stall
+    if n_epochs_stall is not None and epoch < n_epochs_stall:
+        return 0.0
+    if n_epochs_stall:
+        epoch -= n_epochs_stall
+        n_epochs_warmup -= n_epochs_stall
     slope = max_weight - min_weight
+
     if n_epochs_warmup is not None:
-        if epoch < n_epochs_warmup:
-            return slope * (epoch / n_epochs_warmup) + min_weight
+        t = epoch
+        T = n_epochs_warmup
     elif n_steps_warmup is not None:
-        if step < n_steps_warmup:
-            return slope * (step / n_steps_warmup) + min_weight
-    return max_weight
+        t = step
+        T = n_steps_warmup
+    else:
+        return max_weight
+
+    t = min(t, T)
+
+    if schedule == "linear":
+        w = t / T
+    elif schedule == "sigmoid":
+        w = _sigmoid_schedule(t, T, anneal_k)
+    elif schedule == "exponential":
+        w = _exponential_schedule(t, T, anneal_k)
+    else:
+        raise ValueError(f"Invalid schedule type: '{schedule}'")
+
+    return min_weight + slope * w
 
 
 class SemiSupervisedTrainingPlan(TrainingPlan):
@@ -146,6 +148,9 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
         compile_kwargs: dict | None = None,
         average: str = "macro",
         use_posterior_mean: Literal["train", "val", "both"] = "train",
+        anneal_schedule: Literal["linear", "sigmoid", "exponential"] = "sigmoid",
+        anneal_k: float = 5.0,
+        full_val_log_every_n_epoch: int = 50,
         **loss_kwargs,
     ):
         super().__init__(
@@ -187,6 +192,9 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
         self.average = average
         self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
         self.plot_umap = self.loss_kwargs.pop("plot_umap", False)
+        self.anneal_schedule = anneal_schedule
+        self.anneal_k = anneal_k
+        self.full_val_log_every_n_epoch = full_val_log_every_n_epoch
     
     def log_with_mode(self, key: str, value: Any, mode: str, **kwargs):
         """Log with mode."""
@@ -204,6 +212,8 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
             self.n_epochs_cls_stall,
             self.max_cls_weight,
             self.min_cls_weight,
+            schedule=self.anneal_schedule,
+            anneal_k=self.anneal_k
         )
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
@@ -220,6 +230,8 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
             self.n_epochs_align_stall,
             self.max_align_weight,
             self.min_align_weight,
+            schedule=self.anneal_schedule,
+            anneal_k=self.anneal_k
         )
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
@@ -236,6 +248,8 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
             self.n_epochs_contr_stall,
             self.max_contr_weight,
             self.min_contr_weight,
+            schedule=self.anneal_schedule,
+            anneal_k=self.anneal_k
         )
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
@@ -442,12 +456,8 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
         return fig
 
     def on_validation_epoch_end(self):
-        """Plot class label confusion matrix and UMAP projection."""
-        import pytorch_lightning as pl
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-
-        if self.current_epoch % 10 == 0:
+        """Plot validation UMAP projection."""
+        if self.current_epoch % self.full_val_log_every_n_epoch == 0:
             if self.plot_umap:
                 # Perform forward pass on the validation set to get embeddings
                 full_dataset = self.trainer.datamodule.val_dataloader()
@@ -521,24 +531,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         n_classes: int,
         lr: float = 1e-3,
         weight_decay: float = 1e-6,
-        n_steps_kl_warmup: int | None = None,
-        n_epochs_kl_warmup: int | None = 400,
-        n_steps_cls_warmup: int | None = None,
-        n_epochs_cls_warmup: int | None = 400,
-        n_epochs_cls_stall: int | None = 100,
-        max_cls_weight: float = 1.0,
-        min_cls_weight: float = 0.0,
-        n_steps_contr_warmup: int | None = None,
-        n_epochs_contr_warmup: int | None = 400,
-        n_epochs_contr_stall: int | None = 100,
-        max_contr_weight: float = 1.0,
-        min_contr_weight: float = 0.0,
-        use_contr_in_val: bool = False,
-        n_steps_align_warmup: int | None = None,
-        n_epochs_align_warmup: int | None = None,
-        n_epochs_align_stall: int | None = None,
-        max_align_weight: float | None = None,
-        min_align_weight: float | None = None,
+        n_steps_warmup: int | None = None,
+        n_epochs_warmup: int | None = 400,
         reduce_lr_on_plateau: bool = False,
         lr_factor: float = 0.6,
         lr_patience: int = 30,
@@ -550,19 +544,23 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         compile_kwargs: dict | None = None,
         average: str = "macro",
         use_posterior_mean: Literal["train", "val", "both"] | None = "val",
+        use_cls_scores: Literal["train", "val", "both"] | None = "train",
         log_class_distribution: bool = False,
         log_full_val: bool = True,
         freeze_encoder_epoch: int | None = None,
         cls_emb: torch.Tensor | None = None,
         incl_n_unseen: int | None = 200,
+        anneal_schedules: dict[str, dict[str | float]] | None = None,
+        full_val_log_every_n_epoch: int = 10,
+        use_contr_in_val: bool = False,
         **loss_kwargs,
     ):
         super().__init__(
             module=module,
             lr=lr,
             weight_decay=weight_decay,
-            n_steps_kl_warmup=n_steps_kl_warmup,
-            n_epochs_kl_warmup=n_epochs_kl_warmup,
+            n_steps_kl_warmup=n_steps_warmup,
+            n_epochs_kl_warmup=n_epochs_warmup,
             reduce_lr_on_plateau=reduce_lr_on_plateau,
             lr_factor=lr_factor,
             lr_patience=lr_patience,
@@ -572,40 +570,32 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             compile_kwargs=compile_kwargs,
             **loss_kwargs,
         )
+        # Save annealing schedules and default params
+        self.anneal_schedules = anneal_schedules
+        self.n_epochs_warmup = n_epochs_warmup
+        self.n_steps_warmup = n_steps_warmup
         # CLS params
         self.n_classes = n_classes
-        self.n_steps_cls_warmup = n_steps_cls_warmup
-        self.n_epochs_cls_warmup = n_epochs_cls_warmup
-        self.n_epochs_cls_stall = n_epochs_cls_stall
-        self.max_cls_weight = max_cls_weight
-        self.min_cls_weight = min_cls_weight
         self.use_posterior_mean = use_posterior_mean
         self.cls_emb = cls_emb
         self.incl_n_unseen = incl_n_unseen
+        self.use_cls_scores = use_cls_scores
         # Contrastive params
-        self.n_steps_contr_warmup = n_steps_contr_warmup
-        self.n_epochs_contr_warmup = n_epochs_contr_warmup
-        self.n_epochs_contr_stall = n_epochs_contr_stall
-        self.max_contr_weight = max_contr_weight
-        self.min_contr_weight = min_contr_weight
-        self.use_contr_in_val = use_contr_in_val
         self.log_class_distribution = log_class_distribution
         self.freeze_encoder_epoch = freeze_encoder_epoch
         self.encoder_freezed = False
-        # Alignment params
-        self.n_steps_align_warmup = n_steps_align_warmup
-        self.n_epochs_align_warmup = n_epochs_align_warmup
-        self.n_epochs_align_stall = n_epochs_align_stall
-        self.max_align_weight = max_align_weight
-        self.min_align_weight = min_align_weight
+        self.use_contr_in_val = use_contr_in_val
         # Misc
         self.average = average
         self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
         self.plot_umap = self.loss_kwargs.pop("plot_umap", None)
         self.log_full_val = log_full_val
+        self.full_val_log_every_n_epoch = full_val_log_every_n_epoch
         # Save classes that have been seen during training
         self.train_class_counts = []
         self.class_batch_counts = defaultdict(list)
+        self.observed_classes = set()
+        self.n_unseen_classes = 0
     
     def log_with_mode(self, key: str, value: Any, mode: str, **kwargs):
         """Log with mode."""
@@ -615,14 +605,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     @property
     def classification_ratio(self):
         """Scaling factor on classification weight during training. Consider Jax"""
+        kwargs = self.anneal_schedules.get('classification_ratio', {})
         klw = _compute_weight(
             self.current_epoch,
             self.global_step,
-            self.n_epochs_cls_warmup,
-            self.n_steps_cls_warmup,
-            self.n_epochs_cls_stall,
-            self.max_cls_weight,
-            self.min_cls_weight,
+            self.n_epochs_warmup,
+            self.n_steps_warmup,
+            **kwargs
         )
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
@@ -631,14 +620,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     @property
     def alignment_loss_weight(self):
         """Scaling factor on contrastive weight during training. Consider Jax"""
+        kwargs = self.anneal_schedules.get('alignment_loss_weight', {})
         klw = _compute_weight(
             self.current_epoch,
             self.global_step,
-            self.n_epochs_align_warmup,
-            self.n_steps_align_warmup,
-            self.n_epochs_align_stall,
-            self.max_align_weight,
-            self.min_align_weight,
+            self.n_epochs_warmup,
+            self.n_steps_warmup,
+            **kwargs
         )
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
@@ -647,14 +635,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     @property
     def contrastive_loss_weight(self):
         """Scaling factor on contrastive weight during training. Consider Jax"""
+        kwargs = self.anneal_schedules.get('contrastive_loss_weight', {})
         klw = _compute_weight(
             self.current_epoch,
             self.global_step,
-            self.n_epochs_contr_warmup,
-            self.n_steps_contr_warmup,
-            self.n_epochs_contr_stall,
-            self.max_contr_weight,
-            self.min_contr_weight,
+            self.n_epochs_warmup,
+            self.n_steps_warmup,
+            **kwargs
         )
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
@@ -690,7 +677,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # no classification loss (yet)
         if loss_output.classification_loss is None:
             return
-
+        # log how many classes of the whole embedding the model has seen so far
+        if mode == 'train':
+            self.log_with_mode(
+                'n_unseen_classes',
+                self.n_unseen_classes,
+                mode='train',
+                on_step=True,
+                on_epoch=False,
+                batch_size=loss_output.n_obs_minibatch,
+            )
         classification_loss = loss_output.classification_loss
         true_labels = loss_output.true_labels.squeeze(-1)
         logits = loss_output.logits
@@ -736,10 +732,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
         )
 
-    def _get_batch_class_embedding(self, mode: Literal['sample', 'fixed'] = 'sample', batch_idx: int | None = None) -> torch.Tensor:
+    def _get_batch_class_embedding(self, mode: Literal['sample', 'fixed', 'full'] = 'sample', batch_idx: int | None = None) -> torch.Tensor:
         # Always include embedding for classes we actually observe during training
-        if mode == 'fixed' or self.incl_n_unseen is None or self.incl_n_unseen == 0:
-            return torch.Tensor(self.cls_emb[:self.n_classes,:].toarray())
+        if self.incl_n_unseen is None or self.incl_n_unseen == 0:
+            if mode == 'fixed':
+                return torch.Tensor(self.cls_emb[:self.n_classes,:].toarray())
+            # Or return full embedding
+            if mode == 'full':
+                return torch.Tensor(self.cls_emb.toarray())
         # Randomly include other unseen classes
         unseen_class_idc = np.arange(self.n_classes, self.cls_emb.shape[0])
         # Draw classes based on batch index (for reproducibility)
@@ -749,7 +749,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             size=min(self.incl_n_unseen, len(unseen_class_idc)),
             replace=False
         )
+        # Add unseen to training classes
         full_idx = np.concatenate([np.arange(self.n_classes), sampled_unseen])
+        # Update classes that were seen during training
+        self.observed_classes.update(full_idx)
+        self.n_unseen_classes = self.cls_emb.shape[0] - len(self.observed_classes)
         return torch.Tensor(self.cls_emb[full_idx,:].toarray())
 
 
@@ -761,8 +765,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Compute CL warmup
         self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
         self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
-        if self.max_align_weight is not None and self.max_align_weight > 0:
-            self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
+        self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "train" or self.use_posterior_mean == "both"})
         # Setup kwargs
         input_kwargs = {}
@@ -771,6 +774,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         if self.cls_emb is not None:
             # Add embedding for classes that are not in the training data
             batch[REGISTRY_KEYS.CLS_EMB_KEY] = self._get_batch_class_embedding(mode='sample', batch_idx=batch_idx)
+        # Choose to use class scores for scaling or not
+        input_kwargs['use_cls_scores'] = self.use_cls_scores in ['train', 'both']
         # Perform full forward pass of model
         _, _, loss_output = self.forward(batch, loss_kwargs=input_kwargs)
         loss = loss_output.loss
@@ -795,6 +800,20 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
             prog_bar=False,
         )
+        self.log(
+            "constrastive_loss_weight",
+            self.loss_kwargs['contrastive_loss_weight'],
+            on_epoch=True,
+            batch_size=loss_output.n_obs_minibatch,
+            prog_bar=False,
+        )
+        self.log(
+            "alignment_loss_weight",
+            self.loss_kwargs['alignment_loss_weight'],
+            on_epoch=True,
+            batch_size=loss_output.n_obs_minibatch,
+            prog_bar=False,
+        )
         self.compute_and_log_metrics(loss_output, self.train_metrics, "train")
         y = loss_output.true_labels.squeeze(-1)
         # Count occurrences of each class in this batch
@@ -814,8 +833,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
         # Compute contrastive weight
         self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight if self.use_contr_in_val else 0.0})
-        if self.max_align_weight is not None and self.max_align_weight > 0:
-            self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
+        self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "train" or self.use_posterior_mean == "both"})
         # Setup kwargs
         input_kwargs = {}
@@ -824,6 +842,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         if self.cls_emb is not None:
             # Add embedding for classes that are not in the training data
             batch[REGISTRY_KEYS.CLS_EMB_KEY] = self._get_batch_class_embedding(mode='fixed')
+        # Choose to use class scores for scaling or not
+        input_kwargs['use_cls_scores'] = self.use_cls_scores in ['train', 'both']
+        # Perform model forward pass
         _, _, loss_output = self.forward(batch, loss_kwargs=input_kwargs)
         loss = loss_output.loss
         self.log(
@@ -885,8 +906,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
 
     # Calculate accuracy & f1 for entire validation set, not just per batch
     def on_validation_epoch_end(self):
-        """Plot class label confusion matrix and UMAP projection."""
-        if self.current_epoch % 10 == 0:
+        """Plot full validation set UMAP projection."""
+        if self.current_epoch % self.full_val_log_every_n_epoch == 0:
             plt_umap = self.plot_umap in ['val', 'both']
             if plt_umap or self.log_full_val:
                 # Get data from forward pass
@@ -966,8 +987,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
                 # Compute contrastive weight
                 self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight if self.use_contr_in_val else 0.0})
-                if self.max_align_weight is not None and self.max_align_weight > 0:
-                    self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
+                self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
                 self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == mode or self.use_posterior_mean == "both"})
                 # Setup kwargs
                 input_kwargs = {}
@@ -1001,6 +1021,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         }
 
     def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray]):
+        import anndata as ad
+        import scanpy as sc
         # Extract data from forward pass
         embeddings = mode_data['embeddings']
         labels = mode_data['labels']
@@ -1009,16 +1031,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             labels = [self.loss_kwargs["_code_to_label"][l] for l in labels]
         labels = pd.Categorical(labels)
         covs = pd.Categorical(mode_data['covs'])
+        # Plot umap consistent with scanpy settings
+        obs = pd.DataFrame({'labels': labels, 'covs': covs})
+        x = ad.AnnData(X=embeddings, obs=obs)
+        sc.pp.neighbors(x, use_rep='X')
+        sc.tl.umap(x)
+        embeddings_2d = x.obsm['X_umap']
 
         """Plots a UMAP projection of Z latent space."""
         import matplotlib.pyplot as plt
         import seaborn as sns
-        # Use sc.tl.umap default arguments
-        umap = UMAP(
-            n_neighbors=15, min_dist=0.5, metric="euclidean",
-            n_components=2, spread=1.0, negative_sample_rate=5
-        )
-        embeddings_2d = umap.fit_transform(embeddings)
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150)
         # Plot classes
@@ -1027,22 +1049,20 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             y=embeddings_2d[:, 1],
             hue=labels,
             alpha=0.7,
+            s=4,
             ax=axes[0],
+            legend=False
         )
         axes[0].set_title(f"Classes @ Epoch: {self.current_epoch}")
         axes[0].set_xlabel("UMAP-1")
         axes[0].set_ylabel("UMAP-2")
-        axes[0].legend(
-            bbox_to_anchor=(0.5, -0.15),
-            loc="upper center",
-            title="Classes",
-        )
         # Plot batch keys
         sns.scatterplot(
             x=embeddings_2d[:, 0],
             y=embeddings_2d[:, 1],
             hue=covs,
             alpha=0.7,
+            s=4,
             ax=axes[1],
         )
         axes[1].set_title(f"Batch Keys @ Epoch: {self.current_epoch}")

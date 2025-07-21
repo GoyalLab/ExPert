@@ -1,39 +1,40 @@
-from anndata import AnnData
+import torch
 import numpy as np
 import logging
+from anndata import AnnData
 from src.utils.constants import REGISTRY_KEYS
 
 
-def _prep_adata(
-            adata: AnnData, 
-            cls_labels: list[str], 
-            ctrl_key: str = 'control', 
-            p_pos: int = -1,
-            verbose: bool = True,
-        ) -> None:
-    # Add control label
-    adata.obs['is_ctrl'] = False
-    adata.obs.loc[adata.obs[cls_labels[p_pos]]==ctrl_key, 'is_ctrl'] = True
-    # Count number of cells per cls_labels
-    cls_range = np.arange(len(cls_labels))
-    mask = cls_range != cls_range[p_pos]
-    cls_labels_excl = np.array(cls_labels)[mask].tolist()
-    cpp = adata.obs.groupby(cls_labels_excl, observed=True)['is_ctrl'].value_counts()
-    # Get
-    idc = []
-    ctrl_idc = []
-    for group, data in adata.obs[~adata.obs.is_ctrl].groupby(cls_labels_excl, observed=True):
-        mask = True
-        idc.extend(data.index)
-        for i, g in enumerate(group):
-            mask &= adata.obs[cls_labels[i]]==g
-        n_p = cpp[*group, False]
-        if verbose:
-            logging.info(f'group: {group}: n_ctrl: {np.sum(mask)}, n_pert: {n_p}')
-        ctrl_idc.extend(adata.obs[mask].sample(n_p).index)
-    # Extract control cells
-    ctrl_layer = adata[ctrl_idc].X.copy()
-    # Filter cells for perturbed cells only
-    adata._inplace_subset_obs(idc)
-    # Set basal layer with unperturbed cells
-    adata.layers[REGISTRY_KEYS.B_KEY] = ctrl_layer
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1/(1 + np.exp(-x))
+
+def scale_1d_array(
+        x: np.ndarray, 
+        zero_center: bool = True, 
+        max_value: float | None = None, 
+        abs: bool = True,
+        log: bool = True,
+        use_sigmoid: bool = True,
+        check_scale: bool = True,
+    ) -> np.ndarray:
+    x = x.astype(float)
+    # Check if x is already bounded [0,1]
+    if check_scale and x.min() >= 0 and x.max() <= 1:
+        return x
+    if abs:
+        x = np.abs(x)
+    if log:
+        x = np.log10(x)
+    if zero_center:
+        mean = np.mean(x)
+        x -= mean
+    std = np.std(x)
+    if std != 0:
+        x /= std
+    else:
+        x[:] = 0.0  # Avoid division by zero
+    if max_value is not None:
+        x = np.clip(x, -max_value, max_value)
+    if use_sigmoid:
+        x = sigmoid(x)
+    return x

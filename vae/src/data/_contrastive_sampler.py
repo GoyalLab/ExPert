@@ -242,7 +242,8 @@ class ContrastiveBatchSampler:
         last_first: bool = True,
         shuffle_classes: bool = True,
         strict: bool = True,
-        sample_mode: Literal['random', 'split', 'counter'] = 'random'
+        sample_mode: Literal['random', 'split', 'counter'] = 'random',
+        split_batches: bool = False,
     ):
         self.batch_size = batch_size
         self.max_cells_per_batch = max_cells_per_batch
@@ -252,6 +253,7 @@ class ContrastiveBatchSampler:
         self.shuffle_classes = shuffle_classes
         self.strict = strict
         self.sample_mode = sample_mode
+        self.split_batches = split_batches
         # Setup indices and labels
         self.indices = np.array(indices)
         self.n_indices = len(indices)

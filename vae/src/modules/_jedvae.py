@@ -49,8 +49,7 @@ class JEDVAE(VAE):
         n_batch: int,
         n_hidden: int = 256,
         n_latent: int = 128,
-        n_layers_encoder: int = 2,
-        n_layers_decoder: int = 1,
+        n_layers: int = 2,
         dropout_rate_encoder: float = 0.2,
         dropout_rate_decoder: float | None = None,
         class_embed_dim: int = 128,
@@ -69,10 +68,12 @@ class JEDVAE(VAE):
         use_layer_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'none',
         var_activation: Callable[[torch.Tensor], torch.Tensor] | None = None,
         l1_lambda: float | None = 1e-5,
-        use_focal_loss: bool = True,
+        l1_mask: str | list[str] | None = None,
         focal_gamma: float = 2.0,
-        use_class_similarity_loss: bool = True,
+        classification_loss_strategy: Literal['cross_entropy', 'similarity', 'kl', 'focal'] = 'kl',
+        kl_class_temperature: float = 0.1,
         reduction: Literal['mean', 'sum'] = 'sum',
+        non_elbo_reduction: Literal['mean', 'sum'] = 'sum',
         use_feature_mask: bool = False,
         drop_prob: float = 0.5,
         extra_encoder_kwargs: dict | None = None,
@@ -85,7 +86,7 @@ class JEDVAE(VAE):
             n_labels=n_labels,
             n_hidden=n_hidden,
             n_latent=n_latent,
-            n_layers=n_layers_encoder,
+            n_layers=n_layers,
             n_continuous_cov=n_continuous_cov,
             n_cats_per_cov=n_cats_per_cov,
             dropout_rate=dropout_rate_encoder,
@@ -102,8 +103,9 @@ class JEDVAE(VAE):
             var_activation=var_activation,
         )
 
-        # Setup scvi part of model
+        # Setup l1 params
         self.l1_lambda = l1_lambda
+        self.l1_mask = l1_mask
         
         if dropout_rate_decoder is not None:
             logging.warning('Dropout rate for decoder currently unavailable. Will fall back to 0.')
@@ -114,16 +116,23 @@ class JEDVAE(VAE):
         self.class_weights = cls_weights
         self.class_embed_dim = class_embed_dim
         self._update_cls_params()
-        self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
-        self.use_class_similarity_loss = use_class_similarity_loss
+        self.classification_loss_strategy = classification_loss_strategy
         self.reduction = reduction
+        self.kl_class_temperature = kl_class_temperature
+        if non_elbo_reduction not in ['sum', 'mean']:
+            raise ValueError(f'Invalid reduction for extra loss metrics: {non_elbo_reduction}, choose either "sum", or "mean".')
+        self.non_elbo_reduction = non_elbo_reduction
 
         # Setup normalizations for en- and decoder
         use_batch_norm_encoder = use_batch_norm == 'encoder' or use_batch_norm == 'both'
         use_batch_norm_decoder = use_batch_norm == 'decoder' or use_batch_norm == 'both'
         use_layer_norm_encoder = use_layer_norm == 'encoder' or use_layer_norm == 'both'
         use_layer_norm_decoder = use_layer_norm == 'decoder' or use_layer_norm == 'both'
+
+        # Check config
+        if self.classification_loss_strategy not in ['cross_entropy', 'similarity', 'kl', 'focal']:
+            raise ValueError(f'Got invalid argument for `classification_loss_strategy` {self.classification_loss_strategy}')
 
         # Setup encoder input dimensions
         n_input_encoder = n_input + n_continuous_cov * encode_covariates
@@ -134,6 +143,7 @@ class JEDVAE(VAE):
         _extra_encoder_kwargs = extra_encoder_kwargs or {}
         _extra_decoder_kwargs = extra_decoder_kwargs or {}
 
+        n_layers_encoder = _extra_encoder_kwargs.get('n_layers', n_layers)
 
         # Re-Init encoder for X (rna-seq)
         self.z_encoder = Encoder(
@@ -151,6 +161,8 @@ class JEDVAE(VAE):
             **_extra_encoder_kwargs,
             return_dist=True,
         )
+
+        n_layers_decoder = _extra_decoder_kwargs.get('n_layers', n_layers)
 
         self.decoder = DecoderSCVI(
             n_input=n_latent,
@@ -221,7 +233,7 @@ class JEDVAE(VAE):
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
-        reduction: str = 'sum',
+        reduction: str | None = 'sum',
         penalize_cls_uncertaintly: bool = True,
         soft: bool = False,
     ) -> torch.Tensor:
@@ -234,7 +246,8 @@ class JEDVAE(VAE):
         # + overall similarity of cell to classes (classification uncertainty)
         if penalize_cls_uncertaintly:
             cs_scores += logits[~cls_mask].mean(dim=-1)
-        cs_loss = cs_scores.mean() if reduction == 'mean' else cs_scores.sum()
+        if reduction is not None:
+            cs_loss = cs_scores.mean() if reduction == 'mean' else cs_scores.sum()
         if not soft:
             return cs_loss
         else:
@@ -246,7 +259,7 @@ class JEDVAE(VAE):
         targets: torch.Tensor, 
         alpha: torch.Tensor | None = None, 
         gamma: float = 2.0, 
-        reduction: str = 'sum'
+        reduction: str | None = 'sum',
     ) -> torch.Tensor:
         """
         logits: Tensor of shape (batch_size, num_classes)
@@ -258,7 +271,9 @@ class JEDVAE(VAE):
         ce_loss = F.cross_entropy(logits, targets, weight=alpha, reduction='none')  # per-sample loss
         pt = torch.exp(-ce_loss)  # pt = softmax prob of correct class
         focal_loss = ((1 - pt) ** gamma) * ce_loss
-
+        # Use class scores if available
+        if reduction is None:
+            return focal_loss
         if reduction == 'mean':
             return focal_loss.mean()
         elif reduction == 'sum':
@@ -301,7 +316,7 @@ class JEDVAE(VAE):
             z_normalized: torch.Tensor, 
             class_embeds: torch.Tensor, 
             targets: torch.Tensor,
-            reduction: str = 'sum'
+            reduction: str | None = 'sum'
         ) -> torch.Tensor:
         """
         Parameters
@@ -318,32 +333,99 @@ class JEDVAE(VAE):
         target_embeds = class_embeds[targets]  # (batch, d)
         target_embeds = F.normalize(target_embeds, dim=-1)
         cos_sim = F.cosine_similarity(z_normalized, target_embeds, dim=-1)  # (batch,)
+        cos_diff = (1.0 - cos_sim)
+
+        if reduction is None:
+            return cos_diff
         if reduction == 'mean':
-            return (1.0 - cos_sim).mean()
+            return cos_diff.mean()
         elif reduction == 'sum':
-            return (1.0 - cos_sim).sum()
+            return cos_diff.sum()
         else:
             raise ValueError(f"Reduction has to be either 'sum', or 'mean'")
         
+    def _kl_classification_loss(
+        self,
+        logits: torch.Tensor,
+        y: torch.Tensor,
+        cls_emb: torch.Tensor,
+        reduction: str | None = 'mean',
+    ) -> torch.Tensor:
+        # Adjust to batchmean
+        if reduction is None:
+            reduction = 'none'
+        elif reduction == 'mean':
+            reduction = 'batchmean'
+        # Move embedding to gpu
+        cls_emb = cls_emb.to(logits.device)
+        # Compute cosine sim between all class embeddings of this batch
+        class_sim = cls_emb @ cls_emb.T         # [num_classes, num_classes]
+        # For each label, get soft targets
+        soft_targets = class_sim[y]  # shape: [batch, num_classes]
+        soft_targets = F.softmax(soft_targets / self.kl_class_temperature, dim=-1)
+        # Ensure logits are log softmaxed for kl to work properly
+        sm_logits = F.log_softmax(logits, dim=-1)
+        # Get KL divergence between soft targets and logits
+        return F.kl_div(sm_logits, soft_targets, reduction=reduction)
+    
+    def _calc_classification_loss(
+        self,
+        logits: torch.Tensor,
+        y: torch.Tensor,
+        reduction: str = 'mean',
+        cls_emb: torch.Tensor | None = None,
+        cls_scores: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Get class weights
+        cw = self.class_weights.to(device=y.device) if self.class_weights is not None else None
+        y = y.view(-1).long()
+        # Choose reduction method based on cls_scores
+        o_red = reduction
+        reduction = reduction if cls_scores is None else None
+        # Determine which loss to use
+        if self.classification_loss_strategy == 'focal':
+            ce_loss = self.focal_loss(logits, y, alpha=cw, gamma=self.focal_gamma, reduction=reduction)
+        elif self.classification_loss_strategy == 'similarity':
+            ce_loss = self._class_similarity_loss(logits, y, reduction=reduction)
+        elif self.classification_loss_strategy == 'kl' and cls_emb is not None:
+            ce_loss = self._kl_classification_loss(logits, y, cls_emb=cls_emb, reduction=reduction)
+        else:
+            raise ValueError(f'Invalid argument combination of {self.classification_loss_strategy} and external embedding.')
+        # Scale by class scores if provided
+        if cls_scores is not None:
+            if o_red == 'sum':
+                return (cls_scores * ce_loss).sum()
+            elif o_red == 'mean':
+                return (cls_scores * ce_loss).sum() / (cls_scores.sum() + 1e-8)
+            else:
+                return cls_scores * ce_loss
+        else:
+            return ce_loss
+
     @auto_move_data
     def classification_loss(
         self, 
         labelled_dataset: dict[str, torch.Tensor], 
         use_posterior_mean: bool = True,
         use_ext_emb: bool = True,
+        use_cls_scores: bool = True,
         alignment_loss_weight: float | None = None,
-        reduction: str = 'mean',
+        reduction: str = 'batchmean',
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         x = labelled_dataset[REGISTRY_KEYS.X_KEY]  # (n_obs, n_vars)
         y = labelled_dataset[REGISTRY_KEYS.LABELS_KEY]  # (n_obs, 1)
         batch_idx = labelled_dataset[REGISTRY_KEYS.BATCH_KEY]
+        # Get external class embedding
         ext_emb = labelled_dataset.get(REGISTRY_KEYS.CLS_EMB_KEY) if use_ext_emb else None # (n_labels, n_emb)
+        # Try to get class scores
+        cls_scores = labelled_dataset.get(REGISTRY_KEYS.CLS_CERT_KEY) if use_cls_scores else None
 
         cont_key = REGISTRY_KEYS.CONT_COVS_KEY
         cont_covs = labelled_dataset[cont_key] if cont_key in labelled_dataset.keys() else None
 
         cat_key = REGISTRY_KEYS.CAT_COVS_KEY
         cat_covs = labelled_dataset[cat_key] if cat_key in labelled_dataset.keys() else None
+
         # Classify
         logits, cz = self.classify(
             x, 
@@ -353,23 +435,8 @@ class JEDVAE(VAE):
             use_posterior_mean=use_posterior_mean,
             class_embeds=ext_emb
         )  # (n_obs, n_labels)
-        
-        cw = self.class_weights.to(device=y.device) if self.class_weights is not None else None
-        if self.use_focal_loss:
-            ce_loss = self.focal_loss(
-                logits,
-                y.view(-1).long(),
-                alpha=cw,
-                gamma=self.focal_gamma,
-                reduction=reduction
-            )
-        else:
-            ce_loss = F.cross_entropy(
-                logits,
-                y.view(-1).long(),
-                weight=cw,
-                reduction=reduction
-            )
+        # Calculate classification loss from logits and true labels
+        ce_loss = self._calc_classification_loss(logits, y, reduction=reduction, cls_emb=ext_emb, cls_scores=cls_scores)
         # Calculate alignment between zx and class projection if external embedding is given
         if alignment_loss_weight is not None and alignment_loss_weight > 0 and ext_emb is not None:
             align_loss = self.geom_alignment_loss(
@@ -384,9 +451,14 @@ class JEDVAE(VAE):
 
     # L1 regularization function
     def l1_regularization(self):
-        l1_norm = 0
-        for param in self.parameters():
-            l1_norm += torch.sum(torch.abs(param))
+        l1_norm = 0.0
+        masks = self.l1_mask if isinstance(self.l1_mask, (list, tuple)) else [self.l1_mask]
+        # Collect number of parameters
+        for name, param in self.named_parameters():
+            if 'bias' in name:
+                continue
+            if self.l1_mask is None or any(mask in name for mask in masks):
+                l1_norm += torch.sum(torch.abs(param))
         return l1_norm
     
     def _contrastive_loss_custom(
@@ -510,6 +582,7 @@ class JEDVAE(VAE):
         contrastive_temperature: float = 0.1,
         use_posterior_mean: bool = True,
         use_ext_emb: bool = True,
+        use_cls_scores: bool = True,
         **kwargs,
     ) -> LossOutput:
         """Compute the loss."""
@@ -554,22 +627,19 @@ class JEDVAE(VAE):
 
         # Add contrastive loss if it is specified
         if contrastive_loss_weight is not None and contrastive_loss_weight > 0:
-            contr_loss = self._contrastive_loss(z, tensors, temperature=contrastive_temperature)
+            contr_loss = self._contrastive_loss(z, tensors, temperature=contrastive_temperature, reduction=self.non_elbo_reduction)
             lo_kwargs['loss'] += contr_loss * contrastive_loss_weight
             extra_metrics.update({'contrastive_loss': contr_loss})
         # Add classification based losses
         if classification_ratio is not None and classification_ratio > 0:
             ce_loss, true_labels, logits, align_loss = self.classification_loss(
-                tensors, 
-                use_posterior_mean, 
-                use_ext_emb,
-                alignment_loss_weight
+                labelled_dataset=tensors, 
+                use_posterior_mean=use_posterior_mean,
+                use_ext_emb=use_ext_emb,
+                use_cls_scores=use_cls_scores,
+                alignment_loss_weight=alignment_loss_weight,
+                reduction=self.non_elbo_reduction,
             )
-            # Add class cosine difference loss
-            if self.use_class_similarity_loss:
-                cls_sim_loss = self._class_similarity_loss(logits=logits, targets=true_labels)
-                # Overwrite classification loss
-                ce_loss = cls_sim_loss
             # Add z classification loss to overall loss
             lo_kwargs['loss'] += ce_loss * classification_ratio
             

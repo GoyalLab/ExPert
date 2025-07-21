@@ -97,6 +97,7 @@ class FunnelFCLayers(nn.Module):
         self,
         n_in: int,
         n_out: int,
+        n_hidden: int = 128,
         n_cat_list: Optional[Iterable[int]] = None,
         n_layers: int = 2,
         min_attn_dim: int = 512,
@@ -127,8 +128,11 @@ class FunnelFCLayers(nn.Module):
         self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in (n_cat_list or [])]
         self.cat_dim = sum(self.n_cat_list)
 
-        # Geometric decay or growth
-        hidden_dims = np.geomspace(n_in, n_out, num=n_layers + 1).astype(int)
+        # Geometric decay over n hidden to output layer
+        hidden_dims = np.geomspace(n_hidden, n_out, num=n_layers + 1).astype(int)
+        # Set n_hidden as bottleneck first dimension
+        hidden_dims = np.r_[n_in, hidden_dims]
+        
         # Ensure its divisible by n_heads if attention is used
         if use_attention:
             if inverted:
@@ -138,7 +142,7 @@ class FunnelFCLayers(nn.Module):
         # Init layers
         self.layers = nn.ModuleList()
 
-        for i in range(n_layers):
+        for i in range(n_layers + 1):
             in_dim = hidden_dims[i] + self.cat_dim * self.inject_into_layer(i)
             out_dim = hidden_dims[i + 1]
             # Determine whether to to use attention for block, never use on the first layer
@@ -228,9 +232,11 @@ class FCLayers(nn.Module):
         use_batch_norm: bool = True,
         use_layer_norm: bool = False,
         use_activation: bool = True,
+        use_attention: bool = False,
         bias: bool = True,
         inject_covariates: bool = True,
         activation_fn: nn.Module = nn.ReLU,
+        **kwargs
     ):
         super().__init__()
         self.inject_covariates = inject_covariates
@@ -471,6 +477,7 @@ class Encoder(nn.Module):
         self,
         n_input: int,
         n_output: int,
+        n_hidden: int,
         n_cat_list: Iterable[int] = None,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
@@ -480,24 +487,29 @@ class Encoder(nn.Module):
         return_dist: bool = False,
         use_feature_mask: bool = False,
         drop_prob: float = 0.25,
+        use_funnel: bool = True,
         **kwargs,
     ):
         super().__init__()
+
+        fclayers_class = FunnelFCLayers if use_funnel else FCLayers
 
         self.distribution = distribution
         self.var_eps = var_eps
         self.n_input = n_input
         # Setup encoder layers
-        self.encoder = FunnelFCLayers(
+        funnel_out_dim = 2 * n_output
+        self.encoder = fclayers_class(
             n_in=n_input,
-            n_out=n_output,
+            n_out=funnel_out_dim,
+            n_hidden=n_hidden,
             n_cat_list=n_cat_list,
             n_layers=n_layers,
             dropout_rate=dropout_rate,
             **kwargs,
         )
-        self.mean_encoder = nn.Linear(n_output, n_output)
-        self.var_encoder = nn.Linear(n_output, n_output)
+        self.mean_encoder = nn.Linear(funnel_out_dim, n_output)
+        self.var_encoder = nn.Linear(funnel_out_dim, n_output)
         self.return_dist = return_dist
         self.use_feature_mask = use_feature_mask
         self.drop_prob = drop_prob
@@ -588,18 +600,23 @@ class DecoderSCVI(nn.Module):
         self,
         n_input: int,
         n_output: int,
+        n_hidden: int = 128,
         n_cat_list: Iterable[int] = None,
         n_layers: int = 1,
         inject_covariates: bool = True,
         use_batch_norm: bool = False,
         use_layer_norm: bool = False,
         scale_activation: Literal["softmax", "softplus"] = "softmax",
+        use_funnel: bool = False,    
         **kwargs,
     ):
         super().__init__()
-        self.px_decoder = FunnelFCLayers(
+        fc_layer_class = FunnelFCLayers if use_funnel else FCLayers
+        funnel_out_dim = n_output // 2
+        self.px_decoder = fc_layer_class(
             n_in=n_input,
-            n_out=n_output,
+            n_out=funnel_out_dim,
+            n_hidden=n_hidden,
             n_cat_list=n_cat_list,
             n_layers=n_layers,
             dropout_rate=0,
@@ -616,15 +633,15 @@ class DecoderSCVI(nn.Module):
         elif scale_activation == "softplus":
             px_scale_activation = nn.Softplus()
         self.px_scale_decoder = nn.Sequential(
-            nn.Linear(n_output, n_output),
+            nn.Linear(funnel_out_dim, n_output),
             px_scale_activation,
         )
 
         # dispersion: here we only deal with gene-cell dispersion case
-        self.px_r_decoder = nn.Linear(n_output, n_output)
+        self.px_r_decoder = nn.Linear(funnel_out_dim, n_output)
 
         # dropout
-        self.px_dropout_decoder = nn.Linear(n_output, n_output)
+        self.px_dropout_decoder = nn.Linear(funnel_out_dim, n_output)
 
     def forward(
         self,
@@ -701,6 +718,7 @@ class EmbeddingClassifier(nn.Module):
         self.class_embed_dim = class_embed_dim
         self.n_labels = n_labels
         self.temperature = temperature
+        self.dropout_rate = dropout_rate
         self.return_latents = return_latents
 
         # Initialize layers
@@ -718,6 +736,7 @@ class EmbeddingClassifier(nn.Module):
         else:
             # Set encoder to a single linear layer
             self.encoder = nn.Linear(n_input, class_embed_dim)
+            self.dropout = nn.Dropout(p=dropout_rate)
             class_embed_dim = n_input
 
         # 2. Check compatibility
@@ -747,6 +766,8 @@ class EmbeddingClassifier(nn.Module):
             External class embeddings, shape (n_labels, class_embed_dim)
         """
         z = self.encoder(x)  # (batch, d)
+        if self.dropout_rate > 0:
+            x = self.dropout(x)
 
         if class_embeds is None:
             class_embeds = self.learned_class_embeds
