@@ -56,7 +56,7 @@ write.csv(seurat_obj@meta.data, file = paste0(file_path_sans_ext(out_p), '_obs.c
 # 4. Subset by mixscale score threshold and include control cells in filtering
 message("Filtering dataset based on absolute mixscore > ", ctrl_dev)
 # 4.1 Filter with combined mask
-mask = (abs(seurat_obj$mixscale_score) > ctrl_dev) | (seurat_obj$is_ctrl)
+mask = (abs(seurat_obj$mixscale_score) > ctrl_dev) | (seurat_obj[[perturbation_col]]==ctrl_key)
 seurat_obj$mixscale_mask <- mask
 seurat_obj <- subset(seurat_obj, subset = mixscale_mask)
 

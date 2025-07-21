@@ -184,7 +184,7 @@ def _filter_perturbation_pool(adata: ad.AnnData, perturbation_pool_file: str | N
 def preprocess_dataset(
         adata: ad.AnnData, 
         cancer: bool,
-        perturbation_pool_file: str | None = None,
+        perturbation_pool_file: str,
         name: str = 'Unknown', 
         qc: bool = True, 
         norm: bool = True, 
@@ -218,7 +218,8 @@ def preprocess_dataset(
         if sp_mask is not None:
             adata._inplace_subset_obs(sp_mask)
     # Filter perturbations for perturbation pool if given
-    _filter_perturbation_pool(adata, perturbation_pool_file=perturbation_pool_file, p_col=p_col)
+    if perturbation_pool_file != '':
+        _filter_perturbation_pool(adata, perturbation_pool_file=perturbation_pool_file, p_col=p_col)
     if n_ctrl is not None:
         subset_ctrl_cells(adata, n_ctrl=n_ctrl, seed=seed, perturbation_col=p_col, ctrl_key=ctrl_key)
     # apply quality control measures
