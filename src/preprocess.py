@@ -6,7 +6,7 @@ import logging
 import anndata as ad
 import scipy.sparse as sp
 from typing import Iterable
-from src.statics import P_COLS, CTRL_KEYS, GENE_SYMBOL_KEYS, SETTINGS, OBS_KEYS
+from src.statics import P_COLS, CTRL_KEYS, GENE_SYMBOL_KEYS, SETTINGS, OBS_KEYS, MISC_LABELS_KEYS
 
 
 # credit to https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
@@ -180,11 +180,30 @@ def _filter_perturbation_pool(adata: ad.AnnData, perturbation_pool_file: str | N
     adata._inplace_subset_obs(mask)
     logging.info(f'Found {adata.obs[p_col].nunique()} perturbations from pool ({perturbation_pool.shape[0]}) in adata.')
 
+def _remove_invalid_labels(adata: ad.AnnData, p_col: str) -> None:
+    # Collect all unique labels
+    labels = adata.obs[p_col].unique()
+    # Check for invalid labels
+    invalid_labels = labels[labels.isna() | labels.isin(MISC_LABELS_KEYS)]
+    if invalid_labels.shape[0] > 0:
+        invalid_mask = adata.obs[p_col].isin(invalid_labels)
+        logging.info(f'Removing {invalid_mask.sum()} cells with invalid labels: {invalid_labels.astype(str)}')
+        # Remove invalid labels
+        adata._inplace_subset_obs(~invalid_mask)
+
+def _filter_feature_pool(adata: ad.AnnData, feature_pool_file: str) -> None:
+    """Filter adata features according to pre-calculated pool of features."""
+    feature_pool = pd.read_csv(feature_pool_file, index_col=0)[OBS_KEYS.POOL_FEATURE_KEY]
+    feature_mask = adata.var.index.isin(feature_pool)
+    logging.info(f'Subsetting to features in pre-calculated pool: {feature_mask.sum()}/{adata.n_vars}')
+    adata._inplace_subset_var(feature_mask)
+
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
 def preprocess_dataset(
         adata: ad.AnnData, 
         cancer: bool,
         perturbation_pool_file: str,
+        feature_pool_file: str,
         name: str = 'Unknown', 
         qc: bool = True, 
         norm: bool = True, 
@@ -195,12 +214,16 @@ def preprocess_dataset(
         subset: bool = False, 
         n_ctrl: int | None = 10_000,
         single_perturbations_only: bool = True,
+        use_perturbation_pool: bool = False,
+        use_feature_pool: bool = True,
         p_col: str = OBS_KEYS.PERTURBATION_KEY,
         ctrl_key: str = OBS_KEYS.CTRL_KEY,
         min_genes: int = 5_000,
         keep_versions: bool = False,
-        seed: int = 42
+        seed: int = 42,
+        remove_invalid_labels: bool = True,
     ) -> ad.AnnData:
+    logging.info(f'Preprocessing dataset with shape: {adata.shape} (cells x genes)')
     # Ensure adata.X is in csr format
     if not isinstance(adata.X, sp.csr_matrix):
         logging.info('Converting adata.X to CSR matrix.')
@@ -211,6 +234,9 @@ def preprocess_dataset(
     check_ctrl_col(adata, p_col=p_col, ctrl_key=ctrl_key)
     # Clean up perturbation label
     adata.obs[p_col] = clean_perturbation_labels(adata.obs[p_col], keep_versions=keep_versions)
+    # Remove unknown or NaN labels
+    if remove_invalid_labels:
+        _remove_invalid_labels(adata, p_col=p_col)
     # Filter for single perturbations only
     if single_perturbations_only:
         logging.info(f'Filtering column "{p_col}" for single perturbations only')
@@ -218,7 +244,7 @@ def preprocess_dataset(
         if sp_mask is not None:
             adata._inplace_subset_obs(sp_mask)
     # Filter perturbations for perturbation pool if given
-    if perturbation_pool_file != '':
+    if use_perturbation_pool:
         _filter_perturbation_pool(adata, perturbation_pool_file=perturbation_pool_file, p_col=p_col)
     if n_ctrl is not None:
         subset_ctrl_cells(adata, n_ctrl=n_ctrl, seed=seed, perturbation_col=p_col, ctrl_key=ctrl_key)
@@ -258,4 +284,8 @@ def preprocess_dataset(
     if adata.var_names.str.lower().str.startswith('ens').all():
         logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
         adata = ens_to_symbol(adata).copy()
+    # Filter for feature pool if option is given
+    if use_feature_pool:
+        logging.info(f'Using feature pool to filtering for shared features.')
+        _filter_feature_pool(adata, feature_pool_file=feature_pool_file)
     return adata

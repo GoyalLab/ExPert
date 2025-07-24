@@ -30,6 +30,7 @@ save_config(config, os.path.join(OUTPUT_DIR, 'config.yaml'))
 
 # Output files
 PERTURBATION_POOL_FILE = os.path.join(OUTPUT_DIR, 'perturbation_pool.csv')
+FEATURE_POOL_FILE = os.path.join(OUTPUT_DIR, 'feature_pool.csv')
 MERGED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset.h5ad')
 HARMONIZED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'perturb_metaset_harmonized.h5ad')
 # download_datasets
@@ -85,7 +86,8 @@ rule meta_info:
     input:
         input_files = expand(os.path.join(DWNL_DIR, "{dataset}.h5ad"), dataset=DATASET_NAMES)
     output:
-        perturbation_pool_file = PERTURBATION_POOL_FILE
+        perturbation_pool_file = PERTURBATION_POOL_FILE,
+        feature_pool_file = FEATURE_POOL_FILE,
     log:
         os.path.join(LOG, 'meta_info.log')
     params:
@@ -98,10 +100,9 @@ rule meta_info:
 # 2. Preprocess each dataset
 rule process_dataset:
     input:
-        **{
-            'dataset_file': os.path.join(DWNL_DIR, "{dataset}.h5ad"),
-            'perturbation_pool_file': PERTURBATION_POOL_FILE if config['use_perturbation_pool'] else ''
-        }
+        dataset_file = os.path.join(DWNL_DIR, "{dataset}.h5ad"),
+        perturbation_pool_file = PERTURBATION_POOL_FILE,
+        feature_pool_file = FEATURE_POOL_FILE,
     output:
         processed = os.path.join(PROCESS_DIR, "{dataset}.h5ad")
     log:
@@ -116,6 +117,8 @@ rule process_dataset:
         n_hvg = config['n_hvg'],
         subset = config['subset_hvg'],
         n_ctrl = config['n_ctrl'],
+        use_perturbation_pool = config['use_perturbation_pool'],
+        use_feature_pool = config['use_feature_pool'],
         single_perturbations_only = config['single_perturbations_only'],
         p_col = config['perturbation_col'],
         ctrl_key = config['ctrl_key'],

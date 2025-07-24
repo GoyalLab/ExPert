@@ -9,6 +9,7 @@ plot_dir: 'plots'                           # Change to '' if you don't want met
 perturbation_col: 'perturbation'            # Column name to look for in .obs that specifies the perturbation label
 ctrl_key: 'control'                         # Column value in .obs[perturbation_col] that represents control cells
 use_perturbation_pool: true                 # Filter every dataset for biggest common set of perturbations
+use_feature_pool: true                      # Filter for shared features across all datasets
 qc: true                                    # Do quality control on cells (e.g. check for percentage of mitochondiral counts)
 norm: false                                 # Apply sc.pp.normalize_total()
 log_norm: false                             # Apply log1p scaling

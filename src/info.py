@@ -42,22 +42,23 @@ def _overlap_hm(
         plt.show()
     else:
         o = os.path.join(plt_dir, f'{title}_overlap_hm.svg')
-        plt.savefig(o)
+        plt.savefig(o, bbox_inches='tight')
     if return_matrix:
         return overlap_matrix
 
-def collect_meta_from_files(input_files: list[str]) -> tuple[pd.DataFrame, list[pd.DataFrame]]:
+def collect_meta_from_files(input_files: list[str]) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     meta = []
-    vars = []
+    vars = dict()
     for file in input_files:
         if file.endswith('.h5ad'):
             logging.info(f'Reading meta data of {file}')
             adata = sc.read(file, backed='r')
             m, v = get_adata_meta(adata)
-            m['dataset'] = os.path.basename(file).split('.h5ad')[0]
+            ds_name = os.path.basename(file).split('.h5ad')[0]
+            m['dataset'] = ds_name
+            vars[ds_name] = v
             m.index = m.index.astype(str) + '_' + m['dataset'].astype(str)
             meta.append(m)
-            vars.append(v)
             adata.file.close()
     meta = pd.concat(meta, axis=0)
     return meta, vars
@@ -77,7 +78,7 @@ def _plot_cpp(meta: pd.DataFrame, plt_dir: str | None = None):
         plt.show()
     else:
         o = os.path.join(plt_dir, 'cells_per_perturbation.svg')
-        plt.savefig(o)
+        plt.savefig(o, bbox_inches='tight')
 
 def _plt_n_cells_per_dataset(meta: pd.DataFrame, plt_dir: str | None = None):
     df = pd.DataFrame(meta.dataset.value_counts()).reset_index()
@@ -93,7 +94,7 @@ def _plt_n_cells_per_dataset(meta: pd.DataFrame, plt_dir: str | None = None):
         plt.show()
     else:
         o = os.path.join(plt_dir, 'cells_per_dataset.svg')
-        plt.savefig(o)
+        plt.savefig(o, bbox_inches='tight')
 
 def _plt_n_cells_per_dataset(meta: pd.DataFrame, plt_dir: str | None = None):
     df = meta.groupby('dataset').perturbation.nunique().reset_index().sort_values('perturbation', ascending=False)
@@ -108,7 +109,7 @@ def _plt_n_cells_per_dataset(meta: pd.DataFrame, plt_dir: str | None = None):
         plt.show()
     else:
         o = os.path.join(plt_dir, 'perturbations_per_dataset.svg')
-        plt.savefig(o)
+        plt.savefig(o, bbox_inches='tight')
 
 def _plt_upset(meta: pd.DataFrame, plt_dir: str | None = None, min_set_size: int = 100):
     try:
@@ -127,21 +128,46 @@ def _plt_upset(meta: pd.DataFrame, plt_dir: str | None = None, min_set_size: int
         plt.show()
     else:
         o = os.path.join(plt_dir, 'perturbation_intersection_upset.svg')
-        plt.savefig(o)
+        plt.savefig(o, bbox_inches='tight')
 
-def _plt_meta_features(obs: pd.DataFrame, vars: list[pd.DataFrame], plt_dir: str | None = None):
+def _plt_feature_upset(var_dict: dict[str, pd.DataFrame], plt_dir: str | None = None, min_set_size: int = 100) -> None:
+    """Plot UpSet plot for feature overlap between datasets."""
+    try:
+        from upsetplot import UpSet, from_contents
+    except ImportError:
+        logging.warning(f'Install "upsetplot" to plot an UpSet plot. Skipping the plot.')
+        return None
+    # Define input sets
+    sets = {k: set(df.index) for k, df in var_dict.items()}
+    data = from_contents(sets)
+    # Plot
+    plt.figure(dpi=300)
+    us = UpSet(data, subset_size="count", sort_by="cardinality", min_subset_size=min_set_size, show_counts=True)
+    us.plot()
+    if plt_dir is None:
+        plt.show()
+    else:
+        o = os.path.join(plt_dir, 'feature_intersection_upset.svg')
+        plt.savefig(o, bbox_inches='tight')
+
+def _plt_meta_features(obs: pd.DataFrame, vars: dict[str, pd.DataFrame], plt_dir: str | None = None):
     logging.info('Plotting feature overlap.')
-    uv = [set(v.index) for v in vars]
-    _overlap_hm(groups=obs.dataset.unique(), unique_values=uv, title='features')
+    uv = [set(v.index) for v in vars.values()]
+    _overlap_hm(groups=obs.dataset.unique(), unique_values=uv, title='features', plt_dir=plt_dir)
+    _plt_feature_upset(vars, plt_dir=plt_dir)
     logging.info('Plotting perturbation overlap.')
     uv = obs.groupby('dataset')['perturbation'].unique()
-    _overlap_hm(groups=uv.index, unique_values=uv, title='Perc_perturbation')
+    _overlap_hm(groups=uv.index, unique_values=uv, title='perc_perturbation', plt_dir=plt_dir)
     logging.info('Plotting cells per perturbation distribution.')
-    _plot_cpp(obs, plt_dir)
+    _plot_cpp(obs, plt_dir=plt_dir)
     logging.info('Plotting intersection between perturbations in datasets.')
     _plt_upset(obs, plt_dir=plt_dir)
 
-def _calc_pool_datasets(meta: pd.DataFrame, min_set_size: int = 100, normalize: bool = False) -> list[str]:
+def _calc_pool_datasets(
+        meta: pd.DataFrame, 
+        min_set_size: int = 100, 
+        normalize: bool = False
+    ) -> list[str]:
     from itertools import combinations
 
     # Define all sets of unique perturbation labels
@@ -179,15 +205,31 @@ def _calc_pool_datasets(meta: pd.DataFrame, min_set_size: int = 100, normalize: 
     logging.info(f'Pool dim: {len(perturbation_pool)} gene-perturbations')
     return sorted(list(perturbation_pool))
 
+def _calc_feature_pool(vars: dict[str, pd.DataFrame]) -> None:
+    """Calculate overlap between indices of all datasets."""
+    feature_pool = set.intersection(*[set(v.index) for v in vars.values()])
+    logging.info(f'Found {len(feature_pool)} shared features across all datasets.')
+    return feature_pool
 
-def create_perturbation_pool(input_files: list[str], out_file: str, plt_dir: str | None = None, plot: bool = True):
+def create_meta_summary(
+        input_files: list[str],
+        perturbation_pool_file: str,
+        feature_pool_file: str,
+        plt_dir: str | None = None,
+        plot: bool = True,
+    ):
     # Collect meta data for all available datasets
-    obs, vars = collect_meta_from_files(input_files)
+    obs, vars_dict = collect_meta_from_files(input_files)
     # Calculate optimal perturbation pool
     perturbation_pool = _calc_pool_datasets(obs)
     # Save pool to output file
     pp = pd.DataFrame(perturbation_pool, columns=[OBS_KEYS.POOL_PERTURBATION_KEY])
-    pp.to_csv(out_file)
+    pp.to_csv(perturbation_pool_file)
+
+    # Calculate feature overlap and save to file
+    feature_pool = _calc_feature_pool(vars_dict)
+    fp = pd.DataFrame(feature_pool, columns=[OBS_KEYS.POOL_FEATURE_KEY])
+    fp.to_csv(feature_pool_file)
 
     # Choose to plot or not
     if plot:
@@ -195,6 +237,5 @@ def create_perturbation_pool(input_files: list[str], out_file: str, plt_dir: str
         if plt_dir is not None:
             os.makedirs(plt_dir, exist_ok=True)
         # Plot all basic meta related information about datasets
-        _plt_meta_features(obs, vars, plt_dir=plt_dir)
-    
+        _plt_meta_features(obs, vars_dict, plt_dir=plt_dir)
     

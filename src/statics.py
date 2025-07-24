@@ -20,6 +20,7 @@ class _OBS_KEYS_NT(NamedTuple):
     CELL_TYPE_KEY: str = 'celltype_broad'
     PERTURBATION_KEY: str = 'perturbation'
     POOL_PERTURBATION_KEY: str = 'pool_perturbation'
+    POOL_FEATURE_KEY: str = 'pool_feature'
     CTRL_KEY: str = 'control'
 
 class _SETTINGS(NamedTuple):
@@ -41,6 +42,9 @@ def _ctrl_keys():
         'non-targeting',
         'nt'
     ]
+
+def _misc_labels_keys():
+    return ['unknown', 'Non', 'NA']
 
 def _gene_symbol_keys():
     return [
@@ -111,5 +115,6 @@ FLOATS = _floats()
 P_COLS = _perturbation_cols()
 CTRL_KEYS = _ctrl_keys()
 GENE_SYMBOL_KEYS = _gene_symbol_keys()
+MISC_LABELS_KEYS = _misc_labels_keys()
 # Collect all params for hash
 PARAM_KEYS = [*STRINGS, *BOOLEANS, *INTS, *FLOATS]
