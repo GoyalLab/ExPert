@@ -13,6 +13,9 @@ dependencies:
   - r-remotes
   - r-biocmanager
   - r-igraph
+  - r-foreach
+  - r-doparallel
+  - r-dosnow
   - bioconductor-glmgampoi
   - bioconductor-singlecellexperiment
   - bioconductor-zellkonverter

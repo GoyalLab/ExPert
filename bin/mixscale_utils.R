@@ -13,6 +13,16 @@ library(SingleCellExperiment)
 library(dplyr)
 
 
+get_n_cores <- function(default = 1) {
+  job_id <- Sys.getenv("SLURM_JOB_ID")
+  if (job_id == "") {
+    return(default)
+  }
+  cpu_check_cmd <- paste0("squeue -j ", job_id, " -o '%C' | tail -n 1")
+  n.cores <- as.integer(system(cpu_check_cmd, intern = T))
+  return(n.cores)
+}
+
 read_h5ad_to_seurat <- function(adata_p, layer="X") {
   # Use zellkonverter to read sce
   message("Reading h5ad adata", adata_p)
@@ -133,17 +143,157 @@ convert_factors_to_characters <- function(df) {
   return(df)
 }
 
+find_markers <- function(object, ident.1, ident.2, group.by, assay, test.use, logfc.threshold, verbose = FALSE, min.pct = 0.1) {
+  tryCatch({
+    calc_deg_for_gene(object, gene, cells.s, labels, nt.class.name, 
+            assay, test.use, logfc.threshold, pval.cutoff)
+  }, error = function(e) {
+    message("Error processing gene ", gene, ": ", e$message)
+    return(NA)
+  })
+}
+
+# ---- Helper: Perform DEG for a single gene ----
+calc_deg_for_gene <- function(object, gene, cells.s, labels, nt.class.name, 
+                              assay, test.use, logfc.threshold, pval.cutoff) {
+  # Set identities
+  Idents(object) <- labels
+  # Get perturbed & control cells
+  orig.guide.cells <- intersect(WhichCells(object, idents = gene), cells.s)
+  nt.cells <- intersect(WhichCells(object, idents = nt.class.name), cells.s)
+
+  # Try to calculate DEGs
+  deg.result <- data.frame()
+  tryCatch({
+    deg.result <- FindMarkers(
+      object, ident.1 = orig.guide.cells, ident.2 = nt.cells,
+      group.by = labels, assay = assay, 
+      test.use = test.use, logfc.threshold = logfc.threshold, 
+      verbose = FALSE, min.pct = 0.1
+    )
+    # Filter by p-value
+    deg.result <- deg.result[deg.result$p_val_adj < pval.cutoff, ]
+    # Add combined score
+    deg.result$score <- abs(deg.result$avg_log2FC) * -log10(deg.result$p_val_adj)
+  }, error = function(e) {
+    message("Error processing gene ", gene, ": ", e$message)
+  })
+  
+  # Return object
+  return(list(genes = rownames(deg.result), result = deg.result))
+}
+
+# ---- Sequential version ----
+calc_degs_iterative <- function(object, assay = "RNA", labels = "perturbation", 
+                                nt.class.name = "control", logfc.threshold = 0.2, 
+                                verbose = FALSE, pval.cutoff = 0.05, 
+                                seed = 42, test.use = "wilcox") {
+  message("Calculating DEGs iteratively.")
+  if (is.null(labels)) stop("Please specify target gene class metadata name")
+  
+  # Prepare identities and gene list
+  Idents(object) <- "con1"
+  cells.s <- WhichCells(object, idents = "con1")
+  genes <- setdiff(unique(object[[labels]][cells.s, 1]), nt.class.name)
+  
+  # Loop over genes
+  results_list <- lapply(genes, function(gene) {
+    if (verbose) message("Processing ", gene)
+    calc_deg_for_gene(object, gene, cells.s, labels, nt.class.name, 
+                      assay, test.use, logfc.threshold, pval.cutoff)
+  })
+  
+  # Combine
+  DE.genes <- setNames(lapply(results_list, `[[`, "genes"), genes)
+  results <- setNames(lapply(results_list, `[[`, "result"), genes)
+  return(list(genes = DE.genes, results = results))
+}
+
+# ---- Parallel version ----
+calc_degs_parallel <- function(object, assay = "RNA", labels = "perturbation", 
+                               nt.class.name = "control", logfc.threshold = 0.2, 
+                               verbose = FALSE, pval.cutoff = 0.05, 
+                               seed = 42, test.use = "wilcox",
+                               n.cores = 10) {
+  library(foreach)
+  library(doParallel)
+  message("Calculating DEGs in parallel with: ", n.cores, " cores.")
+  if (is.null(labels)) stop("Please specify target gene class metadata name")
+  
+  # Prepare identities and gene list
+  Idents(object) <- "con1"
+  cells.s <- WhichCells(object, idents = "con1")
+  genes <- setdiff(unique(object[[labels]][cells.s, 1]), nt.class.name)
+  
+  # Setup parallel backend
+  registerDoParallel(cores = n.cores)
+  
+  # Main parallel execution
+  results_list <- foreach(gene = genes, .packages = "Seurat", .export = c("calc_deg_for_gene")) %dopar% {
+    calc_deg_for_gene(object, gene, cells.s, labels, nt.class.name, 
+              assay, test.use, logfc.threshold, pval.cutoff)
+  }
+  # Remove NA entries
+  results_list <- results_list[!is.na(results_list)]
+  # Combine results
+  DE.genes <- setNames(lapply(results_list, `[[`, "genes"), genes)
+  results <- setNames(lapply(results_list, `[[`, "results"), genes)
+  return(list(genes = DE.genes, results = results))
+}
+
+
+calc_degs_parallel_no_log <- function(object, assay = "RNA", labels = "perturbation", 
+                               nt.class.name = "control", logfc.threshold = 0.2, 
+                               verbose = FALSE, pval.cutoff = 0.05, 
+                               seed = 42, test.use = "wilcox",
+                               n.cores = 10) {
+  library(foreach)
+  library(doParallel)
+  
+  message("Calculating DEGs in parallel with:.")
+  if (is.null(labels)) stop("Please specify target gene class metadata name")
+  
+  # Prepare identities and gene list
+  Idents(object) <- "con1"
+  cells.s <- WhichCells(object, idents = "con1")
+  genes <- setdiff(unique(object[[labels]][cells.s, 1]), nt.class.name)
+  
+  # Parallel backend
+  cl <- makeCluster(n.cores)
+  registerDoParallel(cl)
+  handlers(global = T)
+  
+  # Parallel loop with progress
+  with_progress({
+    p <- progressor(along = genes)
+    results_list <- foreach(gene = genes, .packages = "Seurat", .export = c("calc_deg_for_gene")) %dopar% {
+      if (verbose) p(sprintf("Processing %s", gene))
+      calc_deg_for_gene(object, gene, cells.s, labels, nt.class.name, 
+              assay, test.use, logfc.threshold, pval.cutoff)
+    }
+  })
+  stopCluster(cl)
+  # Remove NA entries
+  results_list <- results_list[!is.na(results_list)]
+  # Combine
+  DE.genes <- setNames(lapply(results_list, `[[`, "genes"), genes)
+  results <- setNames(lapply(results_list, `[[`, "result"), genes)
+  return(list(genes = DE.genes, results = results))
+}
+
 
 mixscale_pipeline <- function(
     seurat_obj, 
     assay = "originalexp", slot = "data", 
     condition_col = "perturbation", ctrl_col = "control",
     split_by = NULL,
+    de.assay = "RNA",
     ndims = 50, nneighbors = 15, max.de.genes = 100,
     min.de.genes = 2, logfc.threshold = 0.2,
     adjust_low_deg = T,
     verbose = F, cache = F,
-    clear_mem = F
+    clear_mem = F,
+    n_cores = 1
 ) {
   # Check number of perturbations
   if (length(unique(seurat_obj@meta.data[[condition_col]])) < 2) {
@@ -158,6 +308,30 @@ mixscale_pipeline <- function(
   }
   # Add ctrl label to object
   seurat_obj <- add_ctrl_label(seurat_obj, perturbation_col = condition_col, ctrl_key = ctrl_col)
+  # Calculate DEGs and save in obj
+  parallel_available <- requireNamespace("doParallel", quietly = T) &&
+    requireNamespace("foreach", quietly = T)
+  if (n_cores > 1 && parallel_available) {
+    DE.genes.result.list <- calc_degs_parallel(
+      object = seurat_obj,
+      assay = assay,
+      labels = condition_col,
+      nt.class.name = ctrl_col,
+      logfc.threshold = logfc.threshold,
+      verbose = verbose,
+      n.cores = n_cores,
+    )
+  } else {
+    DE.genes.result.list <- calc_degs_iterative(
+      object = seurat_obj,
+      assay = assay,
+      labels = condition_col,
+      nt.class.name = ctrl_col,
+      logfc.threshold = logfc.threshold,
+      verbose = verbose
+    )
+  }
+  
   if ((!"PRTB" %in% names(seurat_obj@assays) || (!cache))) {
     # Calculate Perturbation signatures 
     seurat_obj <- CalcPerturbSig(
@@ -183,6 +357,7 @@ mixscale_pipeline <- function(
   # Mixscale
   seurat_obj <- RunMixscale(
     object = seurat_obj, 
+    DE.gene = DE.genes.result.list[["genes"]],
     assay = "PRTB", 
     slot = "scale.data", 
     labels = condition_col, 
@@ -202,6 +377,8 @@ mixscale_pipeline <- function(
     # Set perturbations with too little DEGs to 0 instead 1
     seurat_obj <- adjust_low_deg_mixscale(seurat_obj, summary_stats)
   }
+  # Save DEGs to object
+  seurat_obj@tools[["deg"]] <- DE.genes.result.list
   return(seurat_obj)
 }
 

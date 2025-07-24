@@ -4,7 +4,7 @@ parser <- ArgumentParser(description = "Parser for mixscale pipeline.")
 
 # Add argument
 parser$add_argument("-i", "--input", required = T, help = "Path to input h5ad file.")
-parser$add_argument("-o", "--output", required = T, help = "Path to output csv file.")
+parser$add_argument("-o", "--output", required = T, help = "Path to output h5ad file.")
 parser$add_argument("-d", "--min_deg", required = F, default = 5,
                     help = "Minimum number of differentially expressed genes vs. control per perturbation, default is 5 (int)")
 parser$add_argument("-t", "--threshold", required = F, default = 2,
@@ -17,6 +17,8 @@ parser$add_argument("-s", "--save_seurat", required = F, default = F,
                     help = "Whether to save the seurat_obj to disk or not.")
 parser$add_argument("-w", "--work_dir", required = F, default = "./",
                     help = "Give path to current working directory of pipeline.")
+parser$add_argument("-n", "--n_cores", required = F, default = 1,
+                    help = "Number of cores to use for parallel calculations.")
 
 # Parse args
 args <- parser$parse_args()
@@ -32,6 +34,8 @@ ctrl_dev <- args$threshold
 perturbation_col <- args$pcol
 ctrl_key <- args$ctrl
 save_seurat <- args$save_seurat
+n.cores <- get_n_cores(default = args$n_cores)
+ds_name <- file_path_sans_ext(basename(adata_p))
 
 # 1. Read h5ad to Seurat object (this approach still doubles the memory, but works)
 seurat_obj <- read_h5ad_to_seurat(adata_p)
@@ -39,9 +43,11 @@ seurat_obj <- read_h5ad_to_seurat(adata_p)
 seurat_obj <- mixscale_pipeline(
   seurat_obj,
   condition_col = perturbation_col,
+  assay = "originalexp",
   ctrl_col = ctrl_key,
   min.de.genes = min_deg,
-  verbose = T
+  verbose = T, cache = T,
+  n_cores = n_cores,
 )
 # 3. Write filtered object to disk (optional)
 if (save_seurat) {
@@ -53,6 +59,27 @@ if (save_seurat) {
 # 3.2 Save meta-data
 message("Saving meta-data.")
 write.csv(seurat_obj@meta.data, file = paste0(file_path_sans_ext(out_p), '_obs.csv'), quote = F)
+# 3.3 Save DEGs for each perturbation as
+if (max(seurat_obj$mixscale_score)!=0) {
+  message("Saving DEGs for each perturbation")
+  DE.genes.result.list <- seurat_obj@tools$deg
+  # Extract all features of object
+  all_features <- rownames(seurat_obj@assays$originalexp@meta.features)
+  # Create mask of degs per perturbation
+  deg.per.perturbation <- as.data.frame(sapply(DE.genes.result.list$genes, function(x) {
+    all_features %in% x
+  }))
+  # Label features
+  rownames(deg.per.perturbation) <- all_features
+  # Convert to binary mask
+  deg.per.perturbation <- deg.per.perturbation * 1
+  # Store in object
+  seurat_obj@reductions$deg_mask <- deg.per.perturbation
+  # Write to file
+  deg.o = paste0(file_path_sans_ext(out_p), '_deg_mask.csv')
+  write.csv(deg.per.perturbation, file = deg.o, quote = F)
+}
+
 # 4. Subset by mixscale score threshold and include control cells in filtering
 message("Filtering dataset based on absolute mixscore > ", ctrl_dev)
 # 4.1 Filter with combined mask
