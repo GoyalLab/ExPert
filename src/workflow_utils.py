@@ -69,6 +69,7 @@ def get_job_resources(resource_config: dict, job_name: str, partition_prio: str 
     # Get resource configs for job from defaults.yaml with updates by user
     time: str = resource_config['jobs'][job_name]['time']
     mem: str = resource_config['jobs'][job_name]['mem']
+    threads: int = resource_config['jobs'][job_name].get('threads')
     partition: str = resource_config['partitions']['default']
     # Get maximum memory cap of default partition
     max_default_mem: int = resource_config['memory']['max_mem']
@@ -86,6 +87,8 @@ def get_job_resources(resource_config: dict, job_name: str, partition_prio: str 
     o = {'time': time, 'mem': mem}
     if partition != '':
         o['partition'] = partition
+    if threads is not None:
+        o['threads'] = threads
     return o
 
 

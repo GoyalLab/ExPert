@@ -3,22 +3,22 @@ library(argparse)
 parser <- ArgumentParser(description = "Parser for mixscale pipeline.")
 
 # Add argument
-parser$add_argument("-i", "--input", required = T, help = "Path to input h5ad file.")
-parser$add_argument("-o", "--output", required = T, help = "Path to output h5ad file.")
-parser$add_argument("-d", "--min_deg", required = F, default = 5,
-                    help = "Minimum number of differentially expressed genes vs. control per perturbation, default is 5 (int)")
-parser$add_argument("-t", "--threshold", required = F, default = 2,
-                    help = "Number of standart deviations from control group to filter cells for, default is 2 (float)")
-parser$add_argument("-p", "--pcol", required = F, default = "perturbation",
-                    help = "Column that labels the perturbation in meta data, default is 'perturbation' (string)")
-parser$add_argument("-c", "--ctrl", required = F, default = "control",
-                    help = "Control label, default is 'control' (string)")
-parser$add_argument("-s", "--save_seurat", required = F, default = F,
-                    help = "Whether to save the seurat_obj to disk or not.")
-parser$add_argument("-w", "--work_dir", required = F, default = "./",
-                    help = "Give path to current working directory of pipeline.")
-parser$add_argument("-n", "--n_cores", required = F, default = 1,
-                    help = "Number of cores to use for parallel calculations.")
+parser$add_argument("-i", "--input", type = "character", required = TRUE, help = "Path to input h5ad file.")
+parser$add_argument("-o", "--output", type = "character", required = TRUE, help = "Path to output h5ad file.")
+parser$add_argument("-d", "--min_deg", type = "integer", required = FALSE, default = 5,
+          help = "Minimum number of differentially expressed genes vs. control per perturbation, default is 5 (int)")
+parser$add_argument("-t", "--threshold", type = "double", required = FALSE, default = 2,
+          help = "Number of standart deviations from control group to filter cells for, default is 2 (float)")
+parser$add_argument("-p", "--pcol", type = "character", required = FALSE, default = "perturbation",
+          help = "Column that labels the perturbation in meta data, default is 'perturbation' (string)")
+parser$add_argument("-c", "--ctrl", type = "character", required = FALSE, default = "control",
+          help = "Control label, default is 'control' (string)")
+parser$add_argument("-s", "--save_seurat", type = "logical", required = FALSE, default = FALSE,
+          help = "Whether to save the seurat_obj to disk or not.")
+parser$add_argument("-w", "--work_dir", type = "character", required = FALSE, default = "./",
+          help = "Give path to current working directory of pipeline.")
+parser$add_argument("-n", "--n_cores", type = "integer", required = FALSE, default = 1,
+          help = "Number of cores to use for parallel calculations.")
 
 # Parse args
 args <- parser$parse_args()
@@ -34,8 +34,10 @@ ctrl_dev <- args$threshold
 perturbation_col <- args$pcol
 ctrl_key <- args$ctrl
 save_seurat <- args$save_seurat
-n.cores <- get_n_cores(default = args$n_cores)
+n_cores <- args$n_cores
 ds_name <- file_path_sans_ext(basename(adata_p))
+# Log setup
+print(args)
 
 # 1. Read h5ad to Seurat object (this approach still doubles the memory, but works)
 seurat_obj <- read_h5ad_to_seurat(adata_p)
@@ -46,7 +48,7 @@ seurat_obj <- mixscale_pipeline(
   assay = "originalexp",
   ctrl_col = ctrl_key,
   min.de.genes = min_deg,
-  verbose = T, cache = T,
+  verbose = T,
   n_cores = n_cores,
 )
 # 3. Write filtered object to disk (optional)
@@ -73,8 +75,6 @@ if (max(seurat_obj$mixscale_score)!=0) {
   rownames(deg.per.perturbation) <- all_features
   # Convert to binary mask
   deg.per.perturbation <- deg.per.perturbation * 1
-  # Store in object
-  seurat_obj@reductions$deg_mask <- deg.per.perturbation
   # Write to file
   deg.o = paste0(file_path_sans_ext(out_p), '_deg_mask.csv')
   write.csv(deg.per.perturbation, file = deg.o, quote = F)
@@ -99,3 +99,5 @@ seurat_obj[["originalexp"]]@meta.features <- convert_factors_to_characters(seura
 SaveH5Seurat(seurat_obj, filename = tmp_out_p)
 Convert(tmp_out_p, dest = 'h5ad', assay = "originalexp", X.layer = "data", overwrite = T)
 rm_tmp_seurat_file <- file.remove(tmp_out_p)
+# Print session info
+sessionInfo()
