@@ -164,7 +164,7 @@ if config['mixscale_filter']:
             time = config['resources']['jobs']['filter_cells_by_efficiency']['time'],
             mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
             partition = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.PARTITION],
-            threads = config['resources']['jobs']['filter_cells_by_efficiency'].get('threads', 1),
+            cpus_per_task = int(config['resources']['jobs']['filter_cells_by_efficiency'].get('threads', 1)),
         shell:
             """
             Rscript workflow/scripts/mixscale.R \\
@@ -172,9 +172,9 @@ if config['mixscale_filter']:
             -o {output.filtered_file} \\
             -d {params.min_deg} \\
             -t {params.ctrl_dev} \\
-            -p {params.perturbation_col} \\
+            --pcol {params.perturbation_col} \\
             -c {params.ctrl_key} \\
-            -n {resources.threads}
+            -n {resources.cpus_per_task}
             """
 else:
     # Skip this step and set output to previous step
