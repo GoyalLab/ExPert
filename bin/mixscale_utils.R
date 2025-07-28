@@ -143,16 +143,6 @@ convert_factors_to_characters <- function(df) {
   return(df)
 }
 
-find_markers <- function(object, ident.1, ident.2, group.by, assay, test.use, logfc.threshold, verbose = FALSE, min.pct = 0.1) {
-  tryCatch({
-    calc_deg_for_gene(object, gene, cells.s, labels, nt.class.name, 
-            assay, test.use, logfc.threshold, pval.cutoff)
-  }, error = function(e) {
-    message("Error processing gene ", gene, ": ", e$message)
-    return(NA)
-  })
-}
-
 # ---- Helper: Perform DEG for a single gene ----
 calc_deg_for_gene <- function(object, gene, cells.s, labels, nt.class.name, 
                               assay, test.use, logfc.threshold, pval.cutoff) {
@@ -161,7 +151,7 @@ calc_deg_for_gene <- function(object, gene, cells.s, labels, nt.class.name,
   # Get perturbed & control cells
   orig.guide.cells <- intersect(WhichCells(object, idents = gene), cells.s)
   nt.cells <- intersect(WhichCells(object, idents = nt.class.name), cells.s)
-
+  
   # Try to calculate DEGs
   deg.result <- data.frame()
   tryCatch({
@@ -231,7 +221,7 @@ calc_degs_parallel <- function(object, assay = "RNA", labels = "perturbation",
   # Main parallel execution
   results_list <- foreach(gene = genes, .packages = "Seurat", .export = c("calc_deg_for_gene")) %dopar% {
     calc_deg_for_gene(object, gene, cells.s, labels, nt.class.name, 
-              assay, test.use, logfc.threshold, pval.cutoff)
+                      assay, test.use, logfc.threshold, pval.cutoff)
   }
   # Remove NA entries
   results_list <- results_list[!is.na(results_list)]
@@ -243,10 +233,10 @@ calc_degs_parallel <- function(object, assay = "RNA", labels = "perturbation",
 
 
 calc_degs_parallel_no_log <- function(object, assay = "RNA", labels = "perturbation", 
-                               nt.class.name = "control", logfc.threshold = 0.2, 
-                               verbose = FALSE, pval.cutoff = 0.05, 
-                               seed = 42, test.use = "wilcox",
-                               n.cores = 10) {
+                                      nt.class.name = "control", logfc.threshold = 0.2, 
+                                      verbose = FALSE, pval.cutoff = 0.05, 
+                                      seed = 42, test.use = "wilcox",
+                                      n.cores = 10) {
   library(foreach)
   library(doParallel)
   
@@ -269,7 +259,7 @@ calc_degs_parallel_no_log <- function(object, assay = "RNA", labels = "perturbat
     results_list <- foreach(gene = genes, .packages = "Seurat", .export = c("calc_deg_for_gene")) %dopar% {
       if (verbose) p(sprintf("Processing %s", gene))
       calc_deg_for_gene(object, gene, cells.s, labels, nt.class.name, 
-              assay, test.use, logfc.threshold, pval.cutoff)
+                        assay, test.use, logfc.threshold, pval.cutoff)
     }
   })
   stopCluster(cl)
@@ -287,7 +277,6 @@ mixscale_pipeline <- function(
     assay = "originalexp", slot = "data", 
     condition_col = "perturbation", ctrl_col = "control",
     split_by = NULL,
-    de.assay = "RNA",
     ndims = 50, nneighbors = 15, max.de.genes = 100,
     min.de.genes = 2, logfc.threshold = 0.2,
     adjust_low_deg = T,
