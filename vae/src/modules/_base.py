@@ -13,14 +13,6 @@ from torch.distributions import Normal
 def _identity(x):
     return x
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Iterable
-
-
-
 class Block(nn.Module):
     """Simple layer block"""
 
@@ -34,7 +26,7 @@ class Block(nn.Module):
             use_activation: bool = True,
             use_attention: bool = True,
             dropout_rate: float = 0.1,
-            activation_fn: nn.Module = nn.ReLU,
+            activation_fn: nn.Module = nn.LeakyReLU,
             bias: bool = True,
         ):
         super().__init__()
@@ -110,7 +102,7 @@ class FunnelFCLayers(nn.Module):
         bias: bool = True,
         inverted: bool = False,
         inject_covariates: bool = True,
-        activation_fn: nn.Module = nn.ReLU,
+        activation_fn: nn.Module = nn.LeakyReLU,
         **kwargs,
     ):
         super().__init__()
@@ -235,7 +227,7 @@ class FCLayers(nn.Module):
         use_attention: bool = False,
         bias: bool = True,
         inject_covariates: bool = True,
-        activation_fn: nn.Module = nn.ReLU,
+        activation_fn: nn.Module = nn.LeakyReLU,
         **kwargs
     ):
         super().__init__()
@@ -542,7 +534,7 @@ class Encoder(nn.Module):
 
         """
         feature_mask = None
-        if self.use_feature_mask:
+        if self.use_feature_mask and self.drop_prob > 0:
             # Sample mask: 1 for keep, 0 for drop
             feature_mask = torch.bernoulli(torch.full((self.n_input,), 1 - self.drop_prob))  # shape: (num_features,)
             feature_mask = feature_mask.view(1, -1)  # shape: (1, num_features)
@@ -702,7 +694,7 @@ class EmbeddingClassifier(nn.Module):
         logits: bool = True,  # <- for CE loss, return logits
         use_batch_norm: bool = True,
         use_layer_norm: bool = False,
-        activation_fn: nn.Module = nn.ReLU,
+        activation_fn: nn.Module = nn.LeakyReLU,
         class_embed_dim: int = 128,
         use_multihead: bool = False,
         use_cosine_similarity: bool = True,

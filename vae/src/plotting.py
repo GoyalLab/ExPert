@@ -132,20 +132,28 @@ def plot_soft_predictions(model: nn.Module, adata: ad.AnnData | None = None, mod
     from sklearn.metrics import precision_recall_fscore_support
     from tqdm import tqdm
 
+    # Split into sets
+    if mode == 'train':
+        idx = model.train_indices
+    elif mode == 'val':
+        idx = model.validation_indices
+    elif mode == 'test':
+        idx = None
+
     if adata is None:
         # Fall back to model's adata
         adata = model.adata
     else:
         # Validate new adata
         model._validate_anndata(adata)
-    # Split into sets
-    idx = model.train_indices if mode == 'train' else model.validation_indices
-    data = adata[idx].copy()
+        idx = np.arange(adata.shape[0])
+
+    data = adata[idx].copy() if idx is not None else adata
     data.obs['idx'] = idx
     data = data[data.obs.perturbation!='control']
     soft_predictions = model.predict(indices=data.obs['idx'].values, soft=True)
     # Plot wo ctrl
-    n_labels = adata.uns['CLS_EMB_INIT']['n_train_labels']
+    n_labels = adata.obs.perturbation.nunique()
     y = data.obs._scvi_labels.values
     labels = data.obs.cls_label.values
     max_idx = np.argsort(soft_predictions, axis=1)

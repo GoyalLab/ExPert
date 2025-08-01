@@ -17,6 +17,17 @@ from torch.distributions.utils import (
 )
 from scvi import settings
 
+def rescale_targets(x: torch.Tensor, scale: float = 4, min: float = -1.0, max: float = 1.0) -> torch.Tensor:
+    """Rescale and clamp tensor values to specified range.
+    
+    Args:
+        x: Input tensor
+        scale: Scaling factor for standardized values
+        min: Minimum allowed value 
+        max: Maximum allowed value
+    """
+    return torch.clamp((x - x.mean()) * scale, min=min, max=max)
+
 def log_mixture_normal(
     x: torch.Tensor,
     mu_1: torch.Tensor,

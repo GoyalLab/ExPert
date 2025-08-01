@@ -37,7 +37,8 @@ def _compute_weight(
     max_weight: float | None = 1.0,
     min_weight: float | None = 0.0,
     schedule: Literal["linear", "sigmoid", "exponential"] = "sigmoid",
-    anneal_k: float = 10.0
+    anneal_k: float = 10.0,
+    invert: bool = False
 ) -> float:
     if min_weight is None:
         min_weight = 0.0
@@ -48,7 +49,7 @@ def _compute_weight(
 
     # Apply stall
     if n_epochs_stall is not None and epoch < n_epochs_stall:
-        return 0.0
+        return max_weight if invert else 0.0
     if n_epochs_stall:
         epoch -= n_epochs_stall
         n_epochs_warmup -= n_epochs_stall
@@ -61,7 +62,7 @@ def _compute_weight(
         t = step
         T = n_steps_warmup
     else:
-        return max_weight
+        return 0.0 if invert else max_weight
 
     t = min(t, T)
 
@@ -73,8 +74,9 @@ def _compute_weight(
         w = _exponential_schedule(t, T, anneal_k)
     else:
         raise ValueError(f"Invalid schedule type: '{schedule}'")
-
-    return min_weight + slope * w
+    # Get final weight
+    weight = min_weight + slope * w
+    return max_weight - weight if invert else weight
 
 
 class SemiSupervisedTrainingPlan(TrainingPlan):
@@ -549,6 +551,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         log_full_val: bool = True,
         freeze_encoder_epoch: int | None = None,
         cls_emb: torch.Tensor | None = None,
+        cls_emb_mode: Literal["fixed", "full", "sample"] = "fixed",
         incl_n_unseen: int | None = 200,
         anneal_schedules: dict[str, dict[str | float]] | None = None,
         full_val_log_every_n_epoch: int = 10,
@@ -578,6 +581,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.n_classes = n_classes
         self.use_posterior_mean = use_posterior_mean
         self.cls_emb = cls_emb
+        self.cls_emb_mode = cls_emb_mode
         self.incl_n_unseen = incl_n_unseen
         self.use_cls_scores = use_cls_scores
         # Contrastive params
@@ -636,6 +640,21 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def contrastive_loss_weight(self):
         """Scaling factor on contrastive weight during training. Consider Jax"""
         kwargs = self.anneal_schedules.get('contrastive_loss_weight', {})
+        klw = _compute_weight(
+            self.current_epoch,
+            self.global_step,
+            self.n_epochs_warmup,
+            self.n_steps_warmup,
+            **kwargs
+        )
+        return (
+            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
+        )
+    
+    @property
+    def class_kl_temperature(self):
+        """Scaling factor on contrastive weight during training. Consider Jax"""
+        kwargs = self.anneal_schedules.get('class_kl_temperature', {})
         klw = _compute_weight(
             self.current_epoch,
             self.global_step,
@@ -767,13 +786,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
         self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "train" or self.use_posterior_mean == "both"})
+        self.loss_kwargs.update({"class_kl_temperature": self.class_kl_temperature})
         # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
         # Add external embedding to batch
         if self.cls_emb is not None:
             # Add embedding for classes that are not in the training data
-            batch[REGISTRY_KEYS.CLS_EMB_KEY] = self._get_batch_class_embedding(mode='sample', batch_idx=batch_idx)
+            batch[REGISTRY_KEYS.CLS_EMB_KEY] = self._get_batch_class_embedding(mode=self.cls_emb_mode)
         # Choose to use class scores for scaling or not
         input_kwargs['use_cls_scores'] = self.use_cls_scores in ['train', 'both']
         # Perform full forward pass of model
@@ -835,13 +855,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight if self.use_contr_in_val else 0.0})
         self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "train" or self.use_posterior_mean == "both"})
+        self.loss_kwargs.update({"class_kl_temperature": self.class_kl_temperature})
         # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
         # Add external embedding to batch
         if self.cls_emb is not None:
             # Add embedding for classes that are not in the training data
-            batch[REGISTRY_KEYS.CLS_EMB_KEY] = self._get_batch_class_embedding(mode='fixed')
+            batch[REGISTRY_KEYS.CLS_EMB_KEY] = self._get_batch_class_embedding(mode=self.cls_emb_mode)
         # Choose to use class scores for scaling or not
         input_kwargs['use_cls_scores'] = self.use_cls_scores in ['train', 'both']
         # Perform model forward pass
@@ -989,6 +1010,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight if self.use_contr_in_val else 0.0})
                 self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
                 self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == mode or self.use_posterior_mean == "both"})
+                self.loss_kwargs.update({"class_kl_temperature": self.class_kl_temperature})
                 # Setup kwargs
                 input_kwargs = {}
                 input_kwargs.update(self.loss_kwargs)
