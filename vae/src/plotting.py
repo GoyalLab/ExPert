@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import os
 import seaborn as sns
-from sklearn.metrics import confusion_matrix
 import anndata as ad
 import logging
 import scanpy as sc
@@ -33,7 +32,7 @@ def get_latest_tensor_dir(d: str) -> str:
 
 
 def plot_confusion(y_true, y_pred, figsize=(10, 8), hm_kwargs={'annot': False}, verbose=False, plt_file=None):
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
     
     # Get class labels (for multiclass classification, this will correspond to unique labels)
     class_labels = np.unique(y_true)
@@ -76,18 +75,18 @@ def get_model_latent(model, mode) -> ad.AnnData:
         idx = model.test_indices
     else:
         raise ValueError(f'Model does not have indices for mode: {mode}, has to be one of [train, val, test]')
-    lr = model.get_latent_representation(indices=idx)
-    if isinstance(lr, dict):
-        z = lr[MODULE_KEYS.Z_KEY]
-        zg = lr[MODULE_KEYS.ZG_KEY]
-    else:
-        z = lr
-        zg = None
+    z = model.get_latent_representation(indices=idx)
+    
     latent = ad.AnnData(z)
     latent.obs = model.adata.obs.iloc[idx,:].copy()
-    latent.obs[MODULE_KEYS.PREDICTION_KEY] = model.predict(indices=idx)
-    if zg is not None:
-        latent.obsm[MODULE_KEYS.ZG_KEY] = zg
+    pred = model.predict(indices=idx)
+    if isinstance(pred, tuple):
+        predictions, cz = pred
+    else:
+        predictions, cz = pred, None
+    latent.obs[MODULE_KEYS.PREDICTION_KEY] = predictions
+    if cz is not None:
+        latent.obsm[MODULE_KEYS.ZG_KEY] = cz
     return latent
 
 def calc_umap(adata: ad.AnnData, rep='X') -> None:
@@ -103,13 +102,15 @@ def add_labels(summary: pd.DataFrame, cls_labels: List[str]) -> None:
     label_df.columns = cls_labels
     summary.loc[:,cls_labels] = label_df
 
-def get_classification_report(latent: ad.AnnData, cls_label: str, mode: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def get_classification_report(latent: ad.AnnData, cls_label: str, mode: str, prediction_key: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     from sklearn.metrics import classification_report
+
+    prediction_key = MODULE_KEYS.PREDICTION_KEY if prediction_key is None else prediction_key
 
     report = classification_report(
         latent.obs[cls_label],
-        latent.obs[MODULE_KEYS.PREDICTION_KEY],
-        zero_division=0,
+        latent.obs[prediction_key],
+        zero_division=np.nan,
         output_dict=True
     )
     report_df = pd.DataFrame(report).transpose()
@@ -128,10 +129,7 @@ def plot_performance_support_corr(summary: pd.DataFrame, o: str):
     plt.savefig(o, dpi=300, bbox_inches='tight')
     plt.close()
 
-def plot_soft_predictions(model: nn.Module, adata: ad.AnnData | None = None, mode: str = 'val', plt_dir: str | None = None, n: int = 10) -> pd.DataFrame:
-    from sklearn.metrics import precision_recall_fscore_support
-    from tqdm import tqdm
-
+def get_soft_predictions(model: nn.Module, adata: ad.AnnData | None = None, mode: str = 'val') -> tuple[pd.DataFrame, pd.DataFrame]:
     # Split into sets
     if mode == 'train':
         idx = model.train_indices
@@ -151,9 +149,17 @@ def plot_soft_predictions(model: nn.Module, adata: ad.AnnData | None = None, mod
     data = adata[idx].copy() if idx is not None else adata
     data.obs['idx'] = idx
     data = data[data.obs.perturbation!='control']
-    soft_predictions = model.predict(indices=data.obs['idx'].values, soft=True)
+    soft_predictions = model.predict(adata=adata, indices=data.obs['idx'].values, soft=True)
+    if isinstance(soft_predictions, tuple):
+        soft_predictions, _ = soft_predictions
+    return soft_predictions, data
+
+def plot_soft_predictions(model: nn.Module, data: ad.AnnData, soft_predictions: pd.DataFrame, mode: str = 'val', plt_dir: str | None = None, n: int = 10) -> pd.DataFrame:
+    from sklearn.metrics import precision_recall_fscore_support
+    from tqdm import tqdm
+
     # Plot wo ctrl
-    n_labels = adata.obs.perturbation.nunique()
+    n_labels = model.adata.obs._scvi_labels.nunique()
     y = data.obs._scvi_labels.values
     labels = data.obs.cls_label.values
     max_idx = np.argsort(soft_predictions, axis=1)
@@ -204,8 +210,9 @@ def plot_soft_predictions(model: nn.Module, adata: ad.AnnData | None = None, mod
     plt.xlabel('Number of top predictions')
     plt.ylim([0.0, 1.0])
     plt.ylabel('F1-score per class')
-    plt.title(f'Validation F1-score distribution over top predictions (N={model.summary_stats.n_labels})', pad=20)
+    plt.title(f'{mode.capitalize()} F1-score distribution over top predictions (N={model.summary_stats.n_labels})', pad=20)
     plt.savefig(f1_p, dpi=300, bbox_inches='tight')
+    plt.close()
     return top_n_predictions
 
 def plot_model_results_mode(latent: ad.AnnData, mode: str, batch_key: str, cls_labels: list[str], plt_dir: str, cm: bool = True, add_key: str = '') -> None:
@@ -347,29 +354,37 @@ def get_model_results(
         max_classes: int = 200,
         save_ad: bool = False,
     ) -> tuple[pd.DataFrame, ad.AnnData]:
+    # Get latest lighntning directory
     version_dir = get_latest_tensor_dir(log_dir)
     plt_dir = os.path.join(version_dir, 'plots')
     os.makedirs(plt_dir, exist_ok=True)
+    # Save model itself
+    if save:
+        model.save(dir_path=os.path.join(version_dir, 'model'), save_anndata=save_ad, overwrite=True)
     # plot for each mode
     summaries = []
     class_reports = []
     latents = []
     soft_predictions = []
+    soft_preds = []
+    # Get model batch and class keys
+    batch_key = model.registry_['setup_args']['batch_key']
+    cls_label = model.registry_['setup_args']['labels_key']
     for mode in modes:
         logging.info(f'Processing {mode} set')
         latent = get_model_latent(model, mode).copy()
-        batch_key = model.registry_['setup_args']['batch_key']
-        cls_label = model.registry_['setup_args']['labels_key']
         summary, class_report = get_classification_report(latent, cls_label, mode)
+        soft_pred, mode_data = get_soft_predictions(model, mode=mode)
         summaries.append(summary)
         class_reports.append(class_report)
+        soft_preds.append(soft_pred)
         # Add classification labels to class performance report
         add_labels(class_report, cls_labels)
         if plot:
             calc_umap(latent)
             plot_model_results_mode(latent, mode, batch_key, cls_labels, plt_dir)
             plot_performance_support_corr(class_report, os.path.join(plt_dir, f'{mode}_support_corr.svg'))
-            soft_predictions_mode = plot_soft_predictions(model, mode=mode, plt_dir=plt_dir)
+            soft_predictions_mode = plot_soft_predictions(model, data=mode_data, soft_predictions=soft_pred, mode=mode, plt_dir=plt_dir)
             soft_predictions.append(soft_predictions_mode)
             if 'zg' in latent.obsm:
                 calc_umap(latent, rep='zg')
@@ -380,16 +395,22 @@ def get_model_results(
     class_reports = pd.concat(class_reports, axis=0)
     latents = ad.concat(latents, axis=0)
     soft_predictions = pd.concat(soft_predictions, axis=0)
+    soft_preds = pd.concat(soft_preds, axis=0)
+    latents.obsm['soft_predictions'] = soft_preds
+    # Calculate classification confidence
+    latents.obs['cls_score'] = soft_preds.max(axis=1) - soft_preds.mean(axis=1)
     # Calculate overall latent
     sc.pp.neighbors(latents, use_rep='X')
     sc.tl.umap(latents)
     if plot and max_classes > 0:
         logging.info('Plotting class masks for run.')
         plot_cls_masks(latents, plt_dir=plt_dir, max_classes=max_classes)
+        sc.pl.umap(latents, color=cls_label, return_fig=True, show=False)
+        plt.savefig(os.path.join(plt_dir, f'all_umap_{cls_label}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
     if save:
         logging.info(f'Saving results to: {version_dir}')
         latents.write_h5ad(os.path.join(version_dir, 'latent.h5ad'))
-        model.save(dir_path=os.path.join(version_dir, 'model'), save_anndata=save_ad, overwrite=True)
         summaries.to_csv(os.path.join(version_dir, 'summary.csv'))
         class_reports.to_csv(os.path.join(version_dir, 'report.csv'))
         soft_predictions.to_csv(os.path.join(version_dir, 'soft_predictions.csv'))

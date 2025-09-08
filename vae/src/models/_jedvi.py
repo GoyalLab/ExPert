@@ -169,6 +169,9 @@ class JEDVI(
                     cls_emb = pd.concat([emb.loc[_shared_labels], emb.loc[_unseen_labels]], axis=0)
                     # Include entire embedding in model's adata
                     self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = sp.csr_matrix(cls_emb.values)
+                    # Include class similarity as pre-calculated matrix
+                    logging.info(f'Calculating class similarities')
+                    self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] @ self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].T
                     # Save registration with this model
                     self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT] = {
                         'model': self.__class__,
@@ -448,14 +451,14 @@ class JEDVI(
         indices: Sequence[int] | None = None,
         soft: bool = False,
         batch_size: int | None = None,
-        return_latent: bool = False,
+        return_latent: bool = True,
     ) -> tuple[np.ndarray | pd.DataFrame, np.ndarray] | np.ndarray | pd.DataFrame:
         """Return cell label predictions.
 
         Parameters
         ----------
         adata
-            AnnData object that has been registered via :meth:`~GEDVI.setup_anndata`.
+            AnnData object that has been registered via :meth:`~JEDVI.setup_anndata`.
         indices
             Return probabilities for each class label.
         soft
@@ -615,7 +618,7 @@ class JEDVI(
 
         plan_kwargs = train_params.pop('plan_kwargs', {})
         
-        cls_emb = None
+        cls_emb, cls_sim = None, None
         # Add external labels to training if included during setup
         if REGISTRY_KEYS.CLS_EMB_KEY in self.adata_manager.data_registry:
             cls_emb_registry = self.adata_manager.data_registry[REGISTRY_KEYS.CLS_EMB_KEY]
@@ -625,6 +628,8 @@ class JEDVI(
                 cls_emb_registry.attr_name,
                 cls_emb_registry.attr_key,
             )
+            # Add class similarities to plan
+            cls_sim = self.adata.uns.get(REGISTRY_KEYS.CLS_SIM_KEY, None)
         # Use contrastive loss in validation if that set uses the same splitter
         if data_params.get('use_contrastive_loader', None) in ['val', 'both']:
             plan_kwargs['use_contr_in_val'] = True
@@ -635,6 +640,7 @@ class JEDVI(
             module=self.module, 
             n_classes=self.n_labels, 
             cls_emb=cls_emb,
+            cls_sim=cls_sim,
             **plan_kwargs
         )
         check_val_every_n_epoch = train_params.pop('check_val_every_n_epoch', 1)

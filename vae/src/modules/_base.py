@@ -28,6 +28,7 @@ class Block(nn.Module):
             dropout_rate: float = 0.1,
             activation_fn: nn.Module = nn.LeakyReLU,
             bias: bool = True,
+            noise_std: float = 0.0,
         ):
         super().__init__()
         # Save hyperparameters
@@ -36,6 +37,7 @@ class Block(nn.Module):
         self.use_activation = use_activation
         self.use_attention = use_attention
         self.dropout_rate = dropout_rate
+        self.noise_std = noise_std
         # Init modules
         head_size = n_input // n_head
         self.root = nn.Linear(n_input, n_output, bias=bias)
@@ -76,6 +78,10 @@ class Block(nn.Module):
             r = self.activation(r)
         # Use final projection layer
         r = self.proj(r)
+        # Add gaussian noise
+        if self.training and self.noise_std > 0:
+            noise = torch.randn_like(r) * self.noise_std
+            r = r + noise
         # Apply dropout
         if self.dropout_rate > 0:
             r = self.dropout(r)
@@ -92,7 +98,8 @@ class FunnelFCLayers(nn.Module):
         n_hidden: int = 128,
         n_cat_list: Optional[Iterable[int]] = None,
         n_layers: int = 2,
-        min_attn_dim: int = 512,
+        min_attn_dim: int = 64,
+        max_attn_dim: int = 1042,
         dropout_rate: float = 0.1,
         use_batch_norm: bool = True,
         use_layer_norm: bool = False,
@@ -101,8 +108,9 @@ class FunnelFCLayers(nn.Module):
         n_head: int = 4,
         bias: bool = True,
         inverted: bool = False,
-        inject_covariates: bool = True,
+        inject_covariates: bool = False,
         activation_fn: nn.Module = nn.LeakyReLU,
+        noise_std: float = 0.0,
         **kwargs,
     ):
         super().__init__()
@@ -138,7 +146,8 @@ class FunnelFCLayers(nn.Module):
             in_dim = hidden_dims[i] + self.cat_dim * self.inject_into_layer(i)
             out_dim = hidden_dims[i + 1]
             # Determine whether to to use attention for block, never use on the first layer
-            is_attention_block = use_attention and in_dim <= min_attn_dim and i > 0
+            head_dim = in_dim // n_head
+            is_attention_block = use_attention and i > 0 and head_dim >= min_attn_dim and head_dim <= max_attn_dim
             # Create block for each layer
             block = Block(
                 n_input=in_dim, 
@@ -150,7 +159,8 @@ class FunnelFCLayers(nn.Module):
                 use_attention=is_attention_block,
                 dropout_rate=dropout_rate,
                 activation_fn=activation_fn,
-                bias=bias
+                bias=bias,
+                noise_std=noise_std
             )
             self.layers.append(block)
     
@@ -534,7 +544,7 @@ class Encoder(nn.Module):
 
         """
         feature_mask = None
-        if self.use_feature_mask and self.drop_prob > 0:
+        if self.training and self.use_feature_mask and self.drop_prob > 0:
             # Sample mask: 1 for keep, 0 for drop
             feature_mask = torch.bernoulli(torch.full((self.n_input,), 1 - self.drop_prob))  # shape: (num_features,)
             feature_mask = feature_mask.view(1, -1)  # shape: (1, num_features)
@@ -691,7 +701,7 @@ class EmbeddingClassifier(nn.Module):
         n_labels: int = 5,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
-        logits: bool = True,  # <- for CE loss, return logits
+        logits: bool = True,
         use_batch_norm: bool = True,
         use_layer_norm: bool = False,
         activation_fn: nn.Module = nn.LeakyReLU,
@@ -715,7 +725,7 @@ class EmbeddingClassifier(nn.Module):
 
         # Initialize layers
         if n_hidden > 0 and n_layers > 0:
-            self.encoder = FunnelFCLayers(
+            self.class_projection = FunnelFCLayers(
                 n_in=n_input,
                 n_out=class_embed_dim,
                 n_layers=n_layers,
@@ -727,7 +737,7 @@ class EmbeddingClassifier(nn.Module):
             )
         else:
             # Set encoder to a single linear layer
-            self.encoder = nn.Linear(n_input, class_embed_dim)
+            self.class_projection = nn.Linear(n_input, class_embed_dim)
             self.dropout = nn.Dropout(p=dropout_rate)
             class_embed_dim = n_input
 
@@ -757,9 +767,12 @@ class EmbeddingClassifier(nn.Module):
         class_embeds : Optional[Tensor]
             External class embeddings, shape (n_labels, class_embed_dim)
         """
-        z = self.encoder(x)  # (batch, d)
+        
+        # Class projection
+        z = self.class_projection(x)  # (batch, d)
+        # Randomly dropout some elements in the projection
         if self.dropout_rate > 0:
-            x = self.dropout(x)
+            z = self.dropout(z)
 
         if class_embeds is None:
             class_embeds = self.learned_class_embeds

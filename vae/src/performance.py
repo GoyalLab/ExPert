@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import anndata as ad
+import gseapy as gp
 
 from typing import Iterable, Any
 
@@ -22,3 +23,40 @@ def get_classification_report(
     report_data = report_data.reset_index().merge(actual_support_map, left_on='index', right_on=cls_label)
     report_data['log_count'] = np.log(report_data['count'])
     return summary, report_data
+
+
+def get_library(library="KEGG_2019_Human", organism="Human"):
+    return gp.get_library(name=library, organism=organism)
+
+def build_gene2pathways(genes, library_obj=None):
+    """Return dict: GENE -> set({pathways}) using a library from gseapy."""
+    if library_obj is None:
+        library_obj = get_library()
+    wanted = set(g.upper() for g in genes)
+    gene2p = {}
+    for pathway, members in library_obj.items():
+        for g in members:
+            gU = g.upper()
+            if gU in wanted:
+                gene2p.setdefault(gU, set()).add(pathway)
+    return gene2p
+
+def compare_gene_pairs(actual_genes, predicted_genes, gene2pathways):
+    """Compare per-position pairs: is predicted in any same pathway as actual?"""
+    rows = []
+    for a, p in zip(actual_genes, predicted_genes):
+        aU, pU = a.upper(), p.upper()
+        A = gene2pathways.get(aU, set())
+        P = gene2pathways.get(pU, set())
+        shared = sorted(A & P)
+        rows.append({
+            "actual": aU,
+            "predicted": pU,
+            "pathway_predicted": aU if bool(shared) else pU,
+            "same_pathway": bool(shared),
+            "n_shared": len(shared),
+            "shared_pathways": "; ".join(shared),
+            "actual_pathways": "; ".join(A),
+            "predicted_pathways": "; ".join(P),
+        })
+    return pd.DataFrame(rows)

@@ -33,6 +33,27 @@ class FCParams(NamedTuple):
     DROPOUT: float = 0.1
 
 
+def zscore(x: torch.Tensor, dim: int = -1, eps: float = 1e-8):
+    mu = x.mean(dim=dim, keepdim=True)
+    sd = x.std(dim=dim, keepdim=True).clamp_min(eps)
+    return (x - mu) / sd
+
+def pearson(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8, dim: int = -1):
+    """
+    Compute Pearson correlation
+    x, y: tensors of shape (B, D)
+    Returns: (B,) correlations
+    """
+    assert x.shape == y.shape, "x and y must have the same shape"
+
+    xm = x - x.mean(dim=dim, keepdim=True)  # (B, D)
+    ym = y - y.mean(dim=dim, keepdim=True)  # (B, D)
+
+    cov = (xm * ym).sum(dim=dim)            # (B,)
+    std = torch.sqrt((xm**2).sum(dim=dim) * (ym**2).sum(dim=dim)).clamp_min(eps)  # (B,)
+
+    return cov / std
+
 def add_pp_layer(adata: ad.AnnData) -> None:
     if 'log1p' in adata.layers:
         logging.info('Detected log1p layer, deleting')
@@ -46,6 +67,17 @@ def add_pp_layer(adata: ad.AnnData) -> None:
 def get_zi_rate(adata: ad.AnnData, verbose: bool = True) -> float:
     zi_r = 1 - (adata.X.nnz / (adata.X.shape[0]*adata.X.shape[1]))
     return zi_r
+
+class BatchCache:
+    def __init__(self, batch_size: int):
+        self.data = []
+        self.maxlen = batch_size
+    
+    def append(self, x):
+        if len(self.data) > self.maxlen:
+            self.data = [x]
+        else:
+            self.data.append(x)
 
 
 def run_hyperparameter_search(

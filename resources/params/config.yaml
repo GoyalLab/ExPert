@@ -1,0 +1,97 @@
+# Dataloader parameters
+data:
+  train_size: 0.9
+  batch_size: 128
+  num_workers: 1
+  pin_memory: true
+  max_cells_per_batch: 64
+  max_classes_per_batch: 32
+  shuffle_classes: true
+  use_contrastive_loader: null
+# Classifier parameters
+cls:
+  n_hidden: 0
+  n_layers: 1
+  dropout_rate: 0.1
+  use_multihead: false
+  use_cosine_similarity: true
+  temperature: 1
+# Encoder parameters
+encoder:
+  n_layer: 8
+  use_attention: true
+  min_attn_dim: 8
+  max_attn_dim: 1024
+  n_head: 8
+  activation_fn: "nn.LeakyReLU"
+# Decoder parameters
+decoder:
+  n_layer: 1
+  use_attention: false
+  activation_fn: "nn.LeakyReLU"
+# Weight schedules
+schedules:
+  classification_ratio:
+    schedule: "sigmoid"
+    anneal_k: 10
+    n_epochs_stall: 0
+    min_weight: 100
+    max_weight: 100
+  contrastive_loss_weight:
+    schedule: "sigmoid"
+    anneal_k: 10
+    n_epochs_stall: 0
+    min_weight: 0
+    max_weight: 0
+  class_kl_temperature:
+    schedule: "sigmoid"
+    anneal_k: 10
+    n_epochs_stall: 0
+    min_weight: 0.1
+    max_weight: 0.1
+  alignment_loss_weight:
+    max_weight: 0
+# Training plan
+plan:
+  lr: 0.001
+  lr_patience: 30
+  weight_decay: 0.000001
+  cls_emb_mode: "full"
+  incl_n_unseen: null
+  n_epochs_warmup: 60
+  min_kl_weight: 0
+  max_kl_weight: 0.5
+  use_posterior_mean: "val"
+  lr_scheduler_metric: "validation_classification_loss"
+  log_class_distribution: false
+  full_val_log_every_n_epoch: 10
+  plot_umap: null
+# Train parameters
+train:
+  max_epochs: 60
+  early_stopping: false
+  early_stopping_monitor: "validation_classification_loss"
+  early_stopping_patience: 20
+  check_val_every_n_epoch: 1
+# Model parameters
+model:
+  n_latent: 256
+  n_hidden: 1024
+  dropout_rate: 0.1
+  dispersion: "gene"
+  use_batch_norm: "none"
+  use_layer_norm: "both"
+  gene_likelihood: "zinb"
+  linear_classifier: true
+  log_variational: true
+  l1_lambda: 0.001
+  l2_lambda: 0.01
+  l_mask: ["attn", "Attention", "class_projection"]
+  cls_weight_method: null
+  classification_loss_strategy: "kl"
+  focal_gamma: 1.0
+  contrastive_temperature: 0.1
+  reduction: "sum"
+  non_elbo_reduction: "sum"
+  use_feature_mask: true
+  drop_prob: 0.001

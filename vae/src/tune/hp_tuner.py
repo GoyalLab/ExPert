@@ -38,7 +38,7 @@ class HPTuner:
 
         data = ray.get(self.data_ref)
         logging.info(f'Setting up model with {params}')
-        self.model_class.setup_anndata(data, labels_key=self.cls_label, batch_key=self.batch_label, unlabeled_category=HP_KEYS.UNKNOWN_CAT_KEY)
+        self.model_class.setup_anndata(data, labels_key=self.cls_label, batch_key=self.batch_label)
         # Initialize model
         model = self.model_class(data, **model_params)
         # Train model

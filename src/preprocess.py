@@ -198,6 +198,37 @@ def _filter_feature_pool(adata: ad.AnnData, feature_pool_file: str) -> None:
     logging.info(f'Subsetting to features in pre-calculated pool: {feature_mask.sum()}/{adata.n_vars}')
     adata._inplace_subset_var(feature_mask)
 
+def read_adata(
+        adata_p: str,
+        p_col: str = 'perturbation',
+        ctrl_key: str = 'control',
+        keep_versions: bool = False,
+        remove_invalid_labels: bool = True,
+        single_perturbations_only: bool = True
+    ) -> ad.AnnData:
+    logging.info(f'Loading dataset from {adata_p}')
+    adata = sc.read(adata_p)
+    # Ensure adata.X is in csr format
+    if not isinstance(adata.X, sp.csr_matrix):
+        logging.info('Converting adata.X to CSR matrix.')
+        adata.X = sp.csr_matrix(adata.X)
+    # Check perturbation column
+    check_p_col(adata, p_col=p_col)
+    # Check control key
+    check_ctrl_col(adata, p_col=p_col, ctrl_key=ctrl_key)
+    # Clean up perturbation label
+    adata.obs[p_col] = clean_perturbation_labels(adata.obs[p_col], keep_versions=keep_versions)
+    # Remove unknown or NaN labels
+    if remove_invalid_labels:
+        _remove_invalid_labels(adata, p_col=p_col)
+    # Filter for single perturbations only
+    if single_perturbations_only:
+        logging.info(f'Filtering column "{p_col}" for single perturbations only')
+        sp_mask = single_perturbation_mask(adata.obs, p_col=p_col)
+        if sp_mask is not None:
+            adata._inplace_subset_obs(sp_mask)
+    return adata
+
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
 def preprocess_dataset(
         adata: ad.AnnData, 

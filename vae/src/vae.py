@@ -13,7 +13,7 @@ from torchmetrics.classification import MulticlassAccuracy, MulticlassConfusionM
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from dl.src._data import AnnDataModule
+from src._data import AnnDataModule
 
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.distributions import Distribution

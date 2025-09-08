@@ -7,7 +7,6 @@ import numpy as np
 import os
 import anndata as ad
 import scipy.sparse as sp
-from memory_profiler import memory_usage
 import functools
 
 
@@ -25,30 +24,6 @@ def log_decorator(func):
         logging.info(f'Finished {func.__name__}')
         return result
     return wrapper
-
-
-def log_memory_usage(mem_dir="./mem"):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            mem_file = os.path.join(mem_dir, f'{func.__name__}.txt')
-            with open(mem_file, "a") as log_file:
-                log_file.write(f"\nMemory usage for {func.__name__}:\n")
-                
-                def track_memory():
-                    mem_usage = memory_usage((func, args, kwargs), interval=0.1)
-                    return mem_usage
-
-                # Run memory tracking and execute the function
-                mem_usage = track_memory()
-
-                # Log memory usage per line
-                for line_num, mem in enumerate(mem_usage):
-                    log_file.write(f"Line {line_num + 1}: {mem} MiB\n")
-                    
-            return func(*args, **kwargs)
-        return wrapper
-    return decorator
 
 
 def convert_size(size_bytes: int) -> str:
