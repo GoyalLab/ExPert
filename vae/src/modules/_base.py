@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +9,8 @@ from collections.abc import Callable, Iterable
 from typing import Literal, Iterable, Optional
 
 from torch.distributions import Normal
+
+from src.utils.constants import REGISTRY_KEYS
 
 
 def _identity(x):
@@ -59,6 +62,24 @@ class Block(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
         self.proj = nn.Linear(n_output, n_output)
 
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-norm + Attention + residual
+        if self.use_attention:
+            x = x + self.attn(self.layer_norm_1(x))
+
+        # Pre-norm + Feedforward + residual
+        r = self.feedfw(self.layer_norm_2(x))
+        if self.use_batch_norm:
+            r = self.batch_norm(r)
+        if self.use_activation:
+            r = self.activation(r)
+        r = self.proj(r)
+        if self.training and self.noise_std > 0:
+            r = r + torch.randn_like(r) * self.noise_std
+        r = self.dropout(r)
+        x = x + r
+        return x
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Apply multi-head self attention and add new branch of x
         if self.use_attention:
@@ -90,6 +111,78 @@ class Block(nn.Module):
         return x
 
 
+class TransformerBlock(nn.Module):
+    """Transformer-style block with multi-head attention + feedforward + residuals."""
+
+    def __init__(
+        self, 
+        n_input: int,
+        n_head: int,
+        head_size: int | None = None,
+        ff_mult: int = 4,                 # expansion factor in FFN (like in Vaswani et al.)
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = True,
+        dropout_rate: float = 0.1,
+        activation_fn: nn.Module = nn.LeakyReLU,
+        bias: bool = True,
+        noise_std: float = 0.0,
+        **kwargs
+    ):
+        super().__init__()
+        self.use_batch_norm = use_batch_norm
+        self.use_layer_norm = use_layer_norm
+        self.noise_std = noise_std
+
+        # Attention over features
+        self.attn = MultiHeadAttention(
+            num_heads=n_head, 
+            n_input=n_input, 
+            head_size=head_size, 
+            dropout_rate=dropout_rate
+        )
+
+        # Norm layers
+        self.norm1 = nn.LayerNorm(n_input) if use_layer_norm else nn.Identity()
+        self.norm2 = nn.LayerNorm(n_input) if use_layer_norm else nn.Identity()
+
+        # Feedforward MLP (expand → contract back to n_input)
+        hidden_dim = ff_mult * n_input
+        self.ff = nn.Sequential(
+            nn.Linear(n_input, hidden_dim, bias=bias),
+            activation_fn(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, n_input, bias=bias)
+        )
+
+        # Optional BatchNorm
+        self.batch_norm = nn.BatchNorm1d(n_input) if use_batch_norm else nn.Identity()
+
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            x: (B, n_input)
+        Returns:
+            out: (B, n_input)
+        """
+        # --- Attention + residual ---
+        attn_out = self.attn(self.norm1(x), **kwargs)              # (B, n_input)
+        x = x + self.dropout(attn_out)
+
+        # --- Feedforward + residual ---
+        r = self.ff(self.norm2(x))                       # (B, n_input)
+        if self.use_batch_norm and not isinstance(self.batch_norm, nn.Identity):
+            r = self.batch_norm(r)
+        out = x + self.dropout(r)
+
+        # Add Gaussian noise if training
+        if self.training and self.noise_std > 0:
+            out = out + torch.randn_like(out) * self.noise_std
+
+        return out
+
+
 class FunnelFCLayers(nn.Module):
     def __init__(
         self,
@@ -111,6 +204,9 @@ class FunnelFCLayers(nn.Module):
         inject_covariates: bool = False,
         activation_fn: nn.Module = nn.LeakyReLU,
         noise_std: float = 0.0,
+        skip_first: bool = True,
+        use_transformer_block: bool = False,
+        last_attention: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -124,14 +220,18 @@ class FunnelFCLayers(nn.Module):
 
         # Init modules
         self.layer_norm = nn.LayerNorm(n_out)
+        self.block = TransformerBlock if use_transformer_block else Block
 
         self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in (n_cat_list or [])]
         self.cat_dim = sum(self.n_cat_list)
 
         # Geometric decay over n hidden to output layer
         hidden_dims = np.geomspace(n_hidden, n_out, num=n_layers + 1).astype(int)
-        # Set n_hidden as bottleneck first dimension
-        hidden_dims = np.r_[n_in, hidden_dims]
+        # Set n_hidden as bottleneck first dimension if its not the same as n_in
+        e = 0
+        if n_hidden != n_in:
+            e = 1
+            hidden_dims = np.r_[n_in, hidden_dims]
         
         # Ensure its divisible by n_heads if attention is used
         if use_attention:
@@ -142,14 +242,13 @@ class FunnelFCLayers(nn.Module):
         # Init layers
         self.layers = nn.ModuleList()
 
-        for i in range(n_layers + 1):
+        for i in range(n_layers + e):
             in_dim = hidden_dims[i] + self.cat_dim * self.inject_into_layer(i)
             out_dim = hidden_dims[i + 1]
             # Determine whether to to use attention for block, never use on the first layer
-            head_dim = in_dim // n_head
-            is_attention_block = use_attention and i > 0 and head_dim >= min_attn_dim and head_dim <= max_attn_dim
+            is_attention_block = False if (i == 0 and skip_first) else (min_attn_dim <= in_dim <= max_attn_dim)
             # Create block for each layer
-            block = Block(
+            block = self.block(
                 n_input=in_dim, 
                 n_output=out_dim, 
                 n_head=n_head,
@@ -163,6 +262,23 @@ class FunnelFCLayers(nn.Module):
                 noise_std=noise_std
             )
             self.layers.append(block)
+        # Add attention to the last layer
+        if last_attention:
+            block = self.block(
+                n_input=n_out,
+                n_output=n_out,
+                n_head=n_head,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                use_activation=use_activation,
+                use_attention=True,
+                dropout_rate=dropout_rate,
+                activation_fn=activation_fn,
+                bias=bias,
+                noise_std=noise_std
+            )
+            self.layers.append(block)
+
     
     def inject_into_layer(self, layer_num) -> bool:
         """Helper to determine if covariates should be injected."""
@@ -184,6 +300,101 @@ class FunnelFCLayers(nn.Module):
                     cat_input = cat_input.expand(x.shape[0], cat_input.shape[-1])
                     x = torch.cat([x, cat_input], dim=-1)
             x = layer(x)
+        # Apply layer norm
+        if self.use_layer_norm:
+            x = self.layer_norm(x)
+        return x
+
+
+class AttentionLayers(nn.Module):
+    def __init__(
+        self,
+        n_in: int,
+        n_out: int,
+        n_hidden: int = 128,
+        n_cat_list: Optional[Iterable[int]] = None,
+        n_layers: int = 2,
+        dropout_rate: float = 0.1,
+        use_batch_norm: bool = True,
+        use_layer_norm: bool = False,
+        use_activation: bool = True,
+        use_attention: bool = True,
+        gene_emb_dim: int | None = None,
+        n_head: int = 4,
+        bias: bool = True,
+        inject_covariates: bool = False,
+        activation_fn: nn.Module = nn.LeakyReLU,
+        noise_std: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.inject_covariates = inject_covariates
+        self.use_activation = use_activation
+        self.use_layer_norm = use_layer_norm
+        self.use_attention = use_attention
+        self.n_hidden = n_hidden
+        self.kwargs = kwargs
+
+        # Init modules
+        self.layer_norm = nn.LayerNorm(n_out)
+
+        self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in (n_cat_list or [])]
+        self.cat_dim = sum(self.n_cat_list)
+
+        # Encode down to bottleneck latent space
+        self.encoder = nn.Linear(n_in, n_out)
+        # Add encoder for embedding dimensions
+        if gene_emb_dim is not None:
+            self.embedding_compressor = nn.Linear(gene_emb_dim, n_out)
+        # Introduce multiple attention layers of same dimension
+        self.layers = nn.ModuleList()
+        for _ in np.arange(n_layers):
+            # Create block for each layer
+            block = TransformerBlock(
+                n_input=n_out,
+                n_head=n_head,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                dropout_rate=dropout_rate,
+                activation_fn=activation_fn,
+                bias=bias,
+                noise_std=noise_std,
+                **kwargs
+            )
+            self.layers.append(block)
+
+    
+    def inject_into_layer(self, layer_num) -> bool:
+        """Helper to determine if covariates should be injected."""
+        return layer_num == 0 or (layer_num > 0 and self.inject_covariates)
+
+    def forward(self, x: torch.Tensor, *cat_list: torch.Tensor, gene_embedding: torch.Tensor | None = None) -> torch.Tensor:
+        # First linear projection
+        x = self.encoder(x)
+        # Project gene embedding if external is given
+        if gene_embedding is not None:
+            g = gene_embedding.to(x.device)
+            compressed_g = self.embedding_compressor(g.T)
+            with torch.no_grad():
+                feature_emb = self.encoder(compressed_g.T)
+        else:
+            feature_emb = None
+        # One-hot encode categorical covariates
+        one_hot_cat_list = []
+        for n_cat, cat in zip(self.n_cat_list, cat_list, strict=False):
+            if n_cat > 1:
+                cat = cat.squeeze(-1) if cat.dim() == 2 and cat.size(-1) == 1 else cat
+                one_hot = F.one_hot(cat, num_classes=n_cat).float()
+                one_hot_cat_list.append(one_hot)
+
+        for i, layer in enumerate(self.layers):
+            if self.inject_into_layer(i):
+                if one_hot_cat_list:
+                    cat_input = torch.cat(one_hot_cat_list, dim=-1)
+                    cat_input = cat_input.expand(x.shape[0], cat_input.shape[-1])
+                    x = torch.cat([x, cat_input], dim=-1)
+            x = layer(x, feature_emb=feature_emb)
         # Apply layer norm
         if self.use_layer_norm:
             x = self.layer_norm(x)
@@ -420,7 +631,7 @@ class FeatureAttention(nn.Module):
         return attended
     
 
-class MultiHeadAttention(nn.Module):
+class MultiHeadAttentionIterative(nn.Module):
     """Multiple FeatureAttention heads in parallel."""
 
     def __init__(self, num_heads: int, n_input: int, head_size: int | None = None, dropout_rate: float = 0.1):
@@ -438,6 +649,269 @@ class MultiHeadAttention(nn.Module):
             x = self.dropout(x)
         return x
 
+
+class MultiHeadAttention(nn.Module):
+    """
+    Multi-head self-attention over features with learnable embeddings.
+    Input:  (B, F) where F = number of features
+    Output: (B, F) same shape
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        n_input: int,
+        head_size: int | None = None,
+        dropout_rate: float = 0.1,
+        use_buffer: bool = False,
+        sequential: bool = True,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.n_input = n_input
+        self.head_size = head_size if head_size is not None else n_input // num_heads
+        self.d_model = self.head_size * num_heads
+
+        # learnable embeddings for each feature (gene)
+        self.feature_emb = nn.Embedding(n_input, self.d_model)
+
+        # projections for all heads
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+
+        # output projection: concat(H*L) -> 1
+        self.out_proj = nn.Linear(self.d_model, 1, bias=True)
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # store last attention maps (B, H, F, F)
+        self.register_buffer("last_attn", torch.empty(0), persistent=False)
+        self.use_buffer = use_buffer
+        self.sequential = sequential
+
+    def forward(self, x: torch.Tensor, feature_emb: torch.Tensor | None = None, return_attn: bool = False):
+        if self.sequential:
+            return self.seq_forward(x, feature_emb=feature_emb, return_attn=return_attn)
+        else:
+            return self.mm_forward(x, feature_emb=feature_emb, return_attn=return_attn)
+
+    def mm_forward(self, x: torch.Tensor, feature_emb: torch.Tensor | None = None, return_attn: bool = False):
+        """
+        Args:
+            x: (B, F) expression matrix
+        Returns:
+            out: (B, F)
+            attn (optional): (B, H, F, F)
+        """
+        B, F_ = x.shape
+        H, L = self.num_heads, self.head_size
+
+        # --- Expand expression with learnable embeddings ---
+        _feature_emb = feature_emb if feature_emb is not None else self.feature_emb.weight
+        feat_vecs = _feature_emb.unsqueeze(0).expand(B, -1, -1)  # (B, F, emb_dim)
+        x_emb = x.unsqueeze(-1) * feat_vecs                                # (B, F, emb_dim)
+
+        # --- Project into Q, K, V ---
+        Q = self.q_proj(x_emb).view(B, F_, H, L).transpose(1, 2)  # (B,H,F,L)
+        K = self.k_proj(x_emb).view(B, F_, H, L).transpose(1, 2)  # (B,H,F,L)
+        V = self.v_proj(x_emb).view(B, F_, H, L).transpose(1, 2)  # (B,H,F,L)
+
+        # --- Attention scores ---
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(L)  # (B,H,F,F)
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+
+        # --- Apply attention ---
+        out = torch.matmul(attn, V)   # (B,H,F,L)
+
+        # Concat heads: (B,F,H*L) = (B,F,d_model)
+        out = out.transpose(1, 2).contiguous().view(B, F_, H * L)
+
+        # Project down to (B,F)
+        out = self.out_proj(out).squeeze(-1)   # (B,F)
+        out = self.dropout(out)
+
+        # Save last attention
+        if self.use_buffer:
+            self.last_attn = attn.detach().cpu()
+
+        if return_attn:
+            return out, attn
+        return out
+
+    def seq_forward(self, x: torch.Tensor, feature_emb: torch.Tensor | None = None, return_attn: bool = False):
+        """
+        Args:
+            x: (B, F) expression matrix
+        Returns:
+            out: (B, F)
+            attn (optional): (B, H, F, F)  # only if return_attn=True
+        """
+        H, L = self.num_heads, self.head_size
+
+        # --- Multiply expression values with feature embeddings (either learnable or pre-computed) ---
+        # avoids expand: (B,F,emb_dim)
+        _feature_emb = feature_emb if feature_emb is not None else self.feature_emb.weight
+        x_emb = torch.einsum("bf,fe->bfe", x, _feature_emb)
+
+        # --- Project once ---
+        Q_full = self.q_proj(x_emb)  # (B,F,H*L)
+        K_full = self.k_proj(x_emb)
+        V_full = self.v_proj(x_emb)
+
+        # --- Process heads sequentially ---
+        out_heads = []
+        attn_list = [] if return_attn else None
+
+        for h in range(H):
+            q = Q_full[:, :, h*L:(h+1)*L]  # (B,F,L)
+            k = K_full[:, :, h*L:(h+1)*L]  # (B,F,L)
+            v = V_full[:, :, h*L:(h+1)*L]  # (B,F,L)
+
+            # attention scores: (B,F,F) — one head at a time
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(L)
+            attn = F.softmax(scores, dim=-1)
+            attn = self.dropout(attn)
+
+            # apply attention
+            out_h = torch.matmul(attn, v)  # (B,F,L)
+            out_heads.append(out_h)
+
+            if return_attn:
+                attn_list.append(attn.detach().cpu())
+
+        # concat all heads: (B,F,H*L)
+        out = torch.cat(out_heads, dim=-1)
+
+        # project back to (B,F)
+        out = self.out_proj(out).squeeze(-1)  # (B,F)
+        out = self.dropout(out)
+
+        # save attention maps (only if requested to save)
+        if self.use_buffer and return_attn:
+            self.last_attn = torch.stack(attn_list, dim=1)  # (B,H,F,F)
+
+        if return_attn:
+            return out, (torch.stack(attn_list, dim=1) if attn_list else None)
+        return out
+    
+
+class MultiHeadAttentionMM(nn.Module):
+    """
+    Multi-head feature self-attention (no sequence axis), loop-free via batched bmm.
+
+    Shapes:
+      x: (B, F) where F == n_input
+      head_size = L  (defaults to n_input)
+      q,k,v per head: (B, L)
+      attention per head: (B, L, L)
+      concat heads: (B, H*L)
+      proj -> (B, n_input)
+
+    Performance tips:
+      - Keep record_attn=False during training (set True only when analyzing).
+      - Use AMP/bfloat16 if possible.
+      - Consider smaller head_size if L is large (cost ~ O(B*H*L^2)).
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        n_input: int,
+        head_size: Optional[int] = None,
+        dropout_rate: float = 0.1,
+        record_attn: bool = False,
+        store_attn_on_cpu: bool = True,
+    ):
+        super().__init__()
+        self.num_heads = int(num_heads)
+        self.n_input = int(n_input)
+        self.head_size = int(n_input if head_size is None else head_size)  # L
+        self.scale = self.head_size ** -0.5
+
+        H, L = self.num_heads, self.head_size
+
+        # Single projections for all heads: (B, F) -> (B, H*L) -> view to (B, H, L)
+        self.query = nn.Linear(self.n_input, H * L, bias=False)
+        self.key   = nn.Linear(self.n_input, H * L, bias=False)
+        self.value = nn.Linear(self.n_input, H * L, bias=False)
+
+        # Concat heads -> project back to (B, n_input)
+        self.proj = nn.Linear(H * L, self.n_input, bias=True)
+
+        self.attn_dropout = nn.Dropout(dropout_rate)
+        self.out_dropout = nn.Dropout(dropout_rate)
+
+        # Attention recording controls
+        self.record_attn = bool(record_attn)
+        self.store_attn_on_cpu = bool(store_attn_on_cpu)
+        self.register_buffer("last_attn_weights", torch.empty(0), persistent=False)
+
+    @torch.no_grad()
+    def _maybe_record(self, attn_bhll: torch.Tensor):
+        if not self.record_attn:
+            # keep an empty tensor to signal "not recording"
+            self.last_attn_weights = attn_bhll.new_empty(0)
+            return
+        attn = attn_bhll.detach()
+        if self.store_attn_on_cpu:
+            attn = attn.to("cpu", non_blocking=True)
+        self.last_attn_weights = attn  # shape: (B, H, L, L)
+
+    def forward(
+        self,
+        x: torch.Tensor,                         # (B, F)
+        feature_mask: Optional[torch.Tensor] = None,  # (B, L) with 1=keep, 0=mask (keys)
+        return_attn: bool = False
+    ):
+        B, F = x.shape
+        H, L = self.num_heads, self.head_size
+        BH = B * H
+
+        # Project all heads at once: (B, F) -> (B, H, L)
+        q = self.query(x).view(B, H, L)
+        k = self.key(x).view(B, H, L)
+        v = self.value(x).view(B, H, L)
+
+        # Flatten batch*heads for batched bmm
+        q_bh = q.reshape(BH, L)                      # (BH, L)
+        k_bh = k.reshape(BH, L)                      # (BH, L)
+        v_bh = v.reshape(BH, L)                      # (BH, L)
+
+        # Scores via outer products per (B,H): (BH, L, 1) @ (BH, 1, L) -> (BH, L, L)
+        scores = torch.bmm(q_bh.unsqueeze(-1), k_bh.unsqueeze(-2))  # (BH, L, L)
+        scores.mul_(self.scale)
+
+        # Key mask: broadcast across query positions
+        if feature_mask is not None:
+            if feature_mask.shape != (B, L):
+                raise ValueError(f"feature_mask must be (B, {L}) but got {tuple(feature_mask.shape)}")
+            key_mask_bh = feature_mask.repeat_interleave(H, dim=0)          # (BH, L)
+            # mask zeros (to -inf) along key axis
+            scores = scores.masked_fill(key_mask_bh.unsqueeze(1) == 0,
+                                        torch.finfo(scores.dtype).min)
+
+        attn = torch.softmax(scores, dim=-1)          # (BH, L, L)
+        if self.attn_dropout.p > 0:
+            attn = self.attn_dropout(attn)
+
+        # Weighted sum: (BH, L, L) @ (BH, L, 1) -> (BH, L)
+        out_bh = torch.bmm(attn, v_bh.unsqueeze(-1)).squeeze(-1)  # (BH, L)
+
+        # Restore (B, H, L) -> concat heads -> (B, H*L)
+        out = out_bh.view(B, H, L).reshape(B, H * L)              # (B, H*L)
+
+        # Final projection back to (B, n_input)
+        out = self.proj(out)                                      # (B, n_input)
+        if self.out_dropout.p > 0:
+            out = self.out_dropout(out)
+
+        # Record attention (reshape back to (B,H,L,L)) only if requested
+        #self._maybe_record(attn.view(B, H, L, L))
+
+        if return_attn:
+            return out, self.last_attn_weights if self.last_attn_weights.numel() else attn.view(B, H, L, L)
+        return out
 
 # Encoder
 class Encoder(nn.Module):
@@ -489,19 +963,26 @@ class Encoder(nn.Module):
         return_dist: bool = False,
         use_feature_mask: bool = False,
         drop_prob: float = 0.25,
-        use_funnel: bool = True,
+        encoder_type: Literal['funnel', 'fc', 'transformer'] = 'funnel',
         **kwargs,
     ):
         super().__init__()
 
-        fclayers_class = FunnelFCLayers if use_funnel else FCLayers
+        # Choose encoder type
+        if encoder_type == 'funnel':
+            self.fclayers_class = FunnelFCLayers
+        elif encoder_type == 'fc':
+            self.fclayers_class = FCLayers
+        elif encoder_type == 'transformer':
+            self.fclayers_class = AttentionLayers
 
+        self.encoder_type = encoder_type
         self.distribution = distribution
         self.var_eps = var_eps
         self.n_input = n_input
         # Setup encoder layers
         funnel_out_dim = 2 * n_output
-        self.encoder = fclayers_class(
+        self.encoder = self.fclayers_class(
             n_in=n_input,
             n_out=funnel_out_dim,
             n_hidden=n_hidden,
@@ -522,7 +1003,7 @@ class Encoder(nn.Module):
             self.z_transformation = _identity
         self.var_activation = torch.exp if var_activation is None else var_activation
 
-    def forward(self, x: torch.Tensor, *cat_list: int):
+    def forward(self, x: torch.Tensor, *cat_list: int, g: torch.Tensor | None = None):
         r"""The forward computation for a single sample.
 
          #. Encodes the data into latent space using the encoder network
@@ -552,7 +1033,10 @@ class Encoder(nn.Module):
             feature_mask = feature_mask.to(x.device)
             x = x * feature_mask
         # Parameters for latent distribution
-        q = self.encoder(x, *cat_list)
+        if self.encoder_type == 'transformer':
+            q = self.encoder(x, *cat_list, gene_embedding=g)
+        else:
+            q = self.encoder(x, *cat_list)
         # Project to mean and variance
         q_m = self.mean_encoder(q)
         q_v = self.var_activation(self.var_encoder(q)) + self.var_eps

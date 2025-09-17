@@ -552,6 +552,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         log_class_distribution: bool = False,
         log_full_val: bool = True,
         freeze_encoder_epoch: int | None = None,
+        gene_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         cls_sim: torch.Tensor | None = None,
         cls_emb_mode: Literal["fixed", "full", "sample"] = "fixed",
@@ -583,8 +584,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # CLS params
         self.n_classes = n_classes
         self.use_posterior_mean = use_posterior_mean
-        self.cls_emb = self._init_cls_emb(cls_emb)
-        self.cls_sim = self._calc_cls_sim(self.cls_emb) if cls_sim is None else torch.Tensor(cls_sim.toarray())
+        self.gene_emb = self._to_tensor(gene_emb)
+        self.cls_emb = self._to_tensor(cls_emb)
+        self.cls_sim = self._calc_cls_sim(self.cls_emb) if cls_sim is None else self._to_tensor(cls_sim)
         self.cls_emb_mode = cls_emb_mode
         self.incl_n_unseen = incl_n_unseen
         self.use_cls_scores = use_cls_scores
@@ -757,12 +759,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
         )
 
-    def _init_cls_emb(self, cls_emb: sp.csr_matrix | torch.Tensor | None) -> torch.Tensor:
-        if cls_emb is None:
+    def _to_tensor(self, m: sp.csr_matrix | torch.Tensor | np.ndarray | None) -> torch.Tensor:
+        if m is None:
             return None
-        if sp.issparse(cls_emb):
-            return torch.Tensor(cls_emb.toarray())
-        return cls_emb
+        if sp.issparse(m):
+            return torch.Tensor(m.toarray())
+        if isinstance(m, np.ndarray):
+            return torch.Tensor(m)
+        if isinstance(m, torch.Tensor):
+            return m
+        raise ValueError(f'{m.__class__} is not compatible. Should be either sp.csr_matrix, np.ndarray, or torch.Tensor.')
 
     def _get_batch_class_embedding(self, batch_idx: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         # Always include embedding for classes we actually observe during training
@@ -805,24 +811,26 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.loss_kwargs.update({"kl_weight": self.kl_weight})
         # Compute CL warmup
         self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
-        self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
+        if mode=='train' or self.use_contr_in_val:
+            self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
         self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == mode or self.use_posterior_mean == "both"})
         self.loss_kwargs.update({"class_kl_temperature": self.class_kl_temperature})
         # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
+        # Add external gene embedding to batch
+        if self.gene_emb is not None:
+            # Add gene embedding matrix to batch
+            batch[REGISTRY_KEYS.GENE_EMB_KEY] = self.gene_emb
         # Add external embedding to batch
         if self.cls_emb is not None:
-            # Add embedding for classes that are not in the training data
+            # Add embedding for classes
             batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding(batch_idx=batch_idx)
         # Choose to use class scores for scaling or not
         input_kwargs['use_cls_scores'] = self.use_cls_scores in [mode, 'both']
         # Perform full forward pass of model
         inference, generative, loss_output = self.forward(batch, loss_kwargs=input_kwargs)
-        # Cache inference outputs for plotting
-        batch_cache = {'z': inference[MODULE_KEYS.Z_KEY].cpu(), 'cov': batch[REGISTRY_KEYS.BATCH_KEY].cpu(), 'y': loss_output.true_labels.cpu()}
-        # TODO: add caching here
         return inference, generative, loss_output
         
     def training_step(self, batch, batch_idx):

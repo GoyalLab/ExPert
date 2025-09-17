@@ -40,7 +40,7 @@ from scvi.model.base import (
 from scvi.data.fields import (
     CategoricalJointObsField,
     CategoricalObsField,
-    LabelsWithUnlabeledObsField,
+    VarmField,
     LayerField,
     StringUnsField,
     NumericalJointObsField,
@@ -77,11 +77,13 @@ class JEDVI(
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         linear_classifier: bool = False,
         cls_weight_method: str | None = "balanced",
+        use_gene_emb: bool = True,
         **model_kwargs,
     ):
         super().__init__(adata)
         _model_kwargs = dict(model_kwargs)
         self._model_kwargs = _model_kwargs
+        self.use_gene_emb = use_gene_emb
         # Initialize indices and labels for this VAE
         self._setup()
 
@@ -96,6 +98,8 @@ class JEDVI(
         cls_weights = self._get_cls_weights(cls_weight_method)
         # Determine number of batches/datasets and fix library method
         n_batch = self.summary_stats.n_batch
+        # Check number of hidden neurons, set to input features if < 0 else use given number
+        n_hidden = self.summary_stats.n_vars if n_hidden < 0 else n_hidden
 
         # Initialize genevae
         self.module = self._module_cls(
@@ -114,7 +118,7 @@ class JEDVI(
             gene_likelihood=gene_likelihood,
             linear_classifier=linear_classifier,
             cls_weights=cls_weights,
-            **_model_kwargs,
+            **self._model_kwargs,
         )
 
         self.supervised_history_ = None
@@ -143,6 +147,11 @@ class JEDVI(
 
     def _setup(self):
         """Setup adata for training. Prepare class embedding"""
+        if self.use_gene_emb and REGISTRY_KEYS.GENE_EMB_KEY in self.adata.varm:
+            # Add embedding dimensionality to encoder kwargs
+            ext_en_kw = self._model_kwargs.get('extra_encoder_kwargs', {})
+            ext_en_kw['gene_emb_dim'] = self.adata.varm[REGISTRY_KEYS.GENE_EMB_KEY].shape[1]
+            self._model_kwargs['extra_encoder_kwargs'] = ext_en_kw
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
         self._label_mapping = labels_state_registry.categorical_mapping
@@ -194,7 +203,7 @@ class JEDVI(
         adata: AnnData | None = None,
         **model_kwargs,
     ):
-        """Initialize scanVI model with weights from pretrained :class:`~scvi.model.SCVI` model.
+        """Initialize jedVI model with weights from pretrained :class:`~scvi.model.SCVI` model.
 
         Parameters
         ----------
@@ -279,7 +288,7 @@ class JEDVI(
         adata: AnnData | None = None,
         **model_kwargs,
     ):
-        """Initialize scanVI model with weights from pretrained :class:`~scvi.model.SCVI` model.
+        """Initialize jedVI model with weights from pretrained :class:`~scvi.model.JEDVI` model.
 
         Parameters
         ----------
@@ -287,14 +296,14 @@ class JEDVI(
             Pretrained scvi model
         labels_key
             key in `adata.obs` for label information. Label categories can not be different if
-            labels_key was used to setup the SCVI model. If None, uses the `labels_key` used to
-            setup the SCVI model. If that was None, and error is raised.
+            labels_key was used to setup the JEDVI model. If None, uses the `labels_key` used to
+            setup the JEDVI model. If that was None, and error is raised.
         unlabeled_category
             Value used for unlabeled cells in `labels_key` used to setup AnnData with scvi.
         adata
-            AnnData object that has been registered via :meth:`~GEDVI.setup_anndata`.
+            AnnData object that has been registered via :meth:`~JEDVI.setup_anndata`.
         model_kwargs
-            kwargs for gedvi model
+            kwargs for JEDVI model
         """
         from copy import deepcopy
         from scvi import settings
@@ -551,7 +560,8 @@ class JEDVI(
         data_params: dict[str, Any]={}, 
         model_params: dict[str, Any]={}, 
         train_params: dict[str, Any]={},
-        return_runner: bool = False
+        return_runner: bool = False,
+        use_gene_emb: bool = True,
     ):
         """Train the model.
 
@@ -630,6 +640,11 @@ class JEDVI(
             )
             # Add class similarities to plan
             cls_sim = self.adata.uns.get(REGISTRY_KEYS.CLS_SIM_KEY, None)
+        # Extract gene embedding if given and flag is set
+        if use_gene_emb and REGISTRY_KEYS.GENE_EMB_KEY in self.adata.varm:
+            gene_emb = self.adata.varm.get(REGISTRY_KEYS.GENE_EMB_KEY)
+            # Rotate embedding and convert to csr
+            gene_emb = sp.csr_matrix(gene_emb.T)
         # Use contrastive loss in validation if that set uses the same splitter
         if data_params.get('use_contrastive_loader', None) in ['val', 'both']:
             plan_kwargs['use_contr_in_val'] = True
@@ -641,6 +656,7 @@ class JEDVI(
             n_classes=self.n_labels, 
             cls_emb=cls_emb,
             cls_sim=cls_sim,
+            gene_emb=gene_emb,
             **plan_kwargs
         )
         check_val_every_n_epoch = train_params.pop('check_val_every_n_epoch', 1)
@@ -727,6 +743,7 @@ class JEDVI(
         adata: AnnData,
         labels_key: str,
         layer: str | None = None,
+        gene_emb_varm_key: str | None = 'gene_embedding',
         class_emb_uns_key: str | None = 'cls_embedding',
         class_certainty_key: str | None = None,
         batch_key: str | None = None,
@@ -755,9 +772,15 @@ class JEDVI(
         ]
         # Add class embedding matrix with shape (n_labels, class_emb_dim)
         if class_emb_uns_key is not None and class_emb_uns_key in adata.uns:
+            logging.info(f'Adding class embedding from adata.uns[{class_emb_uns_key}] to model')
             anndata_fields.append(StringUnsField(REGISTRY_KEYS.CLS_EMB_KEY, class_emb_uns_key))
+        # Add gene embedding matrix with shape (n_vars, emb_dim)
+        if gene_emb_varm_key is not None and gene_emb_varm_key in adata.varm:
+            logging.info(f'Adding gene embedding from adata.varm[{gene_emb_varm_key}] to model')
+            anndata_fields.append(VarmField(REGISTRY_KEYS.GENE_EMB_KEY, gene_emb_varm_key))
         # Add class score per cell, ensure its scaled [0, 1]
         if class_certainty_key is not None:
+            logging.info(f'Adding class certainty score from adata.obs[{class_certainty_key}] to model')
             scaled_class_cert_key = f'{class_certainty_key}_scaled'
             adata.obs[scaled_class_cert_key] = scale_1d_array(adata.obs[class_certainty_key].astype(float).values)
             anndata_fields.append(NumericalObsField(REGISTRY_KEYS.CLS_CERT_KEY, scaled_class_cert_key, required=False))

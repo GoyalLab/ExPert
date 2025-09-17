@@ -89,7 +89,11 @@ def get_model_latent(model, mode) -> ad.AnnData:
         latent.obsm[MODULE_KEYS.ZG_KEY] = cz
     return latent
 
-def calc_umap(adata: ad.AnnData, rep='X') -> None:
+def calc_umap(adata: ad.AnnData, rep: str = 'X') -> None:
+    if rep == 'X' and adata.X.shape[1] > 512:
+        # Falling back to pca
+        rep = 'X_pca'
+        sc.pp.pca(adata, n_comps=50)
     logging.info(f'Calculating latent neighbors')
     sc.pp.neighbors(adata, use_rep=rep)
     logging.info(f'Calculating latent umap')
@@ -400,8 +404,7 @@ def get_model_results(
     # Calculate classification confidence
     latents.obs['cls_score'] = soft_preds.max(axis=1) - soft_preds.mean(axis=1)
     # Calculate overall latent
-    sc.pp.neighbors(latents, use_rep='X')
-    sc.tl.umap(latents)
+    calc_umap(latents)
     if plot and max_classes > 0:
         logging.info('Plotting class masks for run.')
         plot_cls_masks(latents, plt_dir=plt_dir, max_classes=max_classes)

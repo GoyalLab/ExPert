@@ -24,8 +24,10 @@ class EmbAnnTorchDataset(AnnTorchDataset):
         adata_manager: AnnDataManager,
         getitem_tensors: list | dict[str, type] | None = None,
         load_sparse_tensor: bool = False,
+        ignore_types: list = ['uns', 'varm']
     ):
         super().__init__(adata_manager, getitem_tensors, load_sparse_tensor)
+        self.ignore_types = ignore_types
 
     def __getitem__(
         self, indexes: int | list[int] | slice
@@ -54,8 +56,8 @@ class EmbAnnTorchDataset(AnnTorchDataset):
         for key, dtype in self.keys_and_dtypes.items():
             data = self.data[key]
             idx_slice = indexes
-            if self.adata_manager.data_registry[key].attr_name == 'uns':
-                # Ignore .uns
+            if self.adata_manager.data_registry[key].attr_name in self.ignore_types:
+                # Ignore .uns and .varm
                 continue
             if isinstance(data, np.ndarray | h5py.Dataset):
                 sliced_data = data[idx_slice].astype(dtype, copy=False)

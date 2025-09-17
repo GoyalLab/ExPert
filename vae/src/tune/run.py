@@ -2,6 +2,7 @@ import os
 import argparse
 import logging
 import yaml
+import numpy as np
 import pandas as pd
 import itertools, random
 from copy import deepcopy
@@ -11,10 +12,15 @@ import torch.nn as nn
 import pytorch_lightning as pl
 
 import scanpy as sc
+import anndata as ad
+
+from tqdm import tqdm
 
 from ._statics import CONF_KEYS
 from ..models._jedvi import JEDVI
-from ..plotting import get_model_results
+from ..plotting import get_model_results, get_classification_report, get_latest_tensor_dir
+from ..performance import get_library, performance_metric
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +29,8 @@ logging.basicConfig(
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run vae model')
-    parser.add_argument('--input', type=str, required=True, help='Path to h5ad input file')
+    parser.add_argument('--input', type=str, required=True, help='Path to h5ad input file (train/val split)')
+    parser.add_argument('--test', type=str, default=None, help='Path to h5ad test file (test split)')
     parser.add_argument('--config', type=str, required=True, help='config.yaml file that specififes hyperparameters for training')
     parser.add_argument('--outdir', type=str, default=None, help='Output directory, default is config file directory')
     return parser.parse_args()
@@ -151,14 +158,14 @@ def read_config(config_p: str) -> dict:
     config = replace_nn_modules(config)
     return config
 
-def run(
+def train(
         adata_p: str, 
         step_model_dir: str, 
         config: dict, 
         cls_label: str = 'cls_label',
         batch_key: str = 'dataset',
         verbose: bool = True,
-    ) -> None:
+    ) -> tuple[nn.Module, pd.DataFrame, ad.AnnData]:
     logging.info(f'Reading training data from: {adata_p}')
     model_set = sc.read(adata_p)
     # Check if dataset is compatible
@@ -202,26 +209,213 @@ def run(
         batch_key=batch_key,
         labels_key=cls_label
     )
-    jedvae = JEDVI(model_set, **config[CONF_KEYS.MODEL].copy())
-    logging.info(jedvae)
+    model = JEDVI(model_set, **config[CONF_KEYS.MODEL].copy())
+    logging.info(model)
     # Set training logger
     config[CONF_KEYS.TRAIN]['logger'] = pl.loggers.TensorBoardLogger(step_model_dir)
     # Train the model
     logging.info(f'Running at: {step_model_dir}')
-    jedvae.train(
+    model.train(
         data_params=config[CONF_KEYS.DATA].copy(), 
         model_params=config[CONF_KEYS.MODEL].copy(), 
         train_params=config[CONF_KEYS.TRAIN].copy(), 
         return_runner=False
     )
     # Save results to lightning directory
-    get_model_results(
-        model=jedvae, 
+    results, latent = get_model_results(
+        model=model, 
         cls_labels=cls_labels, 
         log_dir=step_model_dir, 
         plot=True, 
-        max_classes=0
+        max_classes=100
     )
+    return model, results, latent
+
+import os
+import logging
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+
+
+def load_test_data(test_adata_p: str, model, incl_unseen: bool):
+    test_ad = sc.read(test_adata_p)
+    adata = model.adata
+
+    train_perturbations = set(adata.obs.perturbation.unique())
+    test_perturbations = set(test_ad.obs.perturbation.unique())
+    embedding_perturbations = set(
+        adata.uns['CLS_EMB_INIT']['labels'].str.replace('[neg;|pos;]', '', regex=True)
+    )
+
+    shared = test_perturbations.intersection(train_perturbations)
+    unseen = test_perturbations.difference(train_perturbations)
+    test_embedding = test_perturbations.intersection(embedding_perturbations)
+
+    logging.info(f"Found {len(train_perturbations)} trained class embeddings in model.")
+    logging.info(f"Found {len(embedding_perturbations)} total class embeddings in model.")
+    logging.info(f"Found {len(test_perturbations)} test perturbations.")
+    logging.info(f"Found {len(shared)} shared perturbations between training and testing.")
+    logging.info(f"Found {len(unseen)} unseen perturbations between training and testing.")
+    logging.info(f"Found {len(test_embedding)} perturbations in model's class embedding.")
+
+    if incl_unseen:
+        test_ad._inplace_subset_obs(test_ad.obs.perturbation.isin(test_embedding))
+    else:
+        test_ad._inplace_subset_obs(test_ad.obs.perturbation.isin(shared))
+        logging.info(f"Subsetting to training perturbations only, got {len(shared)}")
+
+    return test_ad
+
+
+def setup_labels(test_ad, test_adata_p: str, model, use_fixed_dataset_label: bool, cls_label: str = 'cls_label', batch_key: str = 'dataset', seed: int = 42):
+    test_ad.obs['perturbation_direction'] = 'neg'
+    if 'perturbation_direction' in test_ad.obs.columns:
+        cls_labels = ['perturbation_direction', 'perturbation']
+    else:
+        cls_labels = ['celltype', 'perturbation_type', 'perturbation']
+
+    test_ad.obs[cls_label] = test_ad.obs[cls_labels].agg(';'.join, axis=1)
+
+    ds_name = os.path.basename(test_adata_p).split('.h5ad')[0]
+    if not use_fixed_dataset_label:
+        logging.info("Randomly drawing dataset labels from training data.")
+        training_datasets = model.adata.obs.dataset.unique()
+        np.random.seed(seed)
+        ds_names = np.random.choice(training_datasets, test_ad.shape[0])
+        test_ad.obs[batch_key] = pd.Categorical(ds_names)
+    else:
+        logging.info(f"Added {ds_name} as dataset key.")
+        test_ad.obs[batch_key] = ds_name
+
+    return cls_label, batch_key
+
+
+def filter_test_data(test_ad, min_ms: float, min_cpp: int):
+    if 'mixscale_score' in test_ad.obs and min_ms is not None and min_ms > 0:
+        ms_mask = test_ad.obs.mixscale_score >= min_ms
+        test_ad._inplace_subset_obs(ms_mask)
+        logging.info(f"Filtered for minimum mixscale score of {min_ms}, got {test_ad.shape[0]} cells.")
+
+    cpp = test_ad.obs.perturbation.value_counts()
+    valid = cpp[cpp >= min_cpp].index
+    test_ad._inplace_subset_obs(test_ad.obs.perturbation.isin(valid))
+    logging.info(f"Found {valid.shape[0]} perturbations with at least {min_cpp} cells.")
+
+    return test_ad
+
+
+def run_model_predictions(model, test_ad, cls_label, batch_key):
+    model.setup_anndata(test_ad, labels_key=cls_label, batch_key=batch_key)
+    test_ad = model.create_test_data(test_ad)
+
+    if 'cls_embedding' not in test_ad.uns:
+        logging.info("Adding class embedding to test set")
+        test_ad.uns['cls_embedding'] = model.adata.uns['cls_embedding']
+
+    test_ad.obsm['latent_z'] = model.get_latent_representation(adata=test_ad)
+    predictions, cz = model.predict(adata=test_ad, return_latent=True, soft=True)
+
+    test_ad.obs['cls_prediction'] = predictions.columns[predictions.values.argmax(axis=-1)]
+    test_ad.obs['cls_score'] = predictions.max(axis=1) - predictions.mean(axis=1)
+
+    return test_ad, predictions
+
+
+def evaluate_predictions(test_ad, predictions, train_perturbations, output_dir: str, plot: bool):
+    _, report = get_classification_report(test_ad, cls_label='cls_label', mode='test')
+    report.sort_values('f1-score', ascending=False, inplace=True)
+    report['perturbation'] = report.index.str.split(';').str[1]
+    report['is_training_perturbation'] = report.perturbation.isin(train_perturbations)
+
+    top_n_predictions = compute_top_n_predictions(test_ad, predictions, train_perturbations)
+    top_n_predictions.to_csv(os.path.join(output_dir, 'top_n_predictions_report.csv'))
+
+    if plot:
+        plot_f1_distribution(top_n_predictions, test_ad, output_dir)
+
+
+def compute_top_n_predictions(test_ad, predictions, train_perturbations, n: int = 20):
+    y = (test_ad.obs.cls_label.values == predictions.columns.values.reshape(-1, 1)).argmax(axis=0)
+    labels = test_ad.obs.cls_label.values
+    max_idx = np.argsort(predictions, axis=1)
+
+    top_n_predictions = []
+    for top_n in tqdm(np.arange(n) + 1):
+        top_predictions = max_idx[:, -top_n:]
+        hit_mask = top_predictions == np.array(y)[:, np.newaxis]
+        hit_idx = np.argmax(hit_mask, axis=1)
+        is_hit = np.any(hit_mask, axis=1).astype(int)
+
+        stats_per_label = pd.DataFrame({
+            'y': np.concatenate([y[is_hit == 1], y[is_hit == 0]]),
+            'idx': np.concatenate([(top_n + 1 - hit_idx[is_hit == 1]) / (top_n + 1), np.repeat(0, np.sum(is_hit == 0))]),
+            'label': np.concatenate([labels[is_hit == 1], labels[is_hit == 0]]),
+            'prediction': np.concatenate([y[is_hit == 1], top_predictions[is_hit == 0][:, -1]])
+        })
+        stats_per_label['pred_label'] = predictions.columns[stats_per_label.prediction.values.astype(int)]
+        random_pred = pd.Series(np.random.choice(predictions.columns, stats_per_label.shape[0])).str.split(';').str[1]
+
+        actual = stats_per_label.label.str.split(';').str[1]
+        pred = stats_per_label.pred_label.str.split(';').str[1]
+        l = predictions.columns.str.split(';').str[1]
+
+        test_metrics = performance_metric(actual, pred, l, None, mode='test')
+        rand_metrics = performance_metric(actual, random_pred, l, None, mode='random')
+        metrics = pd.concat((test_metrics, rand_metrics), axis=0)
+        metrics = metrics[metrics.support > 0].copy()
+        metrics['top_n'] = top_n
+        top_n_predictions.append(metrics)
+
+    top_n_predictions = pd.concat(top_n_predictions, axis=0)
+    top_n_predictions['perturbation'] = top_n_predictions.index
+    top_n_predictions['is_training_perturbation'] = top_n_predictions.perturbation.isin(train_perturbations)
+
+    return top_n_predictions
+
+
+def plot_f1_distribution(top_n_predictions, test_ad, output_dir: str):
+    no_random = top_n_predictions[top_n_predictions['mode'] != 'random'].copy()
+    n_classes = test_ad.obs.cls_label.nunique()
+
+    plt.figure(dpi=300, figsize=(10, 5))
+    sns.boxenplot(no_random, x='top_n', y='f1', hue='is_training_perturbation',
+                  palette=['#7900d7', '#3274a1'])
+    plt.xlabel('Number of top predictions')
+    plt.ylim([0.0, 1.0])
+    plt.ylabel('F1-score per class')
+    plt.title(f'Test F1-score distribution over top predictions (N={n_classes})', pad=20)
+    plt.legend(title="Training Perturbation", bbox_to_anchor=(1.05, 1), loc="upper left", borderaxespad=0)
+    plt.tight_layout()
+
+    os.makedirs(os.path.join(output_dir, "plots"), exist_ok=True)
+    plt.savefig(os.path.join(output_dir, "plots", "test_f1.svg"))
+    plt.close()
+
+
+def test(
+        model, 
+        test_adata_p: str, 
+        output_dir: str,
+        incl_unseen: bool = True,
+        use_fixed_dataset_label: bool = True,
+        min_ms: float = 4.0,
+        min_cpp: int = 10,
+        plot: bool = False,
+    ):
+    test_ad = load_test_data(test_adata_p, model, incl_unseen)
+    cls_label, batch_key = setup_labels(test_ad, test_adata_p, model, use_fixed_dataset_label)
+    test_ad = filter_test_data(test_ad, min_ms, min_cpp)
+    test_ad, predictions = run_model_predictions(model, test_ad, cls_label, batch_key)
+
+    train_perturbations = set(model.adata.obs.perturbation.unique())
+    top_n_predictions = evaluate_predictions(test_ad, predictions, train_perturbations, output_dir, plot)
+    # Save results to file
+    top_n_predictions.to_csv(os.path.join(output_dir, 'top_n_predictions_report.csv'))
+
 
 def get_ouptut_dir(config_p: str, output_base_dir: str | None = None) -> str:
     # Create directory based on the input config name
@@ -237,8 +431,15 @@ if __name__ == '__main__':
     config = read_config(args.config)
     step_model_dir = get_ouptut_dir(args.config, output_base_dir=args.outdir)
     # Train the model
-    run(
+    logging.info(f'Training config: {args.config}')
+    model, results, latent = train(
         adata_p=args.input, 
         step_model_dir=step_model_dir, 
         config=config
     )
+    # Get latest lightning directory
+    version_dir = get_latest_tensor_dir(step_model_dir)
+    # Test model performance if path is given
+    if args.test is not None and os.path.exists(args.test) and args.test.endswith('.h5ad'):
+        logging.info(f'Testing with: {args.test}')
+        test(model, test_adata_p=args.test, output_dir=version_dir, plot=True)

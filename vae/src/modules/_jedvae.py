@@ -1,13 +1,11 @@
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 from src.modules._base import EmbeddingClassifier, Encoder, DecoderSCVI
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 from src.utils.distributions import rescale_targets
-from src.utils.common import zscore, pearson, BatchCache
+from src.utils.common import pearson, BatchCache
 
 from typing import Iterable
-
-import numpy as np
 
 import logging
 import torch
@@ -149,14 +147,11 @@ class JEDVAE(VAE):
         _extra_encoder_kwargs = extra_encoder_kwargs or {}
         _extra_decoder_kwargs = extra_decoder_kwargs or {}
 
-        n_layers_encoder = _extra_encoder_kwargs.get('n_layers', n_layers)
-
         # Re-Init encoder for X (rna-seq)
         self.z_encoder = Encoder(
             n_input=n_input_encoder, 
             n_output=n_latent, 
             n_hidden=n_hidden,
-            n_layers=n_layers_encoder, 
             n_cat_list=encoder_cat_list, 
             dropout_rate=dropout_rate_encoder, 
             use_batch_norm=use_batch_norm_encoder, 
@@ -168,13 +163,10 @@ class JEDVAE(VAE):
             return_dist=True,
         )
 
-        n_layers_decoder = _extra_decoder_kwargs.get('n_layers', n_layers)
-
         self.decoder = DecoderSCVI(
             n_input=n_latent,
             n_output=n_input,
             n_cat_list=cat_list,
-            n_layers=n_layers_decoder,
             n_hidden=n_hidden,
             use_batch_norm=use_batch_norm_decoder, 
             use_layer_norm=use_layer_norm_decoder,
@@ -196,6 +188,80 @@ class JEDVAE(VAE):
         # Debug
         self.use_cache = False
         self.cache = BatchCache(10)
+
+    def _get_inference_input(
+        self,
+        tensors: dict[str, torch.Tensor | None],
+    ) -> dict[str, torch.Tensor | None]:
+        """Get input tensors for the inference process."""
+        return {
+            MODULE_KEYS.X_KEY: tensors[REGISTRY_KEYS.X_KEY],
+            MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
+            MODULE_KEYS.G_EMB_KEY: tensors.get(REGISTRY_KEYS.GENE_EMB_KEY, None),
+            MODULE_KEYS.CONT_COVS_KEY: tensors.get(REGISTRY_KEYS.CONT_COVS_KEY, None),
+            MODULE_KEYS.CAT_COVS_KEY: tensors.get(REGISTRY_KEYS.CAT_COVS_KEY, None),
+        }
+    
+    @auto_move_data
+    def _regular_inference(
+        self,
+        x: torch.Tensor,
+        batch_index: torch.Tensor,
+        g: torch.Tensor | None = None,
+        cont_covs: torch.Tensor | None = None,
+        cat_covs: torch.Tensor | None = None,
+        n_samples: int = 1,
+    ) -> dict[str, torch.Tensor | Distribution | None]:
+        """Run the regular inference process."""
+        x_ = x
+        if self.use_observed_lib_size:
+            library = torch.log(x.sum(1)).unsqueeze(1)
+        if self.log_variational:
+            x_ = torch.log1p(x_)
+
+        if cont_covs is not None and self.encode_covariates:
+            encoder_input = torch.cat((x_, cont_covs), dim=-1)
+        else:
+            encoder_input = x_
+        if cat_covs is not None and self.encode_covariates:
+            categorical_input = torch.split(cat_covs, 1, dim=1)
+        else:
+            categorical_input = ()
+        import pdb
+        pdb.set_trace()
+        if self.batch_representation == "embedding" and self.encode_covariates:
+            batch_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index)
+            encoder_input = torch.cat([encoder_input, batch_rep], dim=-1)
+            qz, z = self.z_encoder(encoder_input, *categorical_input, g=g)
+        else:
+            qz, z = self.z_encoder(encoder_input, batch_index, *categorical_input, g=g)
+
+        ql = None
+        if not self.use_observed_lib_size:
+            if self.batch_representation == "embedding":
+                ql, library_encoded = self.l_encoder(encoder_input, *categorical_input)
+            else:
+                ql, library_encoded = self.l_encoder(
+                    encoder_input, batch_index, *categorical_input
+                )
+            library = library_encoded
+
+        if n_samples > 1:
+            untran_z = qz.sample((n_samples,))
+            z = self.z_encoder.z_transformation(untran_z)
+            if self.use_observed_lib_size:
+                library = library.unsqueeze(0).expand(
+                    (n_samples, library.size(0), library.size(1))
+                )
+            else:
+                library = ql.sample((n_samples,))
+
+        return {
+            MODULE_KEYS.Z_KEY: z,
+            MODULE_KEYS.QZ_KEY: qz,
+            MODULE_KEYS.QL_KEY: ql,
+            MODULE_KEYS.LIBRARY_KEY: library,
+        }
 
     @auto_move_data
     def classify(

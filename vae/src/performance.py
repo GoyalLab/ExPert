@@ -5,6 +5,27 @@ import gseapy as gp
 
 from typing import Iterable, Any
 
+from sklearn.metrics import precision_recall_fscore_support
+
+
+def performance_metric(actual, pred, labels, lib=None, mode='test'):
+    # Add pathway overlap
+    if lib is not None:
+        universe = set(map(str.upper, set(actual) | set(pred)))
+        gene2p = build_gene2pathways(universe, lib)
+        df_cmp = compare_gene_pairs(actual, pred, gene2p)
+        actual = df_cmp.actual
+        pred = df_cmp.pathway_predicted
+    # Calculate metrics for new predictions
+    cls_report = precision_recall_fscore_support(
+        actual, pred,
+        labels=labels,
+        average=None, 
+        zero_division=np.nan)
+    m = pd.DataFrame(cls_report, index=['precision', 'recall', 'f1', 'support'], columns=labels).T
+    # Set label
+    m['mode'] = mode
+    return m
 
 def get_classification_report(
         adata: ad.AnnData, 
