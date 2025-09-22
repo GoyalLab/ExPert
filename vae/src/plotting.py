@@ -127,6 +127,9 @@ def get_classification_report(latent: ad.AnnData, cls_label: str, mode: str, pre
     return summary, report_data
 
 def plot_performance_support_corr(summary: pd.DataFrame, o: str):
+    if summary['f1-score'].min() == summary['f1-score'].max():
+        logging.info(f'Got uniform values for f1-score, cannot plot kde for mode {summary["mode"].unique()[0]}.')
+        return
     sns.kdeplot(summary, x='log_count', y='f1-score', hue='mode')
     plt.xlabel('Class support (log)')
     plt.ylabel('Macro f1-score')
@@ -152,7 +155,7 @@ def get_soft_predictions(model: nn.Module, adata: ad.AnnData | None = None, mode
 
     data = adata[idx].copy() if idx is not None else adata
     data.obs['idx'] = idx
-    data = data[data.obs.perturbation!='control']
+    #data = data[data.obs.perturbation!='control']
     soft_predictions = model.predict(adata=adata, indices=data.obs['idx'].values, soft=True)
     if isinstance(soft_predictions, tuple):
         soft_predictions, _ = soft_predictions
@@ -205,7 +208,7 @@ def plot_soft_predictions(model: nn.Module, data: ad.AnnData, soft_predictions: 
 
     plt.figure(dpi=120)
     top_n_predictions_no_ctrl = top_n_predictions[~top_n_predictions.cls_label.str.endswith('control')]
-    ax = sns.boxplot(top_n_predictions_no_ctrl, x='top_n', y='f1', hue='top_n', legend=False)
+    ax = sns.boxenplot(top_n_predictions_no_ctrl, x='top_n', y='f1', hue='top_n', legend=False)
     # Display means on top of boxes
     means = top_n_predictions_no_ctrl.groupby('top_n')['f1'].mean()
     for i, top_n_value in enumerate(sorted(top_n_predictions['top_n'].unique())):

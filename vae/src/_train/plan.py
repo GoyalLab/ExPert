@@ -1,11 +1,12 @@
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
-from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 import torch
 import torchmetrics.functional as tmf
 import torch.nn.functional as F
 
+from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
+from src.utils.common import to_tensor
 from scvi.train import TrainingPlan
 from scvi.module.base import BaseModuleClass, LossOutput
 from scvi.train._metrics import ElboMetric
@@ -14,6 +15,8 @@ from scvi.train._constants import METRIC_KEYS
 from typing import Literal, Any
 from umap import UMAP
 from collections import defaultdict
+
+import logging
 
 
 def _sigmoid_schedule(t, T, k):
@@ -555,7 +558,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         gene_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         cls_sim: torch.Tensor | None = None,
-        cls_emb_mode: Literal["fixed", "full", "sample"] = "fixed",
+        use_full_cls_emb: bool = False,
         incl_n_unseen: int | None = None,
         anneal_schedules: dict[str, dict[str | float]] | None = None,
         full_val_log_every_n_epoch: int = 10,
@@ -584,10 +587,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # CLS params
         self.n_classes = n_classes
         self.use_posterior_mean = use_posterior_mean
-        self.gene_emb = self._to_tensor(gene_emb)
-        self.cls_emb = self._to_tensor(cls_emb)
-        self.cls_sim = self._calc_cls_sim(self.cls_emb) if cls_sim is None else self._to_tensor(cls_sim)
-        self.cls_emb_mode = cls_emb_mode
+        self.gene_emb = to_tensor(gene_emb)
+        self.cls_emb = to_tensor(cls_emb)
+        self.cls_sim = self._calc_cls_sim(self.cls_emb) if cls_sim is None else to_tensor(cls_sim)
+        self.use_full_cls_emb = use_full_cls_emb
+        # Add train class embedding
+        if not use_full_cls_emb and self.cls_emb is not None:
+            self.train_cls_emb = self.cls_emb[:self.n_classes,:]
+            self.train_cls_sim = self.train_cls_emb @ self.train_cls_emb.T
+        if self.cls_emb is None:
+            logging.warning(f'No external class embeddings provided, falling back to internal class embeddings.')
         self.incl_n_unseen = incl_n_unseen
         self.use_cls_scores = use_cls_scores
         # Contrastive params
@@ -759,44 +768,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
         )
 
-    def _to_tensor(self, m: sp.csr_matrix | torch.Tensor | np.ndarray | None) -> torch.Tensor:
-        if m is None:
-            return None
-        if sp.issparse(m):
-            return torch.Tensor(m.toarray())
-        if isinstance(m, np.ndarray):
-            return torch.Tensor(m)
-        if isinstance(m, torch.Tensor):
-            return m
-        raise ValueError(f'{m.__class__} is not compatible. Should be either sp.csr_matrix, np.ndarray, or torch.Tensor.')
-
-    def _get_batch_class_embedding(self, batch_idx: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        # Always include embedding for classes we actually observe during training
-        if self.incl_n_unseen is None or self.incl_n_unseen == 0 or self.cls_emb_mode != 'sample':
-            # Use full embedding
-            if self.cls_emb_mode == 'full':
-                return self.cls_emb, self.cls_sim
-            # Or use fixed part of embedding
-            if self.cls_emb_mode == 'fixed':
-                cls_emb = self.cls_emb[:self.n_classes,:]
-                return cls_emb, self._calc_cls_sim(cls_emb)
-        # Or randomly include other unseen classes
-        unseen_class_idc = np.arange(self.n_classes, self.cls_emb.shape[0])
-        # Draw classes based on batch index (for reproducibility)
-        rng = np.random.default_rng(seed=batch_idx)
-        sampled_unseen = rng.choice(
-            unseen_class_idc,
-            size=min(self.incl_n_unseen, len(unseen_class_idc)),
-            replace=False
-        )
-        # Add unseen to training classes
-        full_idx = np.concatenate([np.arange(self.n_classes), sampled_unseen])
-        # Update classes that were seen during training
-        self.observed_classes.update(full_idx)
-        self.n_unseen_classes = self.cls_emb.shape[0] - len(self.observed_classes)
-        # Subset embedding
-        cls_emb = self.cls_emb[full_idx,:]
-        return cls_emb, self._calc_cls_sim(cls_emb)
+    def _get_batch_class_embedding(self, **kwargs) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.cls_emb is None:
+            return None, None
+        # Use full embedding
+        if self.use_full_cls_emb:
+            return self.cls_emb, self.cls_sim
+        # Or use fixed part of embedding
+        else:
+            return self.train_cls_emb, self.train_cls_sim
 
     def _calc_cls_sim(self, cls_emb: torch.Tensor | None) -> torch.Tensor | None:
         if cls_emb is None:
@@ -813,6 +793,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
         if mode=='train' or self.use_contr_in_val:
             self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
+        else:
+            self.loss_kwargs.update({"contrastive_loss_weight": 0.0})
         self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == mode or self.use_posterior_mean == "both"})
         self.loss_kwargs.update({"class_kl_temperature": self.class_kl_temperature})
@@ -826,7 +808,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Add external embedding to batch
         if self.cls_emb is not None:
             # Add embedding for classes
-            batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding(batch_idx=batch_idx)
+            batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding()
         # Choose to use class scores for scaling or not
         input_kwargs['use_cls_scores'] = self.use_cls_scores in [mode, 'both']
         # Perform full forward pass of model
@@ -1040,6 +1022,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 if self.cls_emb is not None:
                     # Add embedding for classes that are not in the training data
                     batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding()
+                # Add external gene embedding to batch
+                if self.gene_emb is not None:
+                    # Add gene embedding matrix to batch
+                    batch[REGISTRY_KEYS.GENE_EMB_KEY] = self.gene_emb
                 # Perform actual forward pass
                 inference_outputs, _, loss_output = self.forward(move_to_device(batch), loss_kwargs=input_kwargs)
                 # Save inference and generative output

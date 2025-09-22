@@ -220,6 +220,12 @@ def create_meta_summary(
     ):
     # Collect meta data for all available datasets
     obs, vars_dict = collect_meta_from_files(input_files)
+    
+    # Get union of all perturbations in the datasets
+    perturbation_union = pd.DataFrame(obs.perturbation.unique(), columns=['perturbation'])
+    union_file = os.path.join(os.path.dirname(perturbation_pool_file), 'all_perturbations.csv')
+    perturbation_union.to_csv(union_file)
+
     # Calculate optimal perturbation pool
     perturbation_pool = _calc_pool_datasets(obs)
     # Save pool to output file

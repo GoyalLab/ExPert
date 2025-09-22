@@ -120,6 +120,7 @@ class TransformerBlock(nn.Module):
         n_head: int,
         head_size: int | None = None,
         ff_mult: int = 4,                 # expansion factor in FFN (like in Vaswani et al.)
+        use_attention: bool = True,
         use_batch_norm: bool = False,
         use_layer_norm: bool = True,
         dropout_rate: float = 0.1,
@@ -132,14 +133,17 @@ class TransformerBlock(nn.Module):
         self.use_batch_norm = use_batch_norm
         self.use_layer_norm = use_layer_norm
         self.noise_std = noise_std
+        self.use_attention = use_attention
 
         # Attention over features
-        self.attn = MultiHeadAttention(
-            num_heads=n_head, 
-            n_input=n_input, 
-            head_size=head_size, 
-            dropout_rate=dropout_rate
-        )
+        if use_attention:
+            self.attn = MultiHeadAttention(
+                num_heads=n_head, 
+                n_input=n_input, 
+                head_size=head_size, 
+                dropout_rate=dropout_rate,
+                **kwargs
+            )
 
         # Norm layers
         self.norm1 = nn.LayerNorm(n_input) if use_layer_norm else nn.Identity()
@@ -167,8 +171,9 @@ class TransformerBlock(nn.Module):
             out: (B, n_input)
         """
         # --- Attention + residual ---
-        attn_out = self.attn(self.norm1(x), **kwargs)              # (B, n_input)
-        x = x + self.dropout(attn_out)
+        if self.use_attention:
+            attn_out = self.attn(self.norm1(x), **kwargs)              # (B, n_input)
+            x = x + self.dropout(attn_out)
 
         # --- Feedforward + residual ---
         r = self.ff(self.norm2(x))                       # (B, n_input)
@@ -192,12 +197,12 @@ class FunnelFCLayers(nn.Module):
         n_cat_list: Optional[Iterable[int]] = None,
         n_layers: int = 2,
         min_attn_dim: int = 64,
-        max_attn_dim: int = 1042,
+        max_attn_dim: int = 256,
         dropout_rate: float = 0.1,
         use_batch_norm: bool = True,
         use_layer_norm: bool = False,
         use_activation: bool = True,
-        use_attention: bool = True,
+        use_attention: bool = False,
         n_head: int = 4,
         bias: bool = True,
         inverted: bool = False,
@@ -205,8 +210,6 @@ class FunnelFCLayers(nn.Module):
         activation_fn: nn.Module = nn.LeakyReLU,
         noise_std: float = 0.0,
         skip_first: bool = True,
-        use_transformer_block: bool = False,
-        last_attention: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -220,7 +223,7 @@ class FunnelFCLayers(nn.Module):
 
         # Init modules
         self.layer_norm = nn.LayerNorm(n_out)
-        self.block = TransformerBlock if use_transformer_block else Block
+        self.block = Block
 
         self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in (n_cat_list or [])]
         self.cat_dim = sum(self.n_cat_list)
@@ -246,7 +249,7 @@ class FunnelFCLayers(nn.Module):
             in_dim = hidden_dims[i] + self.cat_dim * self.inject_into_layer(i)
             out_dim = hidden_dims[i + 1]
             # Determine whether to to use attention for block, never use on the first layer
-            is_attention_block = False if (i == 0 and skip_first) else (min_attn_dim <= in_dim <= max_attn_dim)
+            is_attention_block = False if (i == 0 and skip_first) else (min_attn_dim <= in_dim <= max_attn_dim) and use_attention
             # Create block for each layer
             block = self.block(
                 n_input=in_dim, 
@@ -262,23 +265,6 @@ class FunnelFCLayers(nn.Module):
                 noise_std=noise_std
             )
             self.layers.append(block)
-        # Add attention to the last layer
-        if last_attention:
-            block = self.block(
-                n_input=n_out,
-                n_output=n_out,
-                n_head=n_head,
-                use_batch_norm=use_batch_norm,
-                use_layer_norm=use_layer_norm,
-                use_activation=use_activation,
-                use_attention=True,
-                dropout_rate=dropout_rate,
-                activation_fn=activation_fn,
-                bias=bias,
-                noise_std=noise_std
-            )
-            self.layers.append(block)
-
     
     def inject_into_layer(self, layer_num) -> bool:
         """Helper to determine if covariates should be injected."""
@@ -314,6 +300,7 @@ class AttentionLayers(nn.Module):
         n_hidden: int = 128,
         n_cat_list: Optional[Iterable[int]] = None,
         n_layers: int = 2,
+        n_attn_layers: int = 3,
         dropout_rate: float = 0.1,
         use_batch_norm: bool = True,
         use_layer_norm: bool = False,
@@ -325,6 +312,8 @@ class AttentionLayers(nn.Module):
         inject_covariates: bool = False,
         activation_fn: nn.Module = nn.LeakyReLU,
         noise_std: float = 0.0,
+        linear_encoder: bool = True,
+        compress_emb_dim: int | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -334,6 +323,7 @@ class AttentionLayers(nn.Module):
         self.use_layer_norm = use_layer_norm
         self.use_attention = use_attention
         self.n_hidden = n_hidden
+        self.compress_emb = compress_emb_dim is not None and compress_emb_dim < 2048
         self.kwargs = kwargs
 
         # Init modules
@@ -343,27 +333,47 @@ class AttentionLayers(nn.Module):
         self.cat_dim = sum(self.n_cat_list)
 
         # Encode down to bottleneck latent space
-        self.encoder = nn.Linear(n_in, n_out)
+        if linear_encoder:
+            self.encoder = nn.Linear(n_in, n_out)
+        else:
+            self.encoder = FunnelFCLayers(
+                n_in=n_in, 
+                n_out=n_out, 
+                n_hidden=n_hidden, 
+                n_layers=n_layers,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                use_attention=use_attention,
+                dropout_rate=dropout_rate,
+            )
         # Add encoder for embedding dimensions
+        emb_dim = None
         if gene_emb_dim is not None:
-            self.embedding_compressor = nn.Linear(gene_emb_dim, n_out)
+            if self.compress_emb:
+                # Compress embedding using a linear layer
+                self.embedding_compressor = nn.Linear(gene_emb_dim, compress_emb_dim)
+                emb_dim = compress_emb_dim
+            else:
+                # Fall back to full embedding (likely blows memory limits unless its already compressed)
+                emb_dim = gene_emb_dim
         # Introduce multiple attention layers of same dimension
         self.layers = nn.ModuleList()
-        for _ in np.arange(n_layers):
+        for _ in np.arange(n_attn_layers):
             # Create block for each layer
             block = TransformerBlock(
                 n_input=n_out,
                 n_head=n_head,
+                use_attention=use_attention,
                 use_batch_norm=use_batch_norm,
                 use_layer_norm=use_layer_norm,
                 dropout_rate=dropout_rate,
                 activation_fn=activation_fn,
                 bias=bias,
                 noise_std=noise_std,
+                emb_dim=emb_dim,
                 **kwargs
             )
             self.layers.append(block)
-
     
     def inject_into_layer(self, layer_num) -> bool:
         """Helper to determine if covariates should be injected."""
@@ -375,9 +385,12 @@ class AttentionLayers(nn.Module):
         # Project gene embedding if external is given
         if gene_embedding is not None:
             g = gene_embedding.to(x.device)
-            compressed_g = self.embedding_compressor(g.T)
+            # Compress embedding dimensions
+            if self.compress_emb:
+                g = self.embedding_compressor(g.T).T
+            # Compress features with gene encoder (no grad)
             with torch.no_grad():
-                feature_emb = self.encoder(compressed_g.T)
+                feature_emb = self.encoder(g)
         else:
             feature_emb = None
         # One-hot encode categorical covariates
@@ -445,14 +458,15 @@ class FCLayers(nn.Module):
         use_batch_norm: bool = True,
         use_layer_norm: bool = False,
         use_activation: bool = True,
-        use_attention: bool = False,
         bias: bool = True,
         inject_covariates: bool = True,
         activation_fn: nn.Module = nn.LeakyReLU,
+        linear: bool = False,
         **kwargs
     ):
         super().__init__()
         self.inject_covariates = inject_covariates
+        self.linear = linear
         layers_dim = [n_in] + (n_layers - 1) * [n_hidden] + [n_out]
 
         if n_cat_list is not None:
@@ -460,37 +474,40 @@ class FCLayers(nn.Module):
             self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in n_cat_list]
         else:
             self.n_cat_list = []
-
         cat_dim = sum(self.n_cat_list)
-        self.fc_layers = nn.Sequential(
-            collections.OrderedDict(
-                [
-                    (
-                        f"Layer {i}",
-                        nn.Sequential(
-                            nn.Linear(
-                                n_in + cat_dim * self.inject_into_layer(i),
-                                n_out,
-                                bias=bias,
+        # Add a single linear layer
+        if linear:
+            self.fc_layers = nn.Linear(n_in + cat_dim, n_out)
+        else:
+            self.fc_layers = nn.Sequential(
+                collections.OrderedDict(
+                    [
+                        (
+                            f"Layer {i}",
+                            nn.Sequential(
+                                nn.Linear(
+                                    n_in + cat_dim * self.inject_into_layer(i),
+                                    n_out,
+                                    bias=bias,
+                                ),
+                                # non-default params come from defaults in original Tensorflow
+                                # implementation
+                                nn.BatchNorm1d(n_out, momentum=0.01, eps=0.001)
+                                if use_batch_norm
+                                else None,
+                                nn.LayerNorm(n_out, elementwise_affine=False)
+                                if use_layer_norm
+                                else None,
+                                activation_fn() if use_activation else None,
+                                nn.Dropout(p=dropout_rate) if dropout_rate > 0 else None,
                             ),
-                            # non-default params come from defaults in original Tensorflow
-                            # implementation
-                            nn.BatchNorm1d(n_out, momentum=0.01, eps=0.001)
-                            if use_batch_norm
-                            else None,
-                            nn.LayerNorm(n_out, elementwise_affine=False)
-                            if use_layer_norm
-                            else None,
-                            activation_fn() if use_activation else None,
-                            nn.Dropout(p=dropout_rate) if dropout_rate > 0 else None,
-                        ),
-                    )
-                    for i, (n_in, n_out) in enumerate(
-                        zip(layers_dim[:-1], layers_dim[1:], strict=True)
-                    )
-                ]
+                        )
+                        for i, (n_in, n_out) in enumerate(
+                            zip(layers_dim[:-1], layers_dim[1:], strict=True)
+                        )
+                    ]
+                )
             )
-        )
 
     def inject_into_layer(self, layer_num) -> bool:
         """Helper to determine if covariates should be injected."""
@@ -552,6 +569,18 @@ class FCLayers(nn.Module):
                 else:
                     one_hot_cat = cat  # cat has already been one_hot encoded
                 one_hot_cat_list += [one_hot_cat]
+        # Apply linear mapping
+        if self.linear:
+            if x.dim() == 3:
+                one_hot_cat_list_layer = [
+                    o.unsqueeze(0).expand((x.size(0), o.size(0), o.size(1)))
+                    for o in one_hot_cat_list
+                ]
+            else:
+                one_hot_cat_list_layer = one_hot_cat_list
+            x = torch.cat((x, *one_hot_cat_list_layer), dim=-1)
+            return self.fc_layers(x)
+        # Forward through layers
         for i, layers in enumerate(self.fc_layers):
             for layer in layers:
                 if layer is not None:
@@ -648,148 +677,131 @@ class MultiHeadAttentionIterative(nn.Module):
         if self.dropout_rate > 0:
             x = self.dropout(x)
         return x
+    
+
+class AttentionHead(nn.Module):
+    """Single attention head with its own projections"""
+    def __init__(self, embedding_dim: int, head_size: int, dropout_rate: float = 0.1):
+        super().__init__()
+        self.head_size = head_size
+        # Each head has its own projections
+        self.q_proj = nn.Linear(embedding_dim, head_size, bias=False)
+        self.k_proj = nn.Linear(embedding_dim, head_size, bias=False)
+        self.v_proj = nn.Linear(embedding_dim, head_size, bias=False)
+        self.dropout = nn.Dropout(dropout_rate)
+        
+    def forward(self, x_emb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x_emb: (B,F,E) embedded input
+        Returns:
+            out: (B,F,L) attention output
+            attn: (B,F,F) attention weights
+        """
+        # Project to Q,K,V
+        q = self.q_proj(x_emb)  # (B,F,L)
+        k = self.k_proj(x_emb)  # (B,F,L)
+        v = self.v_proj(x_emb)  # (B,F,L)
+        
+        # Compute attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_size)
+        attn = F.softmax(scores, dim=-1)  # (B,F,F)
+        attn = self.dropout(attn)
+        
+        # Apply attention
+        out = torch.matmul(attn, v)  # (B,F,L)
+        return out, attn
 
 
 class MultiHeadAttention(nn.Module):
-    """
-    Multi-head self-attention over features with learnable embeddings.
-    Input:  (B, F) where F = number of features
-    Output: (B, F) same shape
-    """
-
     def __init__(
         self,
-        num_heads: int,
         n_input: int,
+        num_heads: int,
         head_size: int | None = None,
         dropout_rate: float = 0.1,
-        use_buffer: bool = False,
         sequential: bool = True,
+        emb_dim: int | None = None,
+        buffer_n_step: int | None = None,
+        min_buffer_steps: int = 5000,
+        max_buffer_entries: int = 20,
+        buffer_mode: Literal['train', 'val'] = 'train',
+        use_ext_emb: bool = False,
+        **kwargs
     ):
         super().__init__()
         self.num_heads = num_heads
         self.n_input = n_input
-        self.head_size = head_size if head_size is not None else n_input // num_heads
+        feature_input = n_input if emb_dim is None else emb_dim
+        self.head_size = head_size if head_size is not None else feature_input // num_heads
         self.d_model = self.head_size * num_heads
 
         # learnable embeddings for each feature (gene)
-        self.feature_emb = nn.Embedding(n_input, self.d_model)
-
-        # projections for all heads
-        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.k_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        if not use_ext_emb:
+            self.feature_emb = nn.Embedding(n_input, self.d_model)
+        
+        # Create separate attention heads
+        self.heads = nn.ModuleList([
+            AttentionHead(
+                embedding_dim=self.d_model,
+                head_size=self.head_size,
+                dropout_rate=dropout_rate
+            ) for _ in range(num_heads)
+        ])
 
         # output projection: concat(H*L) -> 1
         self.out_proj = nn.Linear(self.d_model, 1, bias=True)
         self.dropout = nn.Dropout(dropout_rate)
 
-        # store last attention maps (B, H, F, F)
-        self.register_buffer("last_attn", torch.empty(0), persistent=False)
-        self.use_buffer = use_buffer
         self.sequential = sequential
-
+        # If not None and bigger than min steps, save a buffer of the attention layer
+        self.record_each_n_step = buffer_n_step if buffer_n_step is not None and buffer_n_step > min_buffer_steps else None
+        self.buffer_mode = buffer_mode
+        self._buffer_idx = 0
+        # Register buffer TODO: implement buffer_mode switch
+        if self.record_each_n_step is not None:
+            self.max_buffer_entries = max_buffer_entries
+            self.register_buffer('attn_buffer', [], persistent=False)
+        
     def forward(self, x: torch.Tensor, feature_emb: torch.Tensor | None = None, return_attn: bool = False):
-        if self.sequential:
-            return self.seq_forward(x, feature_emb=feature_emb, return_attn=return_attn)
-        else:
-            return self.mm_forward(x, feature_emb=feature_emb, return_attn=return_attn)
-
-    def mm_forward(self, x: torch.Tensor, feature_emb: torch.Tensor | None = None, return_attn: bool = False):
         """
         Args:
             x: (B, F) expression matrix
-        Returns:
-            out: (B, F)
-            attn (optional): (B, H, F, F)
-        """
-        B, F_ = x.shape
-        H, L = self.num_heads, self.head_size
-
-        # --- Expand expression with learnable embeddings ---
-        _feature_emb = feature_emb if feature_emb is not None else self.feature_emb.weight
-        feat_vecs = _feature_emb.unsqueeze(0).expand(B, -1, -1)  # (B, F, emb_dim)
-        x_emb = x.unsqueeze(-1) * feat_vecs                                # (B, F, emb_dim)
-
-        # --- Project into Q, K, V ---
-        Q = self.q_proj(x_emb).view(B, F_, H, L).transpose(1, 2)  # (B,H,F,L)
-        K = self.k_proj(x_emb).view(B, F_, H, L).transpose(1, 2)  # (B,H,F,L)
-        V = self.v_proj(x_emb).view(B, F_, H, L).transpose(1, 2)  # (B,H,F,L)
-
-        # --- Attention scores ---
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(L)  # (B,H,F,F)
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-
-        # --- Apply attention ---
-        out = torch.matmul(attn, V)   # (B,H,F,L)
-
-        # Concat heads: (B,F,H*L) = (B,F,d_model)
-        out = out.transpose(1, 2).contiguous().view(B, F_, H * L)
-
-        # Project down to (B,F)
-        out = self.out_proj(out).squeeze(-1)   # (B,F)
-        out = self.dropout(out)
-
-        # Save last attention
-        if self.use_buffer:
-            self.last_attn = attn.detach().cpu()
-
-        if return_attn:
-            return out, attn
-        return out
-
-    def seq_forward(self, x: torch.Tensor, feature_emb: torch.Tensor | None = None, return_attn: bool = False):
-        """
-        Args:
-            x: (B, F) expression matrix
+            feature_emb (optional): (F, E) external feature embedding matrix
         Returns:
             out: (B, F)
             attn (optional): (B, H, F, F)  # only if return_attn=True
         """
-        H, L = self.num_heads, self.head_size
+        #self._buffer_idx += 1
+        _record_step = False
+        #_record_step = self.record_each_n_step is not None and self._buffer_idx % self.record_each_n_step == 0 and self.training
+        # Get feature embeddings
+        _feature_emb = feature_emb.T if feature_emb is not None else self.feature_emb.weight
+        x_emb = torch.einsum("bf,fe->bfe", x, _feature_emb)  # (B,F,E)
 
-        # --- Multiply expression values with feature embeddings (either learnable or pre-computed) ---
-        # avoids expand: (B,F,emb_dim)
-        _feature_emb = feature_emb if feature_emb is not None else self.feature_emb.weight
-        x_emb = torch.einsum("bf,fe->bfe", x, _feature_emb)
-
-        # --- Project once ---
-        Q_full = self.q_proj(x_emb)  # (B,F,H*L)
-        K_full = self.k_proj(x_emb)
-        V_full = self.v_proj(x_emb)
-
-        # --- Process heads sequentially ---
+        # Process each head
         out_heads = []
         attn_list = [] if return_attn else None
 
-        for h in range(H):
-            q = Q_full[:, :, h*L:(h+1)*L]  # (B,F,L)
-            k = K_full[:, :, h*L:(h+1)*L]  # (B,F,L)
-            v = V_full[:, :, h*L:(h+1)*L]  # (B,F,L)
-
-            # attention scores: (B,F,F) — one head at a time
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(L)
-            attn = F.softmax(scores, dim=-1)
-            attn = self.dropout(attn)
-
-            # apply attention
-            out_h = torch.matmul(attn, v)  # (B,F,L)
+        # Run each attention head
+        for head in self.heads:
+            out_h, attn = head(x_emb)  # (B,F,L), (B,F,F)
             out_heads.append(out_h)
-
-            if return_attn:
+            if return_attn or _record_step:
                 attn_list.append(attn.detach().cpu())
 
-        # concat all heads: (B,F,H*L)
-        out = torch.cat(out_heads, dim=-1)
+        # Concatenate outputs from all heads
+        out = torch.cat(out_heads, dim=-1)  # (B,F,H*L)
 
-        # project back to (B,F)
+        # Project back to output dimension
         out = self.out_proj(out).squeeze(-1)  # (B,F)
         out = self.dropout(out)
 
-        # save attention maps (only if requested to save)
-        if self.use_buffer and return_attn:
-            self.last_attn = torch.stack(attn_list, dim=1)  # (B,H,F,F)
+        # Save attention maps if requested
+        if _record_step:
+            if len(self.attn_buffer) > self.max_buffer_entries:
+                self.register_buffer('attn_buffer', [], persistent=False)
+            self.attn_buffer.append(torch.stack(attn_list, dim=1))  # (B,H,F,F)
 
         if return_attn:
             return out, (torch.stack(attn_list, dim=1) if attn_list else None)
@@ -1047,7 +1059,6 @@ class Encoder(nn.Module):
             return dist, latent
         return q_m, q_v, latent
 
-
 # Decoder
 class DecoderSCVI(nn.Module):
     """Decodes data from latent space of ``n_input`` dimensions into ``n_output`` dimensions.
@@ -1094,24 +1105,42 @@ class DecoderSCVI(nn.Module):
         use_layer_norm: bool = False,
         scale_activation: Literal["softmax", "softplus"] = "softmax",
         use_funnel: bool = False,    
+        linear_decoder: bool = False,
         **kwargs,
     ):
         super().__init__()
-        fc_layer_class = FunnelFCLayers if use_funnel else FCLayers
         funnel_out_dim = n_output // 2
-        self.px_decoder = fc_layer_class(
-            n_in=n_input,
-            n_out=funnel_out_dim,
-            n_hidden=n_hidden,
-            n_cat_list=n_cat_list,
-            n_layers=n_layers,
-            dropout_rate=0,
-            inject_covariates=inject_covariates,
-            use_batch_norm=use_batch_norm,
-            use_layer_norm=use_layer_norm,
-            inverted=True,
-            **kwargs,
-        )
+        # Initialize px decoder
+        if linear_decoder:
+            # Create linear decoder
+            self.px_decoder = FCLayers(
+                n_in=n_input, 
+                n_out=funnel_out_dim, 
+                n_cat_list=n_cat_list, 
+                dropout_rate=0,
+                inject_covariates=inject_covariates,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                inverted=True,
+                linear=True
+            )
+        else:
+            # Create non-linear decoder, either funneled or transformer-like
+            fc_layer_class = FunnelFCLayers if use_funnel else FCLayers
+            
+            self.px_decoder = fc_layer_class(
+                n_in=n_input,
+                n_out=funnel_out_dim,
+                n_hidden=n_hidden,
+                n_cat_list=n_cat_list,
+                n_layers=n_layers,
+                dropout_rate=0,
+                inject_covariates=inject_covariates,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                inverted=True,
+                **kwargs,
+            )
 
         # mean gamma
         if scale_activation == "softmax":
@@ -1193,7 +1222,7 @@ class EmbeddingClassifier(nn.Module):
         use_multihead: bool = False,
         use_cosine_similarity: bool = True,
         n_heads: int = 4,
-        temperature: float = 0.05,
+        temperature: float = 1,
         return_latents: bool = True,
         **kwargs,
     ):

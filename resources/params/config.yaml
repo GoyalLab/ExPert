@@ -1,89 +1,100 @@
 # Dataloader parameters
 data:
-  train_size: 0.9
-  batch_size: null
-  num_workers: 1
-  pin_memory: false
-  max_cells_per_batch: 32
-  max_classes_per_batch: 32
-  shuffle_classes: true
-  use_contrastive_loader: "train"
+  train_size: 0.9                                   # Train split percentage
+  batch_size: null                                  # Automatic batch size w. contrastive parameters
+  num_workers: 1                                    # Number of data loaders (1 seems to be optimal)
+  pin_memory: false                                 # Pin memory
+  max_cells_per_batch: 32                           # Number of cells per class in each batch (range: 8 - 64)
+  max_classes_per_batch: 16                         # Number of classes in each batch         (range: 8 - 64)
+  shuffle_classes: true                             # Shuffle classes while creating batches
+  use_contrastive_loader: "train"                   # Set to ["train", "val", "both"]
+
 # Classifier parameters
 cls:
-  n_hidden: 0
-  n_layers: 1
-  dropout_rate: 0.1
-  use_multihead: false
-  use_cosine_similarity: true
-  temperature: 1
+  n_hidden: 0                                       # 0 = linear classifier
+  n_layers: 1                                       # Number of layers (only used of n_hidden!=0)
+  dropout_rate: 0.1                                 # Classifier dropout rate
+  use_multihead: false                              # Use attention in classifier (depreciated)
+  use_cosine_similarity: true                       # Use cosine similarity to class embeddings for logits calculation (recommended)
+  temperature: 1                                    # Temperature scaling of logits (1)
+
 # Encoder parameters
 encoder:
-  n_layer: 4
-  use_attention: true
-  min_attn_dim: 8
-  max_attn_dim: 1024
-  n_head: 8
-  activation_fn: "nn.LeakyReLU"
+  encoder_type: "transformer"                       # ["transformer", "funnel", "fc"]
+  linear_encoder: false                             # Use linear layers while encoding
+  n_layers: 2                                       # Number of layers to use in encoder
+  use_attention: true                               # Whether to use attention in encoder
+  n_head: 8                                         # Number of AttentionHeads
+  n_attn_layers: 2                                  # Number of attention layers in encoder
+  compress_emb: false                               # Compress embedding (depreciated)
+  activation_fn: "nn.LeakyReLU"                     # Activation function
+  noise_std: 1e-4                                   # Noisy encoder option
+
 # Decoder parameters
 decoder:
-  n_layer: 1
-  use_attention: false
-  activation_fn: "nn.LeakyReLU"
+  linear_decoder: false                             # Use linear decoder
+  n_layers: 1                                       # Number of layers in decoder
+  use_attention: false                              # use attention in decoder
+  activation_fn: "nn.LeakyReLU"                     # Decoder activation function
+
 # Weight schedules
 schedules:
-  classification_ratio:
+  classification_ratio:                             # Classification loss weight schedule
     schedule: "sigmoid"
     anneal_k: 10
     n_epochs_stall: 0
     min_weight: 1
     max_weight: 1
-  contrastive_loss_weight:
+  contrastive_loss_weight:                          # Contrastive loss weight schedule
     schedule: "sigmoid"
     anneal_k: 10
     n_epochs_stall: 0
     min_weight: 1
     max_weight: 1
-  alignment_loss_weight:
+  alignment_loss_weight:                            # Latent space alignment loss weight schedule
     schedule: "sigmoid"
     anneal_k: 10
     n_epochs_stall: 0
     min_weight: 0
     max_weight: 0
-  class_kl_temperature:
+  class_kl_temperature:                             # KL classification temperature range: [0.01-1]
     schedule: "sigmoid"
     anneal_k: 10
     n_epochs_stall: 0
     min_weight: 0.1
     max_weight: 0.1
-  alignment_loss_weight:
-    max_weight: 0
+
 # Training plan
 plan:
-  lr: 0.0001
-  lr_patience: 30
-  weight_decay: 0.000001
-  cls_emb_mode: "full"
-  incl_n_unseen: null
-  n_epochs_warmup: 60
-  min_kl_weight: 0
-  max_kl_weight: 0.5
-  use_posterior_mean: "val"
-  lr_scheduler_metric: "validation_loss"
-  log_class_distribution: false
-  full_val_log_every_n_epoch: 10
-  plot_umap: null
+  lr: 0.0005                                        # Learning rate (LR)
+  lr_patience: 30                                   # LR patience
+  weight_decay: 0.00001                             # Weight decay
+  use_full_cls_emb: false                           # Use full class embedding during training or subset to observed classes
+  n_epochs_warmup: 300                              # Warmup period for schedules
+  min_kl_weight: 0                                  # KL weight schedule
+  max_kl_weight: 1
+  target_scale: 2.0                                 # Classification KL logit rescaler value , 1==one-hot, >1==class modules
+  use_posterior_mean: "val"                         # Use full z or mean for classifier ["train", "val", "both"]
+  use_contr_in_val: false                           # Use contrastive loss in validations set
+  lr_scheduler_metric: "validation_loss"            # LR metric
+  # Tensorboard logging options
+  log_class_distribution: false                     # Log class label distribution in batch
+  full_val_log_every_n_epoch: 10                    # Log full validation metrics
+  plot_umap: null                                   # Plot umap of latent space ["train", "val", "both", null]
+
 # Train parameters
 train:
-  max_epochs: 2000
-  early_stopping: false
-  early_stopping_monitor: "validation_loss"
-  early_stopping_patience: 20
+  max_epochs: 300                                   # Max training epochs
+  early_stopping: false                             # Early stopping
+  early_stopping_monitor: "validation_loss"         # Early stopping metrics
+  early_stopping_patience: 30
   check_val_every_n_epoch: 1
+
 # Model parameters
 model:
-  n_latent: 128
-  n_hidden: 1024
-  dropout_rate: 0.1
+  n_latent: 128                                     # Latent space dimension (z)
+  n_hidden: -1                                      # Start dimension, -1==full gene space, other==1st encoder layer projection
+  dropout_rate: 0.3                                 # Overall dropout rate
   dispersion: "gene"
   use_batch_norm: "none"
   use_layer_norm: "both"
@@ -91,13 +102,11 @@ model:
   linear_classifier: true
   log_variational: true
   l1_lambda: 0.0
-  l2_lambda: 0.0
-  l_mask: ["attn", "Attention", "class_projection"]
-  cls_weight_method: null
-  classification_loss_strategy: "kl"
-  focal_gamma: 1.0
-  contrastive_temperature: 0.1
-  reduction: "sum"
-  non_elbo_reduction: "sum"
-  use_feature_mask: true
-  drop_prob: 0.000001
+  l2_lambda: 1e-3
+  l_mask: ["attn", "Attention", "class_projection"] # Use l1 / l2 regularization on these layers
+  classification_loss_strategy: "kl"                # Enable KL-based class embedding classification
+  contrastive_temperature: 0.1                      # Contrastive logit temperature scaling, lower --> sharper distinction
+  reduction: "sum"                                  # ELBO-loss reduction method (i.e. reconstruction & KL)
+  non_elbo_reduction: "sum"                         # Non-ELBO-loss reduction method (i.e. classification, contrastive)
+  use_feature_mask: true                            # Randomly dropout input features
+  drop_prob: 0.001                                  # Feature dropout rate

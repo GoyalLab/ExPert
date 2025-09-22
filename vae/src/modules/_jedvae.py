@@ -70,7 +70,7 @@ class JEDVAE(VAE):
         l1_lambda: float | None = 1e-5,
         l2_lambda: float | None = 1e-3,
         l_mask: str | list[str] | None = None,
-        focal_gamma: float = 2.0,
+        focal_gamma: float = 1.0,
         classification_loss_strategy: Literal['cross_entropy', 'similarity', 'kl', 'focal'] = 'kl',
         kl_class_temperature: float = 0.1,
         contrastive_temperature: float = 0.1,
@@ -227,8 +227,6 @@ class JEDVAE(VAE):
             categorical_input = torch.split(cat_covs, 1, dim=1)
         else:
             categorical_input = ()
-        import pdb
-        pdb.set_trace()
         if self.batch_representation == "embedding" and self.encode_covariates:
             batch_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index)
             encoder_input = torch.cat([encoder_input, batch_rep], dim=-1)
@@ -268,6 +266,7 @@ class JEDVAE(VAE):
         self,
         x: torch.Tensor,
         batch_index: torch.Tensor | None = None,
+        g: torch.Tensor | None = None,
         cont_covs: torch.Tensor | None = None,
         cat_covs: torch.Tensor | None = None,
         use_posterior_mean: bool = True,
@@ -297,7 +296,7 @@ class JEDVAE(VAE):
         Before v1.1, this method by default returned probabilities per label,
         see #2301 for more details.
         """
-        inference_outputs = self.inference(x, batch_index, cont_covs, cat_covs)
+        inference_outputs = self.inference(x, batch_index, g, cont_covs, cat_covs)
         qz = inference_outputs[MODULE_KEYS.QZ_KEY]
         z = inference_outputs[MODULE_KEYS.Z_KEY]
         z = qz.loc if use_posterior_mean else z
@@ -365,7 +364,7 @@ class JEDVAE(VAE):
             cls_sim: torch.Tensor,
             targets: torch.Tensor,
             reduction: str = 'mean',
-            alpha: float = 1.0,
+            alpha: float = 0.1,
             beta: float = 1.0,
         ) -> torch.Tensor:
         """
@@ -388,7 +387,7 @@ class JEDVAE(VAE):
         y = targets.flatten()
         target_emb = cls_emb[y]
         # Compare to predicted class projection
-        direct_align_score = F.mse_loss(cz, target_emb, reduction=reduction)
+        direct_align_score = F.mse_loss(cz, target_emb, reduction=reduction) if alpha > 0 else 0.0
         # Compare similarities from targets to other classes
         target_sim = cls_sim[y]
         # Calculate pearson correlation
@@ -517,6 +516,8 @@ class JEDVAE(VAE):
         x = labelled_dataset[REGISTRY_KEYS.X_KEY]  # (n_obs, n_vars)
         y = labelled_dataset[REGISTRY_KEYS.LABELS_KEY]  # (n_obs, 1)
         batch_idx = labelled_dataset[REGISTRY_KEYS.BATCH_KEY]
+        # Get gene embedding if given
+        g = labelled_dataset.get(REGISTRY_KEYS.GENE_EMB_KEY)
 
         # Try to get class scores
         cls_scores = labelled_dataset.get(REGISTRY_KEYS.CLS_CERT_KEY) if use_cls_scores else None
@@ -531,6 +532,7 @@ class JEDVAE(VAE):
         logits, cz = self.classify(
             x, 
             batch_index=batch_idx, 
+            g=g,
             cat_covs=cat_covs, 
             cont_covs=cont_covs, 
             use_posterior_mean=use_posterior_mean,
@@ -675,7 +677,7 @@ class JEDVAE(VAE):
                 weights = class_sim[y.squeeze()][:, y.squeeze()]  # (n, n)
                 weights = weights / (weights.max() + eps)  # normalize to [0,1]
         else:
-            weights = torch.ones_like(log_probs)
+            weights = torch.ones_like(logits)
         # Apply weights to exp logits
         exp_logits = (exp_logits * weights)
         # Step 7: Compute softmax denominator: ∑_{a ∈ A(i)} exp(z_i • z_a / τ)

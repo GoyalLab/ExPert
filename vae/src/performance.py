@@ -3,7 +3,7 @@ import pandas as pd
 import anndata as ad
 import gseapy as gp
 
-from typing import Iterable, Any
+from typing import Any
 
 from sklearn.metrics import precision_recall_fscore_support
 
@@ -18,8 +18,9 @@ def performance_metric(actual, pred, labels, lib=None, mode='test'):
         pred = df_cmp.pathway_predicted
     # Calculate metrics for new predictions
     cls_report = precision_recall_fscore_support(
-        actual, pred,
-        labels=labels,
+        actual.values.astype(str),
+        pred.values.astype(str),
+        labels=labels.values.astype(str),
         average=None, 
         zero_division=np.nan)
     m = pd.DataFrame(cls_report, index=['precision', 'recall', 'f1', 'support'], columns=labels).T

@@ -68,6 +68,19 @@ def get_zi_rate(adata: ad.AnnData, verbose: bool = True) -> float:
     zi_r = 1 - (adata.X.nnz / (adata.X.shape[0]*adata.X.shape[1]))
     return zi_r
 
+def to_tensor(m: sp.csr_matrix | torch.Tensor | np.ndarray | pd.DataFrame | None) -> torch.Tensor:
+    if m is None:
+        return None
+    if sp.issparse(m):
+        return torch.Tensor(m.toarray())
+    if isinstance(m, np.ndarray):
+        return torch.Tensor(m)
+    if isinstance(m, pd.DataFrame):
+        return torch.Tensor(m.values)
+    if isinstance(m, torch.Tensor):
+        return m
+    raise ValueError(f'{m.__class__} is not compatible. Should be either sp.csr_matrix, np.ndarray, or torch.Tensor.')
+
 class BatchCache:
     def __init__(self, batch_size: int):
         self.data = []
