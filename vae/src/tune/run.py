@@ -22,7 +22,7 @@ from tqdm import tqdm
 from src.utils.constants import REGISTRY_KEYS
 from ._statics import CONF_KEYS
 from ..models._jedvi import JEDVI
-from ..plotting import get_model_results, get_classification_report, get_latest_tensor_dir
+from ..plotting import get_model_results, get_classification_report, get_latest_tensor_dir, plot_confusion
 from ..performance import get_library, performance_metric
 
 
@@ -280,6 +280,10 @@ def setup_labels(test_ad, test_adata_p: str, model, use_fixed_dataset_label: boo
     test_ad.obs[cls_label] = test_ad.obs[cls_labels].agg(';'.join, axis=1)
 
     ds_name = os.path.basename(test_adata_p).split('.h5ad')[0]
+    # Save original batch keys in adata
+    orig_batch_key = f'orig_{batch_key}'
+    test_ad.obs[orig_batch_key] = test_ad.obs[batch_key].values
+    # Set dataset labels for classification
     if not use_fixed_dataset_label:
         logging.info("Randomly drawing dataset labels from training data.")
         training_datasets = model.adata.obs.dataset.unique()
@@ -290,7 +294,7 @@ def setup_labels(test_ad, test_adata_p: str, model, use_fixed_dataset_label: boo
         logging.info(f"Added {ds_name} as dataset key.")
         test_ad.obs[batch_key] = ds_name
 
-    return cls_label, batch_key
+    return cls_label, batch_key, orig_batch_key
 
 
 def filter_test_data(test_ad, min_ms: float, min_cpp: int):
@@ -326,7 +330,7 @@ def run_model_predictions(model, test_ad, cls_label, batch_key, incl_unseen: boo
     return test_ad, predictions
 
 
-def evaluate_predictions(test_ad, predictions, train_perturbations, output_dir: str, plot: bool, use_pathway: bool = True):
+def evaluate_predictions(test_ad, predictions, train_perturbations, output_dir: str, plot: bool, groupby: str, use_pathway: bool = True):
     _, report = get_classification_report(test_ad, cls_label='cls_label', mode='test')
     report.sort_values('f1-score', ascending=False, inplace=True)
     report['perturbation'] = report.index.str.split(';').str[1]
@@ -336,13 +340,14 @@ def evaluate_predictions(test_ad, predictions, train_perturbations, output_dir: 
     # Setup pathway library
     lib = get_library(library='KEGG_2019_Human', organism='Human') if use_pathway else None
     # Calculate top n predictions
-    top_n_predictions = compute_top_n_predictions(test_ad, predictions, train_perturbations, lib=lib)
+    top_n_predictions = compute_top_n_predictions(test_ad, predictions, train_perturbations, lib=lib, groupby=groupby)
     top_n_predictions.to_csv(os.path.join(output_dir, 'top_n_predictions_report.csv'))
     # Plot metrics results
     if plot:
         # Create plot dir if not already there
         plt_dir = os.path.join(output_dir, 'plots', 'test')
         os.makedirs(plt_dir, exist_ok=True)
+        # Plot confusion matrix
         # Filter out random predictions
         no_random = top_n_predictions[top_n_predictions['mode'] != 'random'].copy()
         n_classes = test_ad.obs.cls_label.nunique()
@@ -350,14 +355,18 @@ def evaluate_predictions(test_ad, predictions, train_perturbations, output_dir: 
         plot_f1_zero_shot(no_random=no_random, n_classes=n_classes, plt_dir=plt_dir, use_pathway=False)
         plot_f1_zero_shot(no_random=no_random, n_classes=len(lib), plt_dir=plt_dir, use_pathway=True)
         # Plot F1 distribution over groups (cell types)
-        plot_f1_groups(no_random=no_random, plt_dir=plt_dir, train_cls_only=False)
-        plot_f1_groups(no_random=no_random, plt_dir=plt_dir, train_cls_only=True)
+        plot_f1_groups(no_random=no_random, plt_dir=plt_dir, groupby=groupby, train_cls_only=False, use_pathway=False)
+        plot_f1_groups(no_random=no_random, plt_dir=plt_dir, groupby=groupby, train_cls_only=True, use_pathway=False)
+        plot_f1_groups(no_random=no_random, plt_dir=plt_dir, groupby=groupby, train_cls_only=False, use_pathway=True)
+        plot_f1_groups(no_random=no_random, plt_dir=plt_dir, groupby=groupby, train_cls_only=True, use_pathway=True)
         # Plot all random vs. normal predictions
-        plot_f1_random_vs_normal(top_n_predictions, n_classes=n_classes, plt_dir=plt_dir, use_pathway=False)
-        plot_f1_random_vs_normal(top_n_predictions, n_classes=n_classes, plt_dir=plt_dir, use_pathway=True)
+        plot_f1_random_vs_normal(top_n_predictions, n_classes=n_classes, plt_dir=plt_dir, use_pathway=False, train_only=False)
+        plot_f1_random_vs_normal(top_n_predictions, n_classes=n_classes, plt_dir=plt_dir, use_pathway=True, train_only=False)
+        plot_f1_random_vs_normal(top_n_predictions, n_classes=n_classes, plt_dir=plt_dir, use_pathway=False, train_only=True)
+        plot_f1_random_vs_normal(top_n_predictions, n_classes=n_classes, plt_dir=plt_dir, use_pathway=True, train_only=True)
 
 
-def compute_top_n_predictions(test_ad, predictions, train_perturbations, n: int = 20, groupby: str = 'celltype', lib = None):
+def compute_top_n_predictions(test_ad, predictions, train_perturbations, n: int = 20, groupby: str = '_dataset', lib = None):
     # Calculate label index in prediction columns per cell
     test_ad.obs['cls_prediction_idx'] = (test_ad.obs.cls_label.values == predictions.columns.values.reshape(-1, 1)).argmax(axis=0)
     labels = test_ad.obs.cls_label.values
@@ -393,7 +402,7 @@ def compute_top_n_predictions(test_ad, predictions, train_perturbations, n: int 
             # Calculate performance metrices for predictions
             test_metrics = performance_metric(actual, pred, l, lib=None, mode='test')
             # Calculate random performance
-            rand_metrics = performance_metric(actual, random_pred, l, lib=lib, mode='random')
+            rand_metrics = performance_metric(actual, random_pred, l, lib=None, mode='random')
             # Concatenate outputs
             metrics = pd.concat((test_metrics, rand_metrics), axis=0)
             metrics['use_pathway'] = False
@@ -419,11 +428,11 @@ def compute_top_n_predictions(test_ad, predictions, train_perturbations, n: int 
     return top_n_predictions
 
 def plot_f1_random_vs_normal(top_n_predictions: pd.DataFrame, n_classes: int, plt_dir: str, use_pathway: bool = False, train_only: bool = True):
-    tmp = top_n_predictions[top_n_predictions['use_pathway']==use_pathway]
+    tmp = top_n_predictions[(top_n_predictions['use_pathway']==use_pathway) & (top_n_predictions.is_training_perturbation==train_only)]
     zs_title = ' (Unseen Perturbations)' if not train_only else ''
     add_title = ' (Pathway-based)' if use_pathway else ''
     plt.figure(dpi=300, figsize=(10, 5))
-    ax = sns.boxenplot(tmp, x='top_n', y='f1', hue='is_training_perturbation',
+    ax = sns.boxenplot(tmp, x='top_n', y='f1', hue='mode',
                   palette=['#7900d7', '#3274a1'])
     plt.xlabel('Number of top predictions')
     plt.ylim([0.0, 1.0])
@@ -431,9 +440,9 @@ def plot_f1_random_vs_normal(top_n_predictions: pd.DataFrame, n_classes: int, pl
     plt.title(f'Test F1-score distribution over top predictions (N={n_classes}){zs_title}{add_title}', pad=20)
     # Build legend labels with counts
     handles, labels = ax.get_legend_handles_labels()
-    counts = tmp.groupby('is_training_perturbation')['perturbation'].nunique()
+    counts = tmp.groupby('mode')['perturbation'].nunique()
     new_labels = [
-        f"{label} (N={counts[True] if label == 'True' else counts[False]})"
+        f"{label} (N={counts[label]})"
         for label in labels
     ]
 
@@ -451,7 +460,6 @@ def plot_f1_random_vs_normal(top_n_predictions: pd.DataFrame, n_classes: int, pl
     o = f"test_f1_vs_random{_o}{_z}.svg"
     plt.savefig(os.path.join(plt_dir, o))
     plt.close()
-
 
 def plot_f1_zero_shot(no_random: pd.DataFrame, n_classes: int, plt_dir: str, use_pathway: bool = False):
     tmp = no_random[no_random['use_pathway']==use_pathway]
@@ -491,7 +499,7 @@ def plot_f1_groups(no_random: pd.DataFrame, plt_dir: str, groupby: str = 'cellty
     top_10 = no_random[mask].copy()
     zs_title = ' (Unseen Perturbations)' if not train_cls_only else ''
     add_title = ' (Pathway-based)' if use_pathway else ''
-    plt.figure(figsize=(6,3), dpi=300)
+    plt.figure(dpi=300, figsize=(10, 5))
     ax = sns.boxenplot(top_10, x='top_n', y='f1', hue=groupby, flier_kws={'s': 10}, legend=True)
     plt.xlabel('Number of top predictions')
     plt.ylim([0.0, 1.0])
@@ -514,8 +522,9 @@ def plot_f1_groups(no_random: pd.DataFrame, plt_dir: str, groupby: str = 'cellty
         borderaxespad=0
     )
     plt.tight_layout()
-    _o = "_zero_shot" if not train_cls_only else ""
-    o = f"test_f1_per_ct{_o}.svg"
+    _o = "_pw" if use_pathway else ""
+    _z = "_zero_shot" if not train_cls_only else ""
+    o = f"test_f1_per_ct{_o}{_z}.svg"
     plt.savefig(os.path.join(plt_dir, o))
     plt.close()
 
@@ -541,7 +550,7 @@ def ens_to_symbol(adata: ad.AnnData, gene_symbol_keys: list[str] = ['gene_symbol
         adata = adata[:,idx]
     return adata
 
-def update_latent(model: nn.Module, test_ad: ad.AnnData, version_dir: str, plot: bool = True, incl_unseen: bool = True):
+def update_latent(model: nn.Module, test_ad: ad.AnnData, version_dir: str, plot: bool = True, incl_unseen: bool = True, batch_key: str = 'dataset', orig_group_key: str = 'orig_dataset'):
     # I/O
     plt_dir = os.path.join(version_dir, 'plots')
     latent = sc.read(os.path.join(version_dir, 'latent.h5ad'))
@@ -557,6 +566,8 @@ def update_latent(model: nn.Module, test_ad: ad.AnnData, version_dir: str, plot:
             .reset_index(names='model_index')[['model_index', 'idx']],
             on='idx')
     )
+    # Add batch label to latent
+    latent.obs[orig_group_key] = latent.obs[batch_key].values
     latent.obsm['cz'] = model_cz[idx_map.model_index]
     test_ad.obs['mode'] = 'test'
     test_z = test_ad.obsm['latent_z']
@@ -587,17 +598,22 @@ def test(
         min_ms: float = 4.0,
         min_cpp: int = 10,
         plot: bool = False,
+        return_adata: bool = False
     ):
     test_ad = load_test_data(test_adata_p, model, incl_unseen=incl_unseen)
-    cls_label, batch_key = setup_labels(test_ad, test_adata_p, model, use_fixed_dataset_label)
+    cls_label, batch_key, orig_batch_key = setup_labels(test_ad, test_adata_p, model, use_fixed_dataset_label)
     test_ad = filter_test_data(test_ad, min_ms, min_cpp)
     test_ad, predictions = run_model_predictions(model, test_ad, cls_label, batch_key, incl_unseen=incl_unseen)
-
+    # Evaluate predictions, plot and update latent space
     train_perturbations = set(model.adata.obs.perturbation.unique())
-    evaluate_predictions(test_ad, predictions, train_perturbations, output_dir, plot)
+    # Basic confusion matrix
+
+    evaluate_predictions(test_ad, predictions, train_perturbations, output_dir=output_dir, plot=plot, groupby=orig_batch_key)
     # Update latent representation and calculate new umaps
     logging.info(f'Updating latent space with test data.')
-    update_latent(model, test_ad=test_ad, version_dir=output_dir, incl_unseen=incl_unseen)
+    update_latent(model, test_ad=test_ad, version_dir=output_dir, incl_unseen=incl_unseen, batch_key=batch_key, orig_group_key=orig_batch_key)
+    if return_adata:
+        return test_ad
 
 
 def get_ouptut_dir(config_p: str, output_base_dir: str | None = None) -> str:

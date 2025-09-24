@@ -6,6 +6,8 @@ import logging
 import anndata as ad
 import scipy.sparse as sp
 from typing import Iterable
+from sklearn.covariance import EmpiricalCovariance
+
 from src.statics import P_COLS, CTRL_KEYS, GENE_SYMBOL_KEYS, SETTINGS, OBS_KEYS, MISC_LABELS_KEYS
 
 
@@ -20,6 +22,80 @@ def is_outlier(
         np.median(M) + nmads * median_abs_deviation(M) < M
     )
     return outlier
+
+def filter_by_distance_to_control(
+    adata: ad.AnnData,
+    condition_col: str = 'perturbation', 
+    ctrl_key: str = 'control',
+    method: str = 'euclidean', 
+    cutoff: float = 25.0,
+    return_dist: bool = False,
+    normalize: bool = True
+) -> None | np.ndarray:
+    """
+    Keep samples that deviate significantly from control mean in latent/feature space.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Input AnnData object.
+    control_mask : boolean array
+        Mask of control samples (True = control).
+    method : str
+        "euclidean" or "mahalanobis".
+    cutoff : float
+        - 25: keep samples above 25th percentile of control distances
+    """
+    # Pre-process adata
+    if normalize:
+        logging.info(f'Normalizing a copy of adata for z-score filtering.')
+        _adata = adata.copy()
+        sc.pp.normalize_total(_adata, target_sum=1e6)
+        sc.pp.log1p(_adata)
+    else:
+        _adata = adata
+    # Extract gene expression data
+    X = _adata.X.toarray() if hasattr(_adata.X, "toarray") else _adata.X
+    
+    # --- Control statistics ---
+    control_mask = _adata.obs[condition_col]==ctrl_key
+    Xc = X[control_mask]
+    mu = Xc.mean(axis=0)
+
+    if method == "euclidean":
+        dists = np.linalg.norm(X - mu, axis=1)
+    elif method == "mahalanobis":
+        cov = EmpiricalCovariance().fit(Xc)
+        dists = cov.mahalanobis(X - mu)  # squared Mahalanobis
+        dists = np.sqrt(dists)
+
+    else:
+        raise ValueError("method must be 'euclidean' or 'mahalanobis'")
+
+    # --- Define cutoff ---
+    thr = np.percentile(dists[control_mask], cutoff)
+
+    # --- Keep samples beyond cutoff ---
+    keep_mask = dists > thr
+    mask = keep_mask | control_mask
+    if return_dist:
+        return dists
+    else:
+        # Subset adata for mask
+        adata._inplace_subset_obs(mask)
+
+def filter_min_number_of_cells_per_class(
+        adata: ad.AnnData, 
+        condition_col: str = 'perturbation', 
+        min_cells: int = 50
+    ) -> None:
+    # Calculate number of cells per perturbation
+    cpp = adata.obs[condition_col].value_counts()
+    # Filter for perturbations with at least min_cells cells
+    valid_cls = cpp[cpp>=min_cells].index
+    # Subset adata for valid classes while also including control cells
+    mask = adata.obs['perturbation'].isin(valid_cls)
+    adata._inplace_subset_obs(mask)
 
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
 def quality_control_filter(
@@ -237,16 +313,18 @@ def preprocess_dataset(
         feature_pool_file: str,
         name: str = 'Unknown', 
         qc: bool = True, 
-        norm: bool = True, 
-        log: bool = True, 
-        scale: bool = True, 
-        hvg: bool = True,
+        norm: bool = False, 
+        log: bool = False, 
+        scale: bool = False, 
+        hvg: bool = False,
         n_hvg: int = 2000, 
         subset: bool = False, 
         n_ctrl: int | None = 10_000,
         single_perturbations_only: bool = True,
         use_perturbation_pool: bool = False,
         use_feature_pool: bool = True,
+        z_score_filter: bool = True,
+        min_cells_per_class: int | None = 50,
         p_col: str = OBS_KEYS.PERTURBATION_KEY,
         ctrl_key: str = OBS_KEYS.CTRL_KEY,
         min_genes: int = 5_000,
@@ -319,4 +397,13 @@ def preprocess_dataset(
     if use_feature_pool:
         logging.info(f'Using feature pool to filtering for shared features.')
         _filter_feature_pool(adata, feature_pool_file=feature_pool_file)
+    # Filter cells for control z-score distance
+    if z_score_filter:
+        logging.info(f'Filtering cells based on control z-score.')
+        filter_by_distance_to_control(adata, condition_col=p_col, ctrl_key=ctrl_key, normalize=not norm)
+    # Filter perturbations based on minimum number of support
+    if min_cells_per_class is not None and min_cells_per_class > 0:
+        logging.info(f'Filtering for at least {min_cells_per_class} cells per perturbation.')
+        filter_min_number_of_cells_per_class(adata, condition_col=p_col, min_cells=min_cells_per_class)
+    logging.info(f'Pre-processed adata shape: {adata.shape}')
     return adata

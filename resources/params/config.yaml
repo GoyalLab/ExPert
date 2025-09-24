@@ -108,5 +108,5 @@ model:
   contrastive_temperature: 0.1                      # Contrastive logit temperature scaling, lower --> sharper distinction
   reduction: "sum"                                  # ELBO-loss reduction method (i.e. reconstruction & KL)
   non_elbo_reduction: "sum"                         # Non-ELBO-loss reduction method (i.e. classification, contrastive)
-  use_feature_mask: true                            # Randomly dropout input features
+  use_feature_mask: false                           # Randomly dropout input features
   drop_prob: 0.001                                  # Feature dropout rate

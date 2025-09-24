@@ -444,7 +444,8 @@ class JEDVAE(VAE):
         elif reduction == 'mean':
             reduction = 'batchmean'
         # Select soft targets for each label
-        soft_targets = class_sim[y]
+        cls_sim_weight = class_sim / class_sim.max()
+        soft_targets = cls_sim_weight[y]
         # --------------- DEBUG> -----------------
         if self.use_cache:
             self.cache.append({'y': y, 'logits': logits, 'soft_targets': soft_targets, 'scaled_targets': rescale_targets(soft_targets, scale=target_scale)})
@@ -624,7 +625,7 @@ class JEDVAE(VAE):
             reduction: str = 'mean',
             scale_by_temperature: bool = False,
             eps: float = 1e-12,
-            cls_emb: torch.Tensor | None = None,
+            cls_sim: torch.Tensor | None = None,
         ) -> torch.Tensor:
         """
         Calculate contrastive loss as defined by Khosla et al., 2020.
@@ -670,12 +671,9 @@ class JEDVAE(VAE):
         # Step 5: Construct mask for denominator A(i): all indices ≠ i (exclude self)
         logits_mask = 1 - self_mask  # mask with 0s on diagonal, 1s elsewhere
         # Step 6: Weight negatives by class embedding distances if provided
-        if cls_emb is not None:
-            with torch.no_grad():
-                cls_emb = F.normalize(cls_emb, p=2, dim=-1)  # normalize prototypes
-                class_sim = torch.matmul(cls_emb, cls_emb.T)  # cosine similarity matrix
-                weights = class_sim[y.squeeze()][:, y.squeeze()]  # (n, n)
-                weights = weights / (weights.max() + eps)  # normalize to [0,1]
+        if cls_sim is not None:
+            weights = cls_sim[y.squeeze()][:, y.squeeze()]  # (n, n)
+            weights = weights / (weights.max() + eps)  # normalize to [0,1]
         else:
             weights = torch.ones_like(logits)
         # Apply weights to exp logits
@@ -763,7 +761,7 @@ class JEDVAE(VAE):
 
         # Add contrastive loss if it is specified
         if contrastive_loss_weight is not None and contrastive_loss_weight > 0:
-            contr_loss = self._contrastive_loss(z, tensors, temperature=self.contrastive_temperature, reduction=self.non_elbo_reduction, cls_emb=cls_emb)
+            contr_loss = self._contrastive_loss(z, tensors, temperature=self.contrastive_temperature, reduction=self.non_elbo_reduction, cls_sim=cls_sim)
             lo_kwargs['loss'] += contr_loss * contrastive_loss_weight
             extra_metrics['contrastive_loss'] = contr_loss
         # Add classification based losses

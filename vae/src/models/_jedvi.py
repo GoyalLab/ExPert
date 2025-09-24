@@ -11,6 +11,7 @@ from src.data._manager import EmbAnnDataManager
 import torch
 from torch import Tensor
 from torch.distributions import Distribution
+import torch.nn.functional as F
 import warnings
 import pandas as pd
 import numpy as np
@@ -125,12 +126,14 @@ class JEDVI(
         self.was_pretrained = False
         self.n_labels = n_labels
         self.use_full_cls_emb = False
+        self.use_ctrl_emb = False
         # Give model summary
         self.n_unseen_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_unseen_labels'] if REGISTRY_KEYS.CLS_EMB_INIT in adata.uns else None
         self._model_summary_string = (
             f"{self.__class__} Model with the following params: \n"
             f"n_classes: {self.n_labels}, "
-            f"n_unseen_classes: {self.n_unseen_labels}"
+            f"n_unseen_classes: {self.n_unseen_labels}, "
+            f"use_gene_emb: {self.use_gene_emb} "
         )
 
     def _get_cls_weights(
@@ -165,7 +168,7 @@ class JEDVI(
                 gene_emb = gene_emb.todense()
             # Convert to tensor
             self.gene_emb = torch.Tensor(gene_emb).T
-        
+
         # Assign class embedding
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
@@ -189,22 +192,23 @@ class JEDVI(
                     n_missing = _label_overlap.shape[0] - _label_overlap.sum()
                     if n_missing > 0:
                         raise ValueError(f'Found {n_missing} missing labels in cls embedding: {_label_series[~_label_overlap]}')
-                    # Save train embeddings and similarities as class parameters
-                    self.train_cls_emb = torch.tensor(cls_emb.loc[_shared_labels].values, dtype=torch.float32)
-                    self.train_cls_sim = self.train_cls_emb @ self.train_cls_emb.T
 
                     # Re-order embedding: first training labels then rest
                     cls_emb = pd.concat([cls_emb.loc[_shared_labels], cls_emb.loc[_unseen_labels]], axis=0)
-                    # Include embedding in model's adata
-                    self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = sp.csr_matrix(cls_emb.values)
                     # Include class similarity as pre-calculated matrix
                     logging.info(f'Calculating class similarities')
-                    cls_sim = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] @ self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].T
-                    self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = cls_sim
                     # Set gene embedding as class parameter
                     self.cls_emb = torch.tensor(cls_emb.values, dtype=torch.float32)
+                    # Normalize embedding before calculating similarities
+                    self.cls_emb = F.normalize(self.cls_emb, p=2, dim=-1)
                     # Set class similarities as class parameter
-                    self.cls_sim = torch.tensor(cls_sim.todense(), dtype=torch.float32)
+                    self.cls_sim = self.cls_emb @ self.cls_emb.T
+                    # Save in adata for caching
+                    self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = self.cls_emb
+                    self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = self.cls_sim
+                    # Save train embeddings and similarities as class parameters
+                    self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
+                    self.train_cls_sim = self.train_cls_emb @ self.train_cls_emb.T
                     # Get full list of perturbations for embedding
                     self.idx_to_label = cls_emb.index
                     # Save registration with this model
@@ -216,6 +220,16 @@ class JEDVI(
                     }
             else:
                 logging.info(f'Class embedding has already been initialized with {self.__class__} for this adata.')
+                # Set to embeddings found in adata
+                self.cls_emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY]
+                self.cls_sim = self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY]
+                # Init train embeddings from adata
+                n_train = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_train_labels']
+                self.train_cls_emb = self.cls_emb[:n_train,:]
+                self.train_cls_sim = self.cls_sim[:n_train,:n_train]
+                # Set indices
+                self.idx_to_label = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels']
+            # Set embedding dimension
             self.n_dims_emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
         else:
             logging.info(f'No class embedding found in adata, falling back to internal embeddings with dimension 128. You can change this by specifying `n_dims_emb`.')

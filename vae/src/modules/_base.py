@@ -1219,16 +1219,14 @@ class EmbeddingClassifier(nn.Module):
         use_layer_norm: bool = False,
         activation_fn: nn.Module = nn.LeakyReLU,
         class_embed_dim: int = 128,
-        use_multihead: bool = False,
+        skip_projection: bool = False,
         use_cosine_similarity: bool = True,
-        n_heads: int = 4,
         temperature: float = 1,
         return_latents: bool = True,
         **kwargs,
     ):
         super().__init__()
         self.logits = logits
-        self.use_multihead = use_multihead
         self.use_cosine_similarity = use_cosine_similarity
         self.class_embed_dim = class_embed_dim
         self.n_labels = n_labels
@@ -1236,42 +1234,33 @@ class EmbeddingClassifier(nn.Module):
         self.dropout_rate = dropout_rate
         self.return_latents = return_latents
 
-        # Initialize layers
-        if n_hidden > 0 and n_layers > 0:
-            self.class_projection = FunnelFCLayers(
-                n_in=n_input,
-                n_out=class_embed_dim,
-                n_layers=n_layers,
-                dropout_rate=dropout_rate,
-                use_batch_norm=use_batch_norm,
-                use_layer_norm=use_layer_norm,
-                activation_fn=activation_fn,
-                **kwargs,
-            )
+        # Use input latent space for classification
+        if n_input == class_embed_dim and skip_projection:
+            self.class_projection = nn.Identity()
         else:
-            # Set encoder to a single linear layer
-            self.class_projection = nn.Linear(n_input, class_embed_dim)
-            self.dropout = nn.Dropout(p=dropout_rate)
-            class_embed_dim = n_input
+            # Initialize layers
+            if n_hidden > 0 and n_layers > 0:
+                self.class_projection = FunnelFCLayers(
+                    n_in=n_input,
+                    n_out=class_embed_dim,
+                    n_layers=n_layers,
+                    dropout_rate=dropout_rate,
+                    use_batch_norm=use_batch_norm,
+                    use_layer_norm=use_layer_norm,
+                    activation_fn=activation_fn,
+                    **kwargs,
+                )
+            else:
+                # Set encoder to a single linear layer
+                self.class_projection = nn.Linear(n_input, class_embed_dim)
+                class_embed_dim = n_input
+        # Add dropout
+        self.dropout = nn.Dropout(p=dropout_rate)
 
-        # 2. Check compatibility
-        if use_multihead and class_embed_dim % n_heads != 0:
-            fallback = 'cosine similarity' if use_cosine_similarity else 'dot product'
-            logging.warning(f"class_embed_dim must be divisible by n_heads. Falling back to {fallback}.")
-            self.use_multihead = False
-
-        # 3. Class embeddings (used if external not provided)
+        # Init learnable class embeddings (used if external not provided)
         self.learned_class_embeds = nn.Parameter(torch.randn(n_labels, class_embed_dim))
 
-        # 4. Optional attention layer
-        if self.use_multihead:
-            self.attn = nn.MultiheadAttention(
-                embed_dim=class_embed_dim, num_heads=n_heads, batch_first=True
-            )
-        else:
-            self.attn = None
-
-    def forward(self, x, class_embeds: torch.Tensor | None = None):
+    def forward(self, x: torch.Tensor, class_embeds: torch.Tensor | None = None):
         """
         Parameters
         ----------
@@ -1281,29 +1270,22 @@ class EmbeddingClassifier(nn.Module):
             External class embeddings, shape (n_labels, class_embed_dim)
         """
         
+        # Get class embeddings for step
+        if class_embeds is None:
+            class_embeds = self.learned_class_embeds
+        else:
+            class_embeds = class_embeds.to(x.device)
         # Class projection
         z = self.class_projection(x)  # (batch, d)
         # Randomly dropout some elements in the projection
         if self.dropout_rate > 0:
             z = self.dropout(z)
-
-        if class_embeds is None:
-            class_embeds = self.learned_class_embeds
-        else:
-            class_embeds = class_embeds.to(z.device)
         # Calculate classification logits
         if self.use_cosine_similarity:
             z_norm = F.normalize(z, dim=-1)            # (batch, d)
             c_norm = F.normalize(class_embeds, dim=-1) # (n_labels, d)
             logits = torch.matmul(z_norm, c_norm.T) / self.temperature    # (batch, n_labels)
             _z = z_norm
-        elif self.attn is not None:
-            z_seq = z.unsqueeze(1)  # (batch, 1, d)
-            class_seq = class_embeds.unsqueeze(0).expand(z.size(0), -1, -1)  # (batch, n_labels, d)
-            attn_out, _ = self.attn(z_seq, class_seq, class_seq)  # (batch, 1, d)
-            attn_out = attn_out.squeeze(1)                        # (batch, d)
-            logits = torch.matmul(attn_out, class_embeds.T)       # (batch, n_labels)
-            _z = attn_out
         else:
             z = z.unsqueeze(1)  # (batch, 1, d)
             class_seq = class_embeds.unsqueeze(0).expand(z.size(0), -1, -1)  # (batch, n_labels, d)

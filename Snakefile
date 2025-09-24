@@ -119,6 +119,8 @@ rule process_dataset:
         n_ctrl = config['n_ctrl'],
         use_perturbation_pool = config['use_perturbation_pool'],
         use_feature_pool = config['use_feature_pool'],
+        z_score_filter = config['z_score_filter'],
+        min_cells_per_class = config['min_cells_per_class'],
         single_perturbations_only = config['single_perturbations_only'],
         p_col = config['perturbation_col'],
         ctrl_key = config['ctrl_key'],
