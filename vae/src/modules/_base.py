@@ -2,7 +2,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import logging
 import numpy as np
 import collections
 from collections.abc import Callable, Iterable
@@ -17,98 +16,39 @@ def _identity(x):
     return x
 
 class Block(nn.Module):
-    """Simple layer block"""
+    """Simple feedforward block for VAEs."""
 
     def __init__(
-            self, 
-            n_input: int, 
-            n_output: int,
-            n_head: int,
-            use_batch_norm: bool = False,
-            use_layer_norm: bool = True,
-            use_activation: bool = True,
-            use_attention: bool = True,
-            dropout_rate: float = 0.1,
-            activation_fn: nn.Module = nn.LeakyReLU,
-            bias: bool = True,
-            noise_std: float = 0.0,
-        ):
+        self,
+        n_input: int,
+        n_output: int,
+        activation_fn: nn.Module = nn.LeakyReLU,
+        dropout_rate: float = 0.1,
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = True,
+        **kwargs
+    ):
         super().__init__()
-        # Save hyperparameters
-        self.use_batch_norm = use_batch_norm
-        self.use_layer_norm = use_layer_norm
-        self.use_activation = use_activation
-        self.use_attention = use_attention
-        self.dropout_rate = dropout_rate
-        self.noise_std = noise_std
-        # Init modules
-        head_size = n_input // n_head
-        self.root = nn.Linear(n_input, n_output, bias=bias)
-        if self.use_attention:
-            self.attn = MultiHeadAttention(num_heads=n_head, n_input=n_input, head_size=head_size, dropout_rate=dropout_rate)
-        else:
-            self.attn = _identity
-        self.feedfw = nn.Linear(n_input, n_output, bias=bias)
-        if self.use_batch_norm:
-            self.batch_norm = nn.BatchNorm1d(n_output)
-        else:
-            self.batch_norm = _identity
-        if self.use_layer_norm:
-            self.layer_norm_1 = nn.LayerNorm(n_input)
-            self.layer_norm_2 = nn.LayerNorm(n_input)
-        else:
-            self.layer_norm_1, self.layer_norm_2 = _identity, _identity
-        self.activation = activation_fn()
-        self.dropout = nn.Dropout(dropout_rate)
-        self.proj = nn.Linear(n_output, n_output)
 
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Pre-norm + Attention + residual
-        if self.use_attention:
-            x = x + self.attn(self.layer_norm_1(x))
+        layers = [nn.Linear(n_input, n_output)]
+        
+        # Normalization (choose one)
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(n_output))
+        elif use_layer_norm:
+            layers.append(nn.LayerNorm(n_output))
 
-        # Pre-norm + Feedforward + residual
-        r = self.feedfw(self.layer_norm_2(x))
-        if self.use_batch_norm:
-            r = self.batch_norm(r)
-        if self.use_activation:
-            r = self.activation(r)
-        r = self.proj(r)
-        if self.training and self.noise_std > 0:
-            r = r + torch.randn_like(r) * self.noise_std
-        r = self.dropout(r)
-        x = x + r
-        return x
+        # Nonlinearity
+        layers.append(activation_fn())
+
+        # Optional dropout
+        if dropout_rate > 0:
+            layers.append(nn.Dropout(dropout_rate))
+
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply multi-head self attention and add new branch of x
-        if self.use_attention:
-            x = x + self.attn(self.layer_norm_1(x))
-        # Apply layer norm
-        if self.use_layer_norm:
-            x = self.layer_norm_2(x)
-        # Branch off into residual pathway
-        r = self.feedfw(x)
-        # Project main branch
-        x = self.root(x)
-        # Apply batch norm
-        if self.use_batch_norm:
-            r = self.batch_norm(r)
-        # Apply activation
-        if self.use_activation:
-            r = self.activation(r)
-        # Use final projection layer
-        r = self.proj(r)
-        # Add gaussian noise
-        if self.training and self.noise_std > 0:
-            noise = torch.randn_like(r) * self.noise_std
-            r = r + noise
-        # Apply dropout
-        if self.dropout_rate > 0:
-            r = self.dropout(r)
-        # Add second branch to x
-        x = x + r
-        return x
+        return self.block(x)
 
 
 class TransformerBlock(nn.Module):
@@ -268,7 +208,7 @@ class FunnelFCLayers(nn.Module):
     
     def inject_into_layer(self, layer_num) -> bool:
         """Helper to determine if covariates should be injected."""
-        return layer_num == 0 or (layer_num > 0 and self.inject_covariates)
+        return layer_num > 0 and self.inject_covariates
 
     def forward(self, x: torch.Tensor, *cat_list: torch.Tensor) -> torch.Tensor:
         # One-hot encode categorical covariates

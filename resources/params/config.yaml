@@ -14,21 +14,22 @@ cls:
   n_hidden: 0                                       # 0 = linear classifier
   n_layers: 1                                       # Number of layers (only used of n_hidden!=0)
   dropout_rate: 0.1                                 # Classifier dropout rate
-  use_multihead: false                              # Use attention in classifier (depreciated)
   use_cosine_similarity: true                       # Use cosine similarity to class embeddings for logits calculation (recommended)
   temperature: 1                                    # Temperature scaling of logits (1)
+  skip_projection: false                            # Allows model to skip projection to class embedding and use z directly (if dimensions match)
 
 # Encoder parameters
 encoder:
   encoder_type: "transformer"                       # ["transformer", "funnel", "fc"]
-  linear_encoder: false                             # Use linear layers while encoding
-  n_layers: 2                                       # Number of layers to use in encoder
+  linear_encoder: true                              # Use linear layers while encoding
+  n_layers: 0                                       # Number of layers to use in encoder
+  # Attention params
   use_attention: true                               # Whether to use attention in encoder
-  n_head: 8                                         # Number of AttentionHeads
-  n_attn_layers: 2                                  # Number of attention layers in encoder
-  compress_emb: false                               # Compress embedding (depreciated)
+  n_head: 8                                         # Number of attention heads (aim for 16-64 d_h, ideally 32)
+  n_attn_layers: 4                                  # Number of attention layers in encoder
+  ff_mult: 4                                        # Latent expansion factor (transformer only)
   activation_fn: "nn.LeakyReLU"                     # Activation function
-  noise_std: 1e-4                                   # Noisy encoder option
+  noise_std: 0.000001                                   # Noisy encoder option
 
 # Decoder parameters
 decoder:
@@ -55,8 +56,8 @@ schedules:
     schedule: "sigmoid"
     anneal_k: 10
     n_epochs_stall: 0
-    min_weight: 0
-    max_weight: 0
+    min_weight: 1
+    max_weight: 1
   class_kl_temperature:                             # KL classification temperature range: [0.01-1]
     schedule: "sigmoid"
     anneal_k: 10
@@ -73,13 +74,13 @@ plan:
   n_epochs_warmup: 300                              # Warmup period for schedules
   min_kl_weight: 0                                  # KL weight schedule
   max_kl_weight: 1
-  target_scale: 2.0                                 # Classification KL logit rescaler value , 1==one-hot, >1==class modules
+  target_scale: 3.0                                 # Classification KL logit rescaler value , 1==one-hot, >1==class modules
   use_posterior_mean: "val"                         # Use full z or mean for classifier ["train", "val", "both"]
   use_contr_in_val: false                           # Use contrastive loss in validations set
   lr_scheduler_metric: "validation_loss"            # LR metric
   # Tensorboard logging options
   log_class_distribution: false                     # Log class label distribution in batch
-  full_val_log_every_n_epoch: 10                    # Log full validation metrics
+  full_val_log_every_n_epoch: 10                    # Log full validation metrics, slows down training a bit if low
   plot_umap: null                                   # Plot umap of latent space ["train", "val", "both", null]
 
 # Train parameters
@@ -99,10 +100,10 @@ model:
   use_batch_norm: "none"
   use_layer_norm: "both"
   gene_likelihood: "zinb"
-  linear_classifier: true
+  linear_classifier: true                           # Overwrites classifier parameters
   log_variational: true
-  l1_lambda: 0.0
-  l2_lambda: 1e-3
+  l1_lambda: 0.0                                    # Should be 0 when using attention
+  l2_lambda: 0.001                                   # Should always be > 0, help prevent overfitting
   l_mask: ["attn", "Attention", "class_projection"] # Use l1 / l2 regularization on these layers
   classification_loss_strategy: "kl"                # Enable KL-based class embedding classification
   contrastive_temperature: 0.1                      # Contrastive logit temperature scaling, lower --> sharper distinction

@@ -16,6 +16,13 @@ class _ConfKeys(NamedTuple):
     TRAIN: str = 'train'
     MODEL: str = 'model'
 
-CONF_KEYS = _ConfKeys()
+class _NestedConfKeys(NamedTuple):
+    SCHEDULES_KEY: str = 'anneal_schedules'
+    PLAN_KEY: str = 'plan_kwargs'
+    ENCODER_KEY: str = 'extra_encoder_kwargs'
+    DECODER_KEY: str = 'extra_decoder_kwargs'
+    CLS_KEY: str = 'classifier_parameters'
 
+CONF_KEYS = _ConfKeys()
+NESTED_CONF_KEYS = _NestedConfKeys()
 HP_KEYS = _HP_KEYS()

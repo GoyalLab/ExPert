@@ -69,6 +69,13 @@ class _MODULE_KEYS(NamedTuple):
     # prediction
     PREDICTION_KEY: str = "cls_prediction"
 
+class _TRAINING_KEYS_NT(NamedTuple):
+    MODEL_KEY: str = "model"
+    RESULTS_KEY: str = "results"
+    LATENT_KEY: str = "latent"
+    OUTPUT_KEY: str = "version_dir"
+    TEST_KEY: str = "test_results"
 
 REGISTRY_KEYS = _REGISTRY_KEYS_NT()
 MODULE_KEYS = _MODULE_KEYS()
+TRAINING_KEYS = _TRAINING_KEYS_NT()

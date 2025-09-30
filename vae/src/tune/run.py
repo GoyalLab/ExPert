@@ -19,8 +19,9 @@ import anndata as ad
 
 from tqdm import tqdm
 
-from src.utils.constants import REGISTRY_KEYS
-from ._statics import CONF_KEYS
+from src.utils.constants import REGISTRY_KEYS, TRAINING_KEYS
+from src.utils.io import read_config
+from ._statics import CONF_KEYS, NESTED_CONF_KEYS
 from ..models._jedvi import JEDVI
 from ..plotting import get_model_results, get_classification_report, get_latest_tensor_dir, plot_confusion
 from ..performance import get_library, performance_metric
@@ -136,33 +137,7 @@ def sample_configs(space: dict, src_config: dict, N: int = 10, base_dir: str | N
     else:
         return space_configs, pd.DataFrame({'config_path': config_paths})
 
-# Recursive function to replace "nn.*" strings with actual torch.nn classes
-def replace_nn_modules(d):
-    if isinstance(d, dict):
-        return {k: replace_nn_modules(v) for k, v in d.items()}
-    elif isinstance(d, list):
-        return [replace_nn_modules(v) for v in d]
-    elif isinstance(d, str) and d.startswith("nn."):
-        attr = d.split("nn.")[-1]
-        return getattr(nn, attr)
-    elif isinstance(d, str) and hasattr(nn, d):
-        return getattr(nn, d)
-    else:
-        return d
-
-def read_config(config_p: str) -> dict:
-    """Read hyperparameter yaml file"""
-    logging.info(f'Loading config file: {config_p}')
-    with open(config_p, 'r') as f:
-        config: dict = yaml.safe_load(f)
-    # Check for config keys
-    expected_keys = set(CONF_KEYS._asdict().values())
-    assert expected_keys.issubset(config.keys()), f"Missing keys: {expected_keys - set(config.keys())}"
-    # Convert nn modules to actual classes
-    config = replace_nn_modules(config)
-    return config
-
-def train(
+def _train(
         adata_p: str, 
         step_model_dir: str, 
         config: dict, 
@@ -196,14 +171,14 @@ def train(
     torch.set_float32_matmul_precision('medium')
 
     # Add schedule params to plan
-    config[CONF_KEYS.PLAN]['anneal_schedules'] = config[CONF_KEYS.SCHEDULES]
+    config[CONF_KEYS.PLAN][NESTED_CONF_KEYS.SCHEDULES_KEY] = config[CONF_KEYS.SCHEDULES]
     # Add plan to train
-    config[CONF_KEYS.TRAIN]['plan_kwargs'] = config[CONF_KEYS.PLAN]
+    config[CONF_KEYS.TRAIN][NESTED_CONF_KEYS.PLAN_KEY] = config[CONF_KEYS.PLAN]
     # Add encoder and decoder args to model
-    config[CONF_KEYS.MODEL]['extra_encoder_kwargs'] = config[CONF_KEYS.ENCODER]
-    config[CONF_KEYS.MODEL]['extra_decoder_kwargs'] = config[CONF_KEYS.DECODER]
+    config[CONF_KEYS.MODEL][NESTED_CONF_KEYS.ENCODER_KEY] = config[CONF_KEYS.ENCODER]
+    config[CONF_KEYS.MODEL][NESTED_CONF_KEYS.DECODER_KEY] = config[CONF_KEYS.DECODER]
     # Add classifier args to model
-    config[CONF_KEYS.MODEL]['classifier_parameters'] = config[CONF_KEYS.CLS]
+    config[CONF_KEYS.MODEL][NESTED_CONF_KEYS.CLS_KEY] = config[CONF_KEYS.CLS]
 
     # Setup model
     logging.info('Setting up model.')
@@ -214,7 +189,6 @@ def train(
         labels_key=cls_label
     )
     model = JEDVI(model_set, **config[CONF_KEYS.MODEL].copy())
-    logging.info(model)
     # Set training logger
     config[CONF_KEYS.TRAIN]['logger'] = pl.loggers.TensorBoardLogger(step_model_dir)
     # Train the model
@@ -330,6 +304,16 @@ def run_model_predictions(model, test_ad, cls_label, batch_key, incl_unseen: boo
     return test_ad, predictions
 
 
+def plot_test_confusion(test_ad: ad.AnnData, plt_dir: str) -> None:
+    from src.plotting import plot_confusion
+
+    actual = test_ad.obs.perturbation.values.tolist()
+    pred = test_ad.obs.cls_prediction.str.split(';').str[1].values.tolist()
+    # Output file
+    o = os.path.join(plt_dir, 'test_confusion_cls_label.png')
+    plot_confusion(actual, pred, plt_file=o)
+
+
 def evaluate_predictions(test_ad, predictions, train_perturbations, output_dir: str, plot: bool, groupby: str, use_pathway: bool = True):
     _, report = get_classification_report(test_ad, cls_label='cls_label', mode='test')
     report.sort_values('f1-score', ascending=False, inplace=True)
@@ -345,9 +329,10 @@ def evaluate_predictions(test_ad, predictions, train_perturbations, output_dir: 
     # Plot metrics results
     if plot:
         # Create plot dir if not already there
-        plt_dir = os.path.join(output_dir, 'plots', 'test')
+        plt_dir = os.path.join(output_dir, 'plots')
         os.makedirs(plt_dir, exist_ok=True)
         # Plot confusion matrix
+        plot_test_confusion(test_ad, plt_dir=plt_dir)
         # Filter out random predictions
         no_random = top_n_predictions[top_n_predictions['mode'] != 'random'].copy()
         n_classes = test_ad.obs.cls_label.nunique()
@@ -364,6 +349,8 @@ def evaluate_predictions(test_ad, predictions, train_perturbations, output_dir: 
         plot_f1_random_vs_normal(top_n_predictions, n_classes=n_classes, plt_dir=plt_dir, use_pathway=True, train_only=False)
         plot_f1_random_vs_normal(top_n_predictions, n_classes=n_classes, plt_dir=plt_dir, use_pathway=False, train_only=True)
         plot_f1_random_vs_normal(top_n_predictions, n_classes=n_classes, plt_dir=plt_dir, use_pathway=True, train_only=True)
+    # Return results
+    return top_n_predictions
 
 
 def compute_top_n_predictions(test_ad, predictions, train_perturbations, n: int = 20, groupby: str = '_dataset', lib = None):
@@ -394,11 +381,11 @@ def compute_top_n_predictions(test_ad, predictions, train_perturbations, n: int 
                 'prediction': np.concatenate([y[is_hit == 1], top_predictions[is_hit == 0][:, -1]])
             })
             stats_per_label['pred_label'] = predictions.columns[stats_per_label.prediction.values.astype(int)]
-            random_pred = pd.Series(np.random.choice(predictions.columns, stats_per_label.shape[0], replace=True)).str.split(';').str[1]
+            random_pred = pd.Series(np.random.choice(predictions.columns, stats_per_label.shape[0], replace=True)).str.split(';').str[1].astype(str)
 
-            actual = stats_per_label.label.str.split(';').str[1]
-            pred = stats_per_label.pred_label.str.split(';').str[1]
-            l = predictions.columns.str.split(';').str[1]
+            actual = stats_per_label.label.str.split(';').str[1].astype(str)
+            pred = stats_per_label.pred_label.str.split(';').str[1].astype(str)
+            l = predictions.columns.str.split(';').str[1].astype(str)
             # Calculate performance metrices for predictions
             test_metrics = performance_metric(actual, pred, l, lib=None, mode='test')
             # Calculate random performance
@@ -432,7 +419,7 @@ def plot_f1_random_vs_normal(top_n_predictions: pd.DataFrame, n_classes: int, pl
     zs_title = ' (Unseen Perturbations)' if not train_only else ''
     add_title = ' (Pathway-based)' if use_pathway else ''
     plt.figure(dpi=300, figsize=(10, 5))
-    ax = sns.boxenplot(tmp, x='top_n', y='f1', hue='mode',
+    ax = sns.boxenplot(tmp, x='top_n', y='f1-score', hue='mode',
                   palette=['#7900d7', '#3274a1'])
     plt.xlabel('Number of top predictions')
     plt.ylim([0.0, 1.0])
@@ -465,7 +452,7 @@ def plot_f1_zero_shot(no_random: pd.DataFrame, n_classes: int, plt_dir: str, use
     tmp = no_random[no_random['use_pathway']==use_pathway]
     add_title = ' (Pathway-based)' if use_pathway else ''
     plt.figure(dpi=300, figsize=(10, 5))
-    ax = sns.boxenplot(tmp, x='top_n', y='f1', hue='is_training_perturbation',
+    ax = sns.boxenplot(tmp, x='top_n', y='f1-score', hue='is_training_perturbation',
                   palette=['#7900d7', '#3274a1'])
     plt.xlabel('Number of top predictions')
     plt.ylim([0.0, 1.0])
@@ -500,7 +487,7 @@ def plot_f1_groups(no_random: pd.DataFrame, plt_dir: str, groupby: str = 'cellty
     zs_title = ' (Unseen Perturbations)' if not train_cls_only else ''
     add_title = ' (Pathway-based)' if use_pathway else ''
     plt.figure(dpi=300, figsize=(10, 5))
-    ax = sns.boxenplot(top_10, x='top_n', y='f1', hue=groupby, flier_kws={'s': 10}, legend=True)
+    ax = sns.boxenplot(top_10, x='top_n', y='f1-score', hue=groupby, flier_kws={'s': 10}, legend=True)
     plt.xlabel('Number of top predictions')
     plt.ylim([0.0, 1.0])
     plt.ylabel('F1-score per class')
@@ -550,9 +537,20 @@ def ens_to_symbol(adata: ad.AnnData, gene_symbol_keys: list[str] = ['gene_symbol
         adata = adata[:,idx]
     return adata
 
-def update_latent(model: nn.Module, test_ad: ad.AnnData, version_dir: str, plot: bool = True, incl_unseen: bool = True, batch_key: str = 'dataset', orig_group_key: str = 'orig_dataset'):
+def update_latent(
+        model: nn.Module, 
+        test_ad: ad.AnnData, 
+        version_dir: str, 
+        output_dir: str | None = None,
+        plot: bool = True, 
+        incl_unseen: bool = True, 
+        batch_key: str = 'dataset', 
+        orig_group_key: str = 'orig_dataset'
+    ):
+    # Set output directory
+    output_dir = version_dir if output_dir is None else output_dir
     # I/O
-    plt_dir = os.path.join(version_dir, 'plots')
+    plt_dir = os.path.join(output_dir, 'plots')
     latent = sc.read(os.path.join(version_dir, 'latent.h5ad'))
     # Plot combination of latent spaces
     _, model_cz = model.predict(return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
@@ -581,13 +579,26 @@ def update_latent(model: nn.Module, test_ad: ad.AnnData, version_dir: str, plot:
     sc.pp.neighbors(latent, use_rep='cz_pca')
     sc.tl.umap(latent)
     # Write updated latent space to file
-    latent.write_h5ad(os.path.join(version_dir, 'full_latent.h5ad'))
+    latent.write_h5ad(os.path.join(output_dir, 'full_latent.h5ad'))
     # Plot updated umap with new testing data
     if plot:
-        logging.info(f'Plotting merged umap.')
-        sc.pl.umap(latent, color=['celltype', 'mode'], ncols=1, return_fig=True, show=False)
-        plt.savefig(os.path.join(plt_dir, f'full_umap.png'), dpi=300, bbox_inches='tight')
+        logging.info(f'Plotting merged umaps.')
+        sc.pl.umap(latent, color=[orig_group_key], ncols=1, return_fig=True, show=False)
+        plt.savefig(os.path.join(plt_dir, f'full_umap_orig_batch_key.png'), dpi=300, bbox_inches='tight')
         plt.close()
+        sc.pl.umap(latent, color=['celltype'], ncols=1, return_fig=True, show=False)
+        plt.savefig(os.path.join(plt_dir, f'full_umap_ct.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        # Plot class labels if less than maximum color palette
+        if latent.obs.perturbation.nunique() < 102:
+            sc.pl.umap(latent, color=['perturbation'], ncols=1, return_fig=True, show=False)
+            plt.savefig(os.path.join(plt_dir, f'full_umap_perturbation.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+
+def _get_test_output_dir(**kwargs) -> str:
+    blacklist = set(['output_dir', 'plot'])
+    kw_strs = [f'{k}:{v}' for k,v in kwargs.items() if k not in blacklist]
+    return os.path.join('test', '_'.join(kw_strs))
         
 def test(
         model, 
@@ -598,46 +609,109 @@ def test(
         min_ms: float = 4.0,
         min_cpp: int = 10,
         plot: bool = False,
-        return_adata: bool = False
+        return_results: bool = False
     ):
+    # Load test set
     test_ad = load_test_data(test_adata_p, model, incl_unseen=incl_unseen)
+    # Setup test set labels
     cls_label, batch_key, orig_batch_key = setup_labels(test_ad, test_adata_p, model, use_fixed_dataset_label)
+    # Filter test set for labels in class embedding
     test_ad = filter_test_data(test_ad, min_ms, min_cpp)
+    # Predict
     test_ad, predictions = run_model_predictions(model, test_ad, cls_label, batch_key, incl_unseen=incl_unseen)
     # Evaluate predictions, plot and update latent space
     train_perturbations = set(model.adata.obs.perturbation.unique())
-    # Basic confusion matrix
-
-    evaluate_predictions(test_ad, predictions, train_perturbations, output_dir=output_dir, plot=plot, groupby=orig_batch_key)
+    # Generate output directory for specific test case
+    test_out_dirname = _get_test_output_dir(incl_unseen=incl_unseen, use_fixed_dataset_label=use_fixed_dataset_label, min_ms=min_ms, min_cpp=min_cpp)
+    test_out_dir = os.path.join(output_dir, test_out_dirname)
+    os.makedirs(test_out_dir, exist_ok=True)
+    logging.info(f'Evaluating results for test set. Test output dir: {test_out_dir}')
+    top_n_predictions = evaluate_predictions(test_ad, predictions, train_perturbations, output_dir=test_out_dir, plot=plot, groupby=orig_batch_key)
     # Update latent representation and calculate new umaps
     logging.info(f'Updating latent space with test data.')
-    update_latent(model, test_ad=test_ad, version_dir=output_dir, incl_unseen=incl_unseen, batch_key=batch_key, orig_group_key=orig_batch_key)
-    if return_adata:
-        return test_ad
+    update_latent(model, test_ad=test_ad, output_dir=test_out_dir, version_dir=output_dir, incl_unseen=incl_unseen, batch_key=batch_key, orig_group_key=orig_batch_key)
+    if return_results:
+        return top_n_predictions, test_ad
 
+def full_run(
+        config_p: str,
+        train_p: str,
+        model_dir: str,
+        test_p: str,
+        test_unseen: bool = False,
+    ) -> dict:
+    # Get config name
+    config_name = os.path.basename(config_p).replace('.yaml', '')
+    # Train model with loaded config file
+    train_output = train(adata_p=train_p, config_p=config_p, out_dir=model_dir)
+    # Test model with specified test set
+    top_n_predictions, _ = test(
+        model=train_output[TRAINING_KEYS.MODEL_KEY],
+        test_adata_p=test_p,
+        output_dir=train_output[TRAINING_KEYS.OUTPUT_KEY],
+        incl_unseen=False,
+        plot=True,
+        return_results=True
+    )
+    top_n_predictions['incl_unseen'] = False
+    # Test model with unseen perturbations
+    if test_unseen:
+        top_n_predictions_unseen, _ = test(
+            model=train_output[TRAINING_KEYS.MODEL_KEY],
+            test_adata_p=test_p,
+            output_dir=train_output[TRAINING_KEYS.OUTPUT_KEY],
+            incl_unseen=True,
+            plot=True,
+            return_results=True
+        )
+        top_n_predictions_unseen['incl_unseen'] = True
+        # Concat both predictions
+        top_n_predictions = pd.concat((top_n_predictions, top_n_predictions_unseen), axis=0)
+    # Add config name to predictions
+    top_n_predictions['config_name'] = config_name
+    # Save overall testing performance to file
+    top_n_predictions.to_csv(os.path.join(train_output[TRAINING_KEYS.OUTPUT_KEY], 'test_top_n_predictions.csv'))
+    return top_n_predictions
 
 def get_ouptut_dir(config_p: str, output_base_dir: str | None = None) -> str:
     # Create directory based on the input config name
-    output_dir = os.path.dirname(config_p) if output_base_dir is None else output_base_dir
+    if output_base_dir is None:
+        output_dir = os.path.dirname(config_p)
+    else:
+        output_dir = os.path.join(output_base_dir, os.path.basename(config_p).replace('.yaml', ''))
     logging.info(f'Run output directory: {output_dir}')
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
-if __name__ == '__main__':
-    # Parse cmd line args
-    args = parse_args()
-    # Load config file
-    config = read_config(args.config)
-    step_model_dir = get_ouptut_dir(args.config, output_base_dir=args.outdir)
+def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.Module | pd.DataFrame | ad.AnnData | str]:
+    # Load run config
+    config = read_config(config_p)
+    # Init run output dir
+    step_model_dir = get_ouptut_dir(config_p, output_base_dir=out_dir)
     # Train the model
-    logging.info(f'Training config: {args.config}')
-    model, results, latent = train(
-        adata_p=args.input, 
+    model, results, latent = _train(
+        adata_p=adata_p, 
         step_model_dir=step_model_dir, 
-        config=config
+        config=config,
+        **kwargs
     )
     # Get latest lightning directory
     version_dir = get_latest_tensor_dir(step_model_dir)
+    return {
+        TRAINING_KEYS.MODEL_KEY: model,
+        TRAINING_KEYS.RESULTS_KEY: results,
+        TRAINING_KEYS.LATENT_KEY: latent,
+        TRAINING_KEYS.OUTPUT_KEY: version_dir
+    }
+
+if __name__ == '__main__':
+    # Parse cmd line args
+    args = parse_args()
+    # Train model
+    train_output = train(adata_p=args.input, config_p=args.config, out_dir=args.outdir)
+    # Get training results
+    version_dir = train_output[TRAINING_KEYS.OUTPUT_KEY]
+    model = train_output[TRAINING_KEYS.MODEL_KEY]
     # Test model performance if path is given
     if args.test is not None and os.path.exists(args.test) and args.test.endswith('.h5ad'):
         logging.info(f'Testing with: {args.test}')

@@ -23,7 +23,7 @@ def performance_metric(actual, pred, labels, lib=None, mode='test'):
         labels=labels.values.astype(str),
         average=None, 
         zero_division=np.nan)
-    m = pd.DataFrame(cls_report, index=['precision', 'recall', 'f1', 'support'], columns=labels).T
+    m = pd.DataFrame(cls_report, index=['precision', 'recall', 'f1-score', 'support'], columns=labels).T
     # Set label
     m['mode'] = mode
     return m
