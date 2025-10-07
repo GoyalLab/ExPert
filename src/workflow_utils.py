@@ -64,7 +64,7 @@ def get_default_resources(resource_config: dict, default_key: str = 'default') -
 def get_job_resources(resource_config: dict, job_name: str, partition_prio: str | None = None) -> dict[str, str]:
     # Check if there are resource specification for that job name
     if job_name not in resource_config['jobs']:
-        logging.warning(f'Could not resource config for job {job_name}, falling back to defaults.')
+        logging.warning(f'Could not find resource config for job {job_name}, falling back to defaults.')
         return get_default_resources()
     # Get resource configs for job from defaults.yaml with updates by user
     time: str = resource_config['jobs'][job_name]['time']
@@ -89,6 +89,9 @@ def get_job_resources(resource_config: dict, job_name: str, partition_prio: str 
         o['partition'] = partition
     if threads is not None:
         o['threads'] = threads
+    # Add any extra options to resources
+    ext_kwargs = {k: v for k, v in resource_config.items() if k not in o.keys()}
+    o.update(ext_kwargs)
     return o
 
 
