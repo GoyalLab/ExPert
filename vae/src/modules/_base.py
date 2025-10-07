@@ -208,7 +208,7 @@ class FunnelFCLayers(nn.Module):
     
     def inject_into_layer(self, layer_num) -> bool:
         """Helper to determine if covariates should be injected."""
-        return layer_num > 0 and self.inject_covariates
+        return layer_num==0 or (layer_num > 0 and self.inject_covariates)
 
     def forward(self, x: torch.Tensor, *cat_list: torch.Tensor) -> torch.Tensor:
         # One-hot encode categorical covariates
@@ -1159,10 +1159,12 @@ class EmbeddingClassifier(nn.Module):
         use_layer_norm: bool = False,
         activation_fn: nn.Module = nn.LeakyReLU,
         class_embed_dim: int = 128,
+        shared_projection_dim: int | None = None,
         skip_projection: bool = False,
         use_cosine_similarity: bool = True,
         temperature: float = 1,
         return_latents: bool = True,
+        mode: Literal['latent_to_class', 'class_to_latent', 'shared'] = 'latent_to_class',
         **kwargs,
     ):
         super().__init__()
@@ -1173,27 +1175,51 @@ class EmbeddingClassifier(nn.Module):
         self.temperature = temperature
         self.dropout_rate = dropout_rate
         self.return_latents = return_latents
+        self.mode = mode
 
-        # Use input latent space for classification
-        if n_input == class_embed_dim and skip_projection:
+        # -------- Projections depending on mode -------- #
+        # Latent -> Class embedding space
+        if mode == 'latent_to_class':
+            # No class projection necessary
             self.class_projection = nn.Identity()
-        else:
-            # Initialize layers
-            if n_hidden > 0 and n_layers > 0:
-                self.class_projection = FunnelFCLayers(
-                    n_in=n_input,
-                    n_out=class_embed_dim,
-                    n_layers=n_layers,
-                    dropout_rate=dropout_rate,
-                    use_batch_norm=use_batch_norm,
-                    use_layer_norm=use_layer_norm,
-                    activation_fn=activation_fn,
-                    **kwargs,
-                )
+            if n_input == class_embed_dim and skip_projection:
+                self.latent_projection = nn.Identity()
             else:
-                # Set encoder to a single linear layer
-                self.class_projection = nn.Linear(n_input, class_embed_dim)
-                class_embed_dim = n_input
+                # Initialize layers
+                if n_hidden > 0 and n_layers > 0:
+                    self.latent_projection = FunnelFCLayers(
+                        n_in=n_input,
+                        n_out=class_embed_dim,
+                        n_layers=n_layers,
+                        dropout_rate=dropout_rate,
+                        use_batch_norm=use_batch_norm,
+                        use_layer_norm=use_layer_norm,
+                        activation_fn=activation_fn,
+                        **kwargs,
+                    )
+                else:
+                    # Set encoder to a single linear layer
+                    self.latent_projection = nn.Linear(n_input, class_embed_dim)
+        
+        # Class embedding -> Latent space
+        elif mode == 'class_to_latent':
+            # No latent projection needed
+            self.latent_projection = nn.Identity()
+            if n_input == class_embed_dim and skip_projection:
+                self.class_projection = nn.Identity()
+            else:
+                self.class_projection = nn.Linear(class_embed_dim, n_input)
+        
+        # Both -> shared space
+        elif mode == 'shared':
+            if shared_projection_dim is None:
+                shared_projection_dim = min(n_input, class_embed_dim)
+            self.latent_projection = nn.Linear(n_input, shared_projection_dim)
+            self.class_projection = nn.Linear(class_embed_dim, shared_projection_dim)
+
+        else:
+            raise ValueError(f'Unknown mode: {mode}')
+
         # Add dropout
         self.dropout = nn.Dropout(p=dropout_rate)
 
@@ -1205,9 +1231,9 @@ class EmbeddingClassifier(nn.Module):
         Parameters
         ----------
         x : Tensor
-            Input latent features, shape (batch, n_input)
+            Input latent features, shape (batch, l)
         class_embeds : Optional[Tensor]
-            External class embeddings, shape (n_labels, class_embed_dim)
+            External class embeddings, shape (n_labels, d)
         """
         
         # Get class embeddings for step
@@ -1215,24 +1241,28 @@ class EmbeddingClassifier(nn.Module):
             class_embeds = self.learned_class_embeds
         else:
             class_embeds = class_embeds.to(x.device)
-        # Class projection
-        z = self.class_projection(x)  # (batch, d)
+        # Latent -> Class projection
+        z = self.latent_projection(x)  # (batch, d) | (batch, l)
+        # Class -> Latent projection
+        c = self.class_projection(class_embeds)     # (n_labels, l) | (n_labels, d)
         # Randomly dropout some elements in the projection
         if self.dropout_rate > 0:
             z = self.dropout(z)
         # Calculate classification logits
         if self.use_cosine_similarity:
-            z_norm = F.normalize(z, dim=-1)            # (batch, d)
-            c_norm = F.normalize(class_embeds, dim=-1) # (n_labels, d)
+            z_norm = F.normalize(z, dim=-1)            # (batch, d | l)
+            c_norm = F.normalize(c, dim=-1)            # (n_labels, d | l)
             logits = torch.matmul(z_norm, c_norm.T) / self.temperature    # (batch, n_labels)
             _z = z_norm
+            _c = c_norm
         else:
             z = z.unsqueeze(1)  # (batch, 1, d)
             class_seq = class_embeds.unsqueeze(0).expand(z.size(0), -1, -1)  # (batch, n_labels, d)
             logits = torch.bmm(z, class_seq.transpose(1, 2)).squeeze(1)      # (batch, n_labels)
             _z = z
+            _c = c
         l = logits if self.logits else F.softmax(logits, dim=-1)
         if self.return_latents:
-            return l, _z
+            return l, _z, _c
         else:
             return l

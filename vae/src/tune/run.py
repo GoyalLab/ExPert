@@ -19,7 +19,7 @@ import anndata as ad
 
 from tqdm import tqdm
 
-from src.utils.constants import REGISTRY_KEYS, TRAINING_KEYS
+from src.utils.constants import REGISTRY_KEYS, TRAINING_KEYS, MODULE_KEYS
 from src.utils.io import read_config
 from ._statics import CONF_KEYS, NESTED_CONF_KEYS
 from ..models._jedvi import JEDVI
@@ -143,7 +143,7 @@ def _train(
         config: dict, 
         cls_label: str = 'cls_label',
         batch_key: str = 'dataset',
-        verbose: bool = True,
+        verbose: bool = False,
     ) -> tuple[nn.Module, pd.DataFrame, ad.AnnData]:
     logging.info(f'Reading training data from: {adata_p}')
     model_set = sc.read(adata_p)
@@ -189,6 +189,8 @@ def _train(
         labels_key=cls_label
     )
     model = JEDVI(model_set, **config[CONF_KEYS.MODEL].copy())
+    if verbose:
+        print(model.module)
     # Set training logger
     config[CONF_KEYS.TRAIN]['logger'] = pl.loggers.TensorBoardLogger(step_model_dir)
     # Train the model
@@ -295,9 +297,10 @@ def run_model_predictions(model, test_ad, cls_label, batch_key, incl_unseen: boo
 
     # Get latent representation of model
     test_ad.obsm['latent_z'] = model.get_latent_representation(adata=test_ad)
-    predictions, cz = model.predict(adata=test_ad, return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
-    
+    predictions, cz, cls_emb_z = model.predict(adata=test_ad, return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
+    # Store in adata
     test_ad.obsm['latent_cz'] = cz
+    test_ad.uns['cls_emb_z'] = cls_emb_z
     test_ad.obs['cls_prediction'] = predictions.columns[predictions.values.argmax(axis=-1)]
     test_ad.obs['cls_score'] = predictions.max(axis=1) - predictions.mean(axis=1)
 
@@ -353,11 +356,14 @@ def evaluate_predictions(test_ad, predictions, train_perturbations, output_dir: 
     return top_n_predictions
 
 
-def compute_top_n_predictions(test_ad, predictions, train_perturbations, n: int = 20, groupby: str = '_dataset', lib = None):
+def compute_top_n_predictions(test_ad, predictions: pd.DataFrame, train_perturbations, n: int = 20, groupby: str = '_dataset', lib = None):
     # Calculate label index in prediction columns per cell
     test_ad.obs['cls_prediction_idx'] = (test_ad.obs.cls_label.values == predictions.columns.values.reshape(-1, 1)).argmax(axis=0)
     labels = test_ad.obs.cls_label.values
     max_idx = np.argsort(predictions, axis=1)
+    # Include random predictions
+    random_predictions = pd.DataFrame(np.random.random(predictions.shape), columns=predictions.columns, index=predictions.index)
+    random_max_idx = np.argsort(random_predictions, axis=1)
 
     # Look at top N predictions (can be useful for pathways etc.)
     top_n_predictions = []
@@ -369,22 +375,30 @@ def compute_top_n_predictions(test_ad, predictions, train_perturbations, n: int 
         y = tmp.obs['cls_prediction_idx'].values
         labels = tmp.obs.cls_label.values
         for top_n in tqdm(np.arange(n) + 1):
+            # Get top predictions
             top_predictions = max_idx[idx,-top_n:]
             hit_mask = top_predictions == np.array(y)[:, np.newaxis]
             hit_idx = np.argmax(hit_mask, axis=1)
             is_hit = np.any(hit_mask, axis=1).astype(int)
-
+            # Get top random predictions
+            top_random_predictions = random_max_idx[idx,-top_n:]
+            random_hit_mask = top_random_predictions == np.array(y)[:, np.newaxis]
+            is_random_hit = np.any(random_hit_mask, axis=1).astype(int)
+            # Summarize results
             stats_per_label = pd.DataFrame({
                 'y': np.concatenate([y[is_hit == 1], y[is_hit == 0]]),
                 'idx': np.concatenate([(top_n + 1 - hit_idx[is_hit == 1]) / (top_n + 1), np.repeat(0, np.sum(is_hit == 0))]),
                 'label': np.concatenate([labels[is_hit == 1], labels[is_hit == 0]]),
-                'prediction': np.concatenate([y[is_hit == 1], top_predictions[is_hit == 0][:, -1]])
+                'prediction': np.concatenate([y[is_hit == 1], top_predictions[is_hit == 0][:, -1]]),
+                'random_prediction': np.concatenate([y[is_random_hit == 1], top_random_predictions[is_random_hit == 0][:, -1]])
             })
+            # Pick actual labels from indices
             stats_per_label['pred_label'] = predictions.columns[stats_per_label.prediction.values.astype(int)]
-            random_pred = pd.Series(np.random.choice(predictions.columns, stats_per_label.shape[0], replace=True)).str.split(';').str[1].astype(str)
-
+            stats_per_label['random_pred_label'] = predictions.columns[stats_per_label.random_prediction.values.astype(int)]
+            # Transform labels to strings
             actual = stats_per_label.label.str.split(';').str[1].astype(str)
             pred = stats_per_label.pred_label.str.split(';').str[1].astype(str)
+            random_pred = stats_per_label.random_pred_label.str.split(';').str[1].astype(str)
             l = predictions.columns.str.split(';').str[1].astype(str)
             # Calculate performance metrices for predictions
             test_metrics = performance_metric(actual, pred, l, lib=None, mode='test')
@@ -553,7 +567,7 @@ def update_latent(
     plt_dir = os.path.join(output_dir, 'plots')
     latent = sc.read(os.path.join(version_dir, 'latent.h5ad'))
     # Plot combination of latent spaces
-    _, model_cz = model.predict(return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
+    _, model_cz, cls_emb_z = model.predict(return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
     idx_map = (
         latent.obs
         .reset_index(names='idx')
@@ -567,6 +581,7 @@ def update_latent(
     # Add batch label to latent
     latent.obs[orig_group_key] = latent.obs[batch_key].values
     latent.obsm['cz'] = model_cz[idx_map.model_index]
+    # Add test set
     test_ad.obs['mode'] = 'test'
     test_z = test_ad.obsm['latent_z']
     test_z = ad.AnnData(test_z, obs=test_ad.obs)
@@ -576,6 +591,7 @@ def update_latent(
     latent = ad.concat([latent, test_z], axis=0)
     # TODO: save cz umap as individual .obsm and not overwrite existing latent umap
     latent.obsm['cz_pca'] = sc.pp.pca(latent.obsm['cz'])
+    latent.uns['cls_emb_z'] = test_ad.uns['cls_emb_z']
     sc.pp.neighbors(latent, use_rep='cz_pca')
     sc.tl.umap(latent)
     # Write updated latent space to file

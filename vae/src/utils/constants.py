@@ -36,12 +36,14 @@ class _MODULE_KEYS(NamedTuple):
     QZM_KEY: str = "qzm"
     QZV_KEY: str = "qzv"
     PWDX_KEY: str = "xpwd"
-    # inference (gene embedding)
+    # inference (latent to class embedding projection)
     ZG_KEY: str = "zg"
     QZG_KEY: str = "qzg"
     QZGM_KEY: str = "qzgm"
     QZGV_KEY: str = "qzgv"
     PWDG_KEY: str = "gpwd"
+    # inference (class embedding to latent projection)
+    ZE_KEY: str = "ze"
     LIBRARY_G_KEY: str = "library_g"
     # inference (library)
     LIBRARY_KEY: str = "library"

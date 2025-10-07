@@ -554,6 +554,7 @@ class JEDVI(
         
         y_pred = []
         y_cz = []
+        y_ez = []
         for _, tensors in enumerate(scdl):
             x = tensors[REGISTRY_KEYS.X_KEY]
             batch = tensors[REGISTRY_KEYS.BATCH_KEY]
@@ -563,8 +564,8 @@ class JEDVI(
 
             cat_key = REGISTRY_KEYS.CAT_COVS_KEY
             cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
-
-            pred, cz = self.module.classify(
+            # Run classification process
+            pred, cz, ez = self.module.classify(
                 x,
                 batch_index=batch,
                 g=self.gene_emb,
@@ -576,9 +577,12 @@ class JEDVI(
                 pred = pred.argmax(dim=1)
             y_pred.append(pred.detach().cpu())
             y_cz.append(cz.detach().cpu())
+            y_ez.append(ez.detach().cpu())
         # Concatenate batch results
         y_pred = torch.cat(y_pred).numpy()
         y_cz = torch.cat(y_cz).numpy()
+        # Calculate mean embedding projections
+        y_ez = torch.stack(y_ez, dim=0).mean(dim=0).numpy()
         if not soft:
             predictions = []
             for p in y_pred:
@@ -597,7 +601,7 @@ class JEDVI(
                 index=adata.obs_names[indices],
             )
         if return_latent:
-            return pred, y_cz
+            return pred, y_cz, y_ez
         else:
             return pred
         

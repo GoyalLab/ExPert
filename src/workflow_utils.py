@@ -90,7 +90,7 @@ def get_job_resources(resource_config: dict, job_name: str, partition_prio: str 
     if threads is not None:
         o['threads'] = threads
     # Add any extra options to resources
-    ext_kwargs = {k: v for k, v in resource_config.items() if k not in o.keys()}
+    ext_kwargs = {k: v for k, v in resource_config['jobs'][job_name].items() if k not in o.keys()}
     o.update(ext_kwargs)
     return o
 

@@ -20,6 +20,8 @@ import logging
 
 
 def _sigmoid_schedule(t, T, k):
+    if T == 0:
+        return 0
     """Normalized sigmoid: 0 at t=0, 1 at t=T."""
     midpoint = T / 2
     raw = 1 / (1 + np.exp(-k * (t - midpoint) / T))
@@ -28,6 +30,8 @@ def _sigmoid_schedule(t, T, k):
     return (raw - min_val) / (max_val - min_val)
 
 def _exponential_schedule(t, T, k):
+    if T == 0:
+        return 0
     """Normalized exponential: 0 at t=0, 1 at t=T."""
     raw = 1 - np.exp(-k * t / T)
     max_val = 1 - np.exp(-k)
@@ -83,417 +87,6 @@ def _compute_weight(
     weight = min_weight + slope * w
     return max_weight - weight if invert else weight
 
-
-class SemiSupervisedTrainingPlan(TrainingPlan):
-    """Lightning module task for SemiSupervised Training.
-
-    Parameters
-    ----------
-    module
-        A module instance from class ``BaseModuleClass``.
-    n_classes
-        The number of classes in the labeled dataset.
-    classification_ratio
-        Weight of the classification_loss in loss function
-    lr
-        Learning rate used for optimization :class:`~torch.optim.Adam`.
-    weight_decay
-        Weight decay used in :class:`~torch.optim.Adam`.
-    n_steps_kl_warmup
-        Number of training steps (minibatches) to scale weight on KL divergences from 0 to 1.
-        Only activated when `n_epochs_kl_warmup` is set to None.
-    n_epochs_kl_warmup
-        Number of epochs to scale weight on KL divergences from 0 to 1.
-        Overrides `n_steps_kl_warmup` when both are not `None`.
-    reduce_lr_on_plateau
-        Whether to monitor validation loss and reduce learning rate when validation set
-        `lr_scheduler_metric` plateaus.
-    lr_factor
-        Factor to reduce learning rate.
-    lr_patience
-        Number of epochs with no improvement after which learning rate will be reduced.
-    lr_threshold
-        Threshold for measuring the new optimum.
-    lr_scheduler_metric
-        Which metric to track for learning rate reduction.
-    **loss_kwargs
-        Keyword args to pass to the loss method of the `module`.
-        `kl_weight` should not be passed here and is handled automatically.
-    """
-
-    def __init__(
-        self,
-        module: BaseModuleClass,
-        n_classes: int,
-        lr: float = 1e-3,
-        weight_decay: float = 1e-6,
-        n_steps_kl_warmup: int | None = None,
-        n_epochs_kl_warmup: int | None = 400,
-        n_steps_cls_warmup: int | None = None,
-        n_epochs_cls_warmup: int | None = 400,
-        n_epochs_cls_stall: int | None = 100,
-        max_cls_weight: float = 1.0,
-        min_cls_weight: float = 0.0,
-        n_steps_contr_warmup: int | None = None,
-        n_epochs_contr_warmup: int | None = 400,
-        n_epochs_contr_stall: int | None = 100,
-        max_contr_weight: float = 1.0,
-        min_contr_weight: float = 0.0,
-        n_steps_align_warmup: int | None = None,
-        n_epochs_align_warmup: int | None = None,
-        n_epochs_align_stall: int | None = None,
-        max_align_weight: float | None = None,
-        min_align_weight: float | None = None,
-        reduce_lr_on_plateau: bool = False,
-        lr_factor: float = 0.6,
-        lr_patience: int = 30,
-        lr_threshold: float = 0.0,
-        lr_scheduler_metric: Literal[
-            "elbo_validation", "reconstruction_loss_validation", "kl_local_validation", "validation_classification_loss"
-        ] = "elbo_validation",
-        compile: bool = False,
-        compile_kwargs: dict | None = None,
-        average: str = "macro",
-        use_posterior_mean: Literal["train", "val", "both"] = "train",
-        anneal_schedule: Literal["linear", "sigmoid", "exponential"] = "sigmoid",
-        anneal_k: float = 5.0,
-        full_val_log_every_n_epoch: int = 50,
-        **loss_kwargs,
-    ):
-        super().__init__(
-            module=module,
-            lr=lr,
-            weight_decay=weight_decay,
-            n_steps_kl_warmup=n_steps_kl_warmup,
-            n_epochs_kl_warmup=n_epochs_kl_warmup,
-            reduce_lr_on_plateau=reduce_lr_on_plateau,
-            lr_factor=lr_factor,
-            lr_patience=lr_patience,
-            lr_threshold=lr_threshold,
-            lr_scheduler_metric=lr_scheduler_metric,
-            compile=compile,
-            compile_kwargs=compile_kwargs,
-            **loss_kwargs,
-        )
-        # CLS params
-        self.n_steps_cls_warmup = n_steps_cls_warmup
-        self.n_epochs_cls_warmup = n_epochs_cls_warmup
-        self.n_epochs_cls_stall = n_epochs_cls_stall
-        self.max_cls_weight = max_cls_weight
-        self.min_cls_weight = min_cls_weight
-        self.use_posterior_mean = use_posterior_mean
-        # Contrastive params
-        self.n_steps_contr_warmup = n_steps_contr_warmup
-        self.n_epochs_contr_warmup = n_epochs_contr_warmup
-        self.n_epochs_contr_stall = n_epochs_contr_stall
-        self.max_contr_weight = max_contr_weight
-        self.min_contr_weight = min_contr_weight
-        # Alignment params
-        self.n_steps_align_warmup = n_steps_align_warmup
-        self.n_epochs_align_warmup = n_epochs_align_warmup
-        self.n_epochs_align_stall = n_epochs_align_stall
-        self.max_align_weight = max_align_weight
-        self.min_align_weight = min_align_weight
-        # Misc
-        self.n_classes = n_classes
-        self.average = average
-        self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
-        self.plot_umap = self.loss_kwargs.pop("plot_umap", False)
-        self.anneal_schedule = anneal_schedule
-        self.anneal_k = anneal_k
-        self.full_val_log_every_n_epoch = full_val_log_every_n_epoch
-    
-    def log_with_mode(self, key: str, value: Any, mode: str, **kwargs):
-        """Log with mode."""
-        # TODO: Include this with a base training plan
-        self.log(f"{mode}_{key}", value, **kwargs)
-
-    @property
-    def classification_ratio(self):
-        """Scaling factor on classification weight during training. Consider Jax"""
-        klw = _compute_weight(
-            self.current_epoch,
-            self.global_step,
-            self.n_epochs_cls_warmup,
-            self.n_steps_cls_warmup,
-            self.n_epochs_cls_stall,
-            self.max_cls_weight,
-            self.min_cls_weight,
-            schedule=self.anneal_schedule,
-            anneal_k=self.anneal_k
-        )
-        return (
-            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
-        )
-    
-    @property
-    def alignment_loss_weight(self):
-        """Scaling factor on contrastive weight during training. Consider Jax"""
-        klw = _compute_weight(
-            self.current_epoch,
-            self.global_step,
-            self.n_epochs_align_warmup,
-            self.n_steps_align_warmup,
-            self.n_epochs_align_stall,
-            self.max_align_weight,
-            self.min_align_weight,
-            schedule=self.anneal_schedule,
-            anneal_k=self.anneal_k
-        )
-        return (
-            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
-        )
-
-    @property
-    def contrastive_loss_weight(self):
-        """Scaling factor on contrastive weight during training. Consider Jax"""
-        klw = _compute_weight(
-            self.current_epoch,
-            self.global_step,
-            self.n_epochs_contr_warmup,
-            self.n_steps_contr_warmup,
-            self.n_epochs_contr_stall,
-            self.max_contr_weight,
-            self.min_contr_weight,
-            schedule=self.anneal_schedule,
-            anneal_k=self.anneal_k
-        )
-        return (
-            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
-        )
-
-    def compute_and_log_metrics(
-        self, loss_output: LossOutput, metrics: dict[str, ElboMetric], mode: str
-    ):
-        """Computes and logs metrics."""
-        super().compute_and_log_metrics(loss_output, metrics, mode)
-
-        # Log individual reconstruction losses if there are multiple
-        if isinstance(loss_output.reconstruction_loss, dict) and len(loss_output.reconstruction_loss.keys()) > 1:
-            for k, rl in loss_output.reconstruction_loss.items():
-                self.log(
-                    f"{mode}_{k}",
-                    rl.mean() if isinstance(rl, torch.Tensor) else rl,
-                    on_epoch=True,
-                    batch_size=loss_output.n_obs_minibatch,
-                    prog_bar=True,
-                )
-        # Log individual kl local losses if there are multiple
-        if isinstance(loss_output.kl_local, dict) and len(loss_output.kl_local.keys()) > 1:
-            for k, kl in loss_output.kl_local.items():
-                self.log(
-                    f"{mode}_{k}",
-                    kl.mean() if isinstance(kl, torch.Tensor) else kl,
-                    on_epoch=True,
-                    batch_size=loss_output.n_obs_minibatch,
-                    prog_bar=True,
-                )
-
-        # no labeled observations in minibatch
-        if loss_output.classification_loss is None:
-            return
-
-        classification_loss = loss_output.classification_loss
-        true_labels = loss_output.true_labels.squeeze(-1)
-        logits = loss_output.logits
-        predicted_labels = torch.argmax(logits, dim=-1)
-
-        accuracy = tmf.classification.multiclass_accuracy(
-            predicted_labels,
-            true_labels,
-            self.n_classes,
-            average=self.average
-        )
-        f1 = tmf.classification.multiclass_f1_score(
-            predicted_labels,
-            true_labels,
-            self.n_classes,
-            average=self.average,
-        )
-        ce = tmf.classification.multiclass_calibration_error(
-            logits,
-            true_labels,
-            self.n_classes,
-        )
-
-        self.log_with_mode(
-            METRIC_KEYS.CLASSIFICATION_LOSS_KEY,
-            classification_loss,
-            mode,
-            on_step=False,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-        )
-        self.log_with_mode(
-            METRIC_KEYS.ACCURACY_KEY,
-            accuracy,
-            mode,
-            on_step=False,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-        )
-        self.log_with_mode(
-            METRIC_KEYS.F1_SCORE_KEY,
-            f1,
-            mode,
-            on_step=False,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-        )
-        self.log_with_mode(
-            METRIC_KEYS.CALIBRATION_ERROR_KEY,
-            ce,
-            mode,
-            on_step=False,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-        )
-
-    def training_step(self, batch, batch_idx):
-        """Training step for semi-supervised training."""
-        # Potentially dangerous if batch is from a single dataloader with two keys
-        if len(batch) == 2:
-            full_dataset = batch[0]
-            labelled_dataset = batch[1]
-        else:
-            full_dataset = batch
-            labelled_dataset = None
-
-        # Compute KL warmup
-        if "kl_weight" in self.loss_kwargs:
-            self.loss_kwargs.update({"kl_weight": self.kl_weight})
-        # Compute CL warmup
-        self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
-        self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
-        if self.max_align_weight is not None and self.max_align_weight > 0:
-            self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
-        self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "train" or self.use_posterior_mean == "both"})
-        # Add external embedding
-        if self.loss_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in self.loss_kwargs and labelled_dataset is not None:
-            labelled_dataset[REGISTRY_KEYS.CLS_EMB_KEY] = self.loss_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
-        input_kwargs = {
-            "labelled_tensors": labelled_dataset,
-        }
-        input_kwargs.update(self.loss_kwargs)
-        _, _, loss_output = self.forward(full_dataset, loss_kwargs=input_kwargs)
-        loss = loss_output.loss
-        self.log(
-            "train_loss",
-            loss,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=True,
-        )
-        self.log(
-            "kl_weight",
-            self.loss_kwargs['kl_weight'],
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=False,
-        )
-        self.log(
-            "classification_ratio",
-            self.loss_kwargs['classification_ratio'],
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=False,
-        )
-        self.compute_and_log_metrics(loss_output, self.train_metrics, "train")
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        """Validation step for semi-supervised training."""
-        # Potentially dangerous if batch is from a single dataloader with two keys
-        if len(batch) == 2:
-            full_dataset = batch[0]
-            labelled_dataset = batch[1]
-        else:
-            full_dataset = batch
-            labelled_dataset = None
-
-        if "kl_weight" in self.loss_kwargs:
-            self.loss_kwargs.update({"kl_weight": self.kl_weight})
-        self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
-        self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
-        if self.max_align_weight is not None and self.max_align_weight > 0:
-            self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
-        self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == "val" or self.use_posterior_mean == "both"})
-        
-        if self.loss_kwargs.get('use_ext_emb', False) and REGISTRY_KEYS.CLS_EMB_KEY in self.loss_kwargs and labelled_dataset is not None:
-            labelled_dataset[REGISTRY_KEYS.CLS_EMB_KEY] = self.loss_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY)
-
-        input_kwargs = {
-            "labelled_tensors": labelled_dataset,
-        }
-        input_kwargs.update(self.loss_kwargs)
-        _, _, loss_output = self.forward(full_dataset, loss_kwargs=input_kwargs)
-        loss = loss_output.loss
-        self.log(
-            "validation_loss",
-            loss,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=True,
-        )
-        self.compute_and_log_metrics(loss_output, self.val_metrics, "validation")
-
-    def get_umap(self, embeddings, labels, title="UMAP Projection", figsize=(10, 8), plt_file=None):
-        """Plots a UMAP projection of embeddings colored by labels."""
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-
-        umap = UMAP(n_neighbors=15, min_dist=0.1, metric="euclidean")
-        embeddings_2d = umap.fit_transform(embeddings)
-
-        plt.figure(figsize=figsize)
-        scatter = sns.scatterplot(
-            x=embeddings_2d[:, 0],
-            y=embeddings_2d[:, 1],
-            hue=labels,
-            palette="tab10",
-            legend="full",
-            alpha=0.7,
-        )
-        scatter.set_title(title)
-        scatter.set_xlabel("UMAP-1")
-        scatter.set_ylabel("UMAP-2")
-        plt.legend(title="Labels", bbox_to_anchor=(1.05, 1), loc="upper left")
-        fig = plt.gcf()
-        plt.close(fig)
-        return fig
-
-    def on_validation_epoch_end(self):
-        """Plot validation UMAP projection."""
-        if self.current_epoch % self.full_val_log_every_n_epoch == 0:
-            if self.plot_umap:
-                # Perform forward pass on the validation set to get embeddings
-                full_dataset = self.trainer.datamodule.val_dataloader()
-                embeddings = []
-                predicted_labels = []
-
-                for _, batch in enumerate(full_dataset):
-                    if len(batch) == 2:
-                        full_data = batch[0]
-                    else:
-                        full_data = batch
-
-                    with torch.no_grad():
-                        inference_outputs, _, loss_output = self.forward(full_data)
-                        embeddings.append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
-                        if self.loss_kwargs['classification_ratio'] != 0:
-                            predicted_labels.append(torch.argmax(loss_output.logits, dim=-1).cpu())
-
-                embeddings = torch.cat(embeddings, dim=0)
-                if self.loss_kwargs['classification_ratio'] != 0:
-                    predicted_labels = torch.cat(predicted_labels, dim=0)
-                    predicted_labels = predicted_labels.cpu().numpy()
-                else:
-                    predicted_labels = None
-
-                embeddings = embeddings.cpu().numpy()
-
-                fig_umap = self.get_umap(embeddings, predicted_labels, title=f"UMAP Projection (Predicted Labels), Epoch: {self.current_epoch}")
-                self.logger.experiment.add_figure("val_umap_projection", fig_umap, global_step=self.current_epoch)
 
 class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     """Lightning module task for Contrastive Supervised Training.
@@ -563,6 +156,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         anneal_schedules: dict[str, dict[str | float]] | None = None,
         full_val_log_every_n_epoch: int = 10,
         use_contr_in_val: bool = False,
+        multistage_kl_min: float = 0.1,
         **loss_kwargs,
     ):
         super().__init__(
@@ -584,6 +178,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.anneal_schedules = anneal_schedules
         self.n_epochs_warmup = n_epochs_warmup
         self.n_steps_warmup = n_steps_warmup
+        self.multistage_kl_min = multistage_kl_min
+        self.kl_reset_epochs = self._get_stall_epochs()
         # CLS params
         self.n_classes = n_classes
         self.use_posterior_mean = use_posterior_mean
@@ -595,6 +191,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         if not use_full_cls_emb and self.cls_emb is not None:
             self.train_cls_emb = self.cls_emb[:self.n_classes,:]
             self.train_cls_sim = self.train_cls_emb @ self.train_cls_emb.T
+        # Get number of total classes in embedding
+        self.n_all_classes = self.cls_emb.shape[0] if self.cls_emb is not None else self.n_classes
         if self.cls_emb is None:
             logging.warning(f'No external class embeddings provided, falling back to internal class embeddings.')
         self.incl_n_unseen = incl_n_unseen
@@ -617,11 +215,61 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.n_unseen_classes = 0
         # Cache
         self.cache = {}
+
+    def _get_stall_epochs(self) -> dict[str, int]:
+        stalls = {'kl': 0}
+        for name, schedule in self.anneal_schedules.items():
+            stall = schedule.get('n_epochs_stall', 0)
+            if stall > 0:
+                stalls[name] = stall
+        return stalls
     
     def log_with_mode(self, key: str, value: Any, mode: str, **kwargs):
         """Log with mode."""
         # TODO: Include this with a base training plan
         self.log(f"{mode}_{key}", value, **kwargs)
+
+    @property
+    def rl_weight(self):
+        """Scaling factor on classification weight during training. Consider Jax"""
+        kwargs = self.anneal_schedules.get('rl_weight', {'min_weight': 1.0, 'max_weight': 1.0})
+        klw = _compute_weight(
+            self.current_epoch,
+            self.global_step,
+            self.n_epochs_warmup,
+            self.n_steps_warmup,
+            **kwargs
+        )
+        return (
+            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
+        )
+
+    @property
+    def kl_weight_multistage(self):
+        """KL weight for forward process. Resets every time a new loss objective activates."""
+        reset_at = np.array(sorted(self.kl_reset_epochs.values()))
+        idx = (self.current_epoch > reset_at).sum() - 1
+        n_epochs_stall = reset_at[idx]
+        n_epochs_warmup = reset_at[idx+1] if idx+1 < len(reset_at) else self.n_epochs_warmup
+        # No new loss
+        if n_epochs_stall < 1:
+            min_weight = self.min_kl_weight
+        # New loss
+        else:
+            min_weight = self.multistage_kl_min
+        # Set KL weight to restart at multistage min (0.1) for every new loss that gets activated
+        klw = _compute_weight(
+            self.current_epoch,
+            self.global_step,
+            n_epochs_warmup,
+            self.n_steps_warmup,
+            n_epochs_stall=n_epochs_stall,
+            min_weight=min_weight,
+            max_weight=self.max_kl_weight
+        )
+        return (
+            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
+        )
 
     @property
     def classification_ratio(self):
@@ -768,12 +416,37 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
         )
 
-    def _get_batch_class_embedding(self, **kwargs) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def _get_batch_class_embedding(self, batch_idx: int | None = None, **kwargs) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if self.cls_emb is None:
             return None, None
         # Use full embedding
         if self.use_full_cls_emb:
-            return self.cls_emb, self.cls_sim
+            cls_emb = self.cls_emb
+            cls_sim = self.cls_sim
+            # Randomly subsample embeddings outside of training classes if there are more available
+            if self.incl_n_unseen is not None and self.incl_n_unseen > 0 and self.n_all_classes > self.n_classes:
+                # Seen class indices
+                seen_idx = torch.arange(self.n_classes, device=cls_emb.device)
+                # Unseen class indices
+                unseen_idx = torch.arange(self.n_classes, self.n_all_classes, device=cls_emb.device)
+                # Fix RNG seed based on batch_idx to make sampling deterministic per batch (optional)
+                if batch_idx is not None:
+                    g = torch.Generator(device=cls_emb.device)
+                    g.manual_seed(batch_idx + 1234)  # offset for reproducibility
+                    unseen_sample = unseen_idx[
+                        torch.randperm(len(unseen_idx), generator=g)[:self.incl_n_unseen]
+                    ]
+                else:
+                    unseen_sample = unseen_idx[
+                        torch.randperm(len(unseen_idx))[:self.incl_n_unseen]
+                    ]
+                # Combine seen + sampled unseen
+                selected_idx = torch.cat([seen_idx, unseen_sample], dim=0)
+                # Subset embeddings and similarity matrix
+                cls_emb = cls_emb[selected_idx]
+                cls_sim = cls_sim[selected_idx][:, selected_idx]
+
+            return cls_emb, cls_sim
         # Or use fixed part of embedding
         else:
             return self.train_cls_emb, self.train_cls_sim
@@ -786,9 +459,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
 
     def step(self, mode, batch, batch_idx):
         """Step for supervised training"""
+        # Compute RL weight
+        self.loss_kwargs.update({"rl_weight": self.rl_weight})
         # Compute KL warmup
         if "kl_weight" in self.loss_kwargs:
-            self.loss_kwargs.update({"kl_weight": self.kl_weight})
+            self.loss_kwargs.update({"kl_weight": self.kl_weight_multistage})
         # Compute CL warmup
         self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
         if mode=='train' or self.use_contr_in_val:
@@ -808,7 +483,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Add external embedding to batch
         if self.cls_emb is not None:
             # Add embedding for classes
-            batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding()
+            batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding(batch_idx=batch_idx)
         # Choose to use class scores for scaling or not
         input_kwargs['use_cls_scores'] = self.use_cls_scores in [mode, 'both']
         # Perform full forward pass of model
@@ -851,6 +526,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.log(
             "alignment_loss_weight",
             self.loss_kwargs['alignment_loss_weight'],
+            on_epoch=True,
+            batch_size=loss_output.n_obs_minibatch,
+            prog_bar=False,
+        )
+        self.log(
+            "logit_temperature",
+            1.0 / self.module.logit_scale.clamp(0, 4.6).exp(),
             on_epoch=True,
             batch_size=loss_output.n_obs_minibatch,
             prog_bar=False,
@@ -1003,7 +685,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         predicted_labels = []
         covs = []
         # Collect results for all batches
-        for _, batch in enumerate(full_dataset):
+        for batch_idx, batch in enumerate(full_dataset):
             with torch.no_grad():
                 # Compute KL warmup
                 if "kl_weight" in self.loss_kwargs:
@@ -1021,7 +703,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 # Add external embedding to batch
                 if self.cls_emb is not None:
                     # Add embedding for classes that are not in the training data
-                    batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding()
+                    batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding(batch_idx=batch_idx)
                 # Add external gene embedding to batch
                 if self.gene_emb is not None:
                     # Add gene embedding matrix to batch

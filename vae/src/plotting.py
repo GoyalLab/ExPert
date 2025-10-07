@@ -81,12 +81,14 @@ def get_model_latent(model, mode) -> ad.AnnData:
     latent.obs = model.adata.obs.iloc[idx,:].copy()
     pred = model.predict(indices=idx)
     if isinstance(pred, tuple):
-        predictions, cz = pred
+        predictions, cz, ez = pred
     else:
-        predictions, cz = pred, None
+        predictions, cz, ez = pred, None, None
     latent.obs[MODULE_KEYS.PREDICTION_KEY] = predictions
     if cz is not None:
         latent.obsm[MODULE_KEYS.ZG_KEY] = cz
+    if ez is not None:
+        latent.uns[MODULE_KEYS.ZE_KEY] = ez
     return latent
 
 def calc_umap(adata: ad.AnnData, rep: str = 'X') -> None:
@@ -158,7 +160,7 @@ def get_soft_predictions(model: nn.Module, adata: ad.AnnData | None = None, mode
     #data = data[data.obs.perturbation!='control']
     soft_predictions = model.predict(adata=adata, indices=data.obs['idx'].values, soft=True)
     if isinstance(soft_predictions, tuple):
-        soft_predictions, _ = soft_predictions
+        soft_predictions = soft_predictions[0]
     return soft_predictions, data
 
 def plot_soft_predictions(model: nn.Module, data: ad.AnnData, soft_predictions: pd.DataFrame, mode: str = 'val', plt_dir: str | None = None, n: int = 10) -> pd.DataFrame:
