@@ -8,7 +8,7 @@ plot_dir: 'plots'                           # Change to '' if you don't want met
 ## Pre-processing:
 perturbation_col: 'perturbation'            # Column name to look for in .obs that specifies the perturbation label
 ctrl_key: 'control'                         # Column value in .obs[perturbation_col] that represents control cells
-use_perturbation_pool: true                 # Filter every dataset for biggest common set of perturbations
+use_perturbation_pool: false                # Filter every dataset for biggest common set of perturbations
 use_feature_pool: true                      # Filter for shared features across all datasets
 qc: true                                    # Do quality control on cells (e.g. check for percentage of mitochondiral counts)
 norm: false                                 # Apply sc.pp.normalize_total()
@@ -19,9 +19,11 @@ n_hvg: 2000                                 # Number of highly variable genes to
 subset_hvg: false                           # Directly subset to hvgs (not recommended)
 n_ctrl: 10000                               # Maximum number of control cells, randomly draw n_ctrl if there are more control cells than that, keep all if less
 single_perturbations_only: true             # Exclude multiple perturbations from dataset
+z_score_filter: true                        # Filter cells based on euclidian distance to mean control expression in dataset
+min_cells_per_class: 50                     # Filter perturbations for a minimum number of cells
 
-## Filtering:
-mixscale_filter: true                       # Filter cells by knockdown efficiency (based on mixscale: https://www.biorxiv.org/content/10.1101/2024.01.29.576933v2)
+## Mixscale filter (very resource intensive):
+mixscale_filter: false                       # Filter cells by knockdown efficiency (based on mixscale: https://www.biorxiv.org/content/10.1101/2024.01.29.576933v2)
 min_deg: 5                                  # Minimum amount of differentially expressed genes compared to control cells for each perturbation to pass filtering
 ctrl_dev: 0.5                               # Minimum standart deviation of perturbed cells mixscale score to control
 min_cells_per_perturbation: 5               # Minimum amount of cells / perturbation required to pass filtering

@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import scipy.sparse as sp
 import torch
 import torchmetrics.functional as tmf
 import torch.nn.functional as F
@@ -13,7 +12,6 @@ from scvi.train._metrics import ElboMetric
 from scvi.train._constants import METRIC_KEYS
 
 from typing import Literal, Any
-from umap import UMAP
 from collections import defaultdict
 
 import logging
@@ -226,6 +224,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     
     def log_with_mode(self, key: str, value: Any, mode: str, **kwargs):
         """Log with mode."""
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
         # TODO: Include this with a base training plan
         self.log(f"{mode}_{key}", value, **kwargs)
 
@@ -274,14 +274,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     @property
     def classification_ratio(self):
         """Scaling factor on classification weight during training. Consider Jax"""
+        # Init basic args
+        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        # Add scheduling params if given
         kwargs = self.anneal_schedules.get('classification_ratio', {})
-        klw = _compute_weight(
-            self.current_epoch,
-            self.global_step,
-            self.n_epochs_warmup,
-            self.n_steps_warmup,
-            **kwargs
-        )
+        sched_kwargs.update(kwargs)
+        klw = _compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -289,14 +287,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     @property
     def alignment_loss_weight(self):
         """Scaling factor on contrastive weight during training. Consider Jax"""
+        # Init basic args
+        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        # Add scheduling params if given
         kwargs = self.anneal_schedules.get('alignment_loss_weight', {})
-        klw = _compute_weight(
-            self.current_epoch,
-            self.global_step,
-            self.n_epochs_warmup,
-            self.n_steps_warmup,
-            **kwargs
-        )
+        sched_kwargs.update(kwargs)
+        klw = _compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -304,14 +300,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     @property
     def contrastive_loss_weight(self):
         """Scaling factor on contrastive weight during training. Consider Jax"""
+        # Init basic args
+        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        # Add scheduling params if given
         kwargs = self.anneal_schedules.get('contrastive_loss_weight', {})
-        klw = _compute_weight(
-            self.current_epoch,
-            self.global_step,
-            self.n_epochs_warmup,
-            self.n_steps_warmup,
-            **kwargs
-        )
+        sched_kwargs.update(kwargs)
+        klw = _compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -319,14 +313,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     @property
     def class_kl_temperature(self):
         """Scaling factor on contrastive weight during training. Consider Jax"""
+        # Init basic args
+        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        # Add scheduling params if given
         kwargs = self.anneal_schedules.get('class_kl_temperature', {})
-        klw = _compute_weight(
-            self.current_epoch,
-            self.global_step,
-            self.n_epochs_warmup,
-            self.n_steps_warmup,
-            **kwargs
-        )
+        sched_kwargs.update(kwargs)
+        klw = _compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -335,8 +327,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self, loss_output: LossOutput, metrics: dict[str, ElboMetric], mode: str
     ):
         """Computes and logs metrics."""
-        super().compute_and_log_metrics(loss_output, metrics, mode)
-
         # Log individual reconstruction losses if there are multiple
         if isinstance(loss_output.reconstruction_loss, dict) and len(loss_output.reconstruction_loss.keys()) > 1:
             for k, rl in loss_output.reconstruction_loss.items():
@@ -357,72 +347,56 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                     batch_size=loss_output.n_obs_minibatch,
                     prog_bar=True,
                 )
-        
-        # no classification loss (yet)
-        if loss_output.classification_loss is None:
-            return
-        # log how many classes of the whole embedding the model has seen so far
-        if mode == 'train':
-            self.log_with_mode(
-                'n_unseen_classes',
-                self.n_unseen_classes,
-                mode='train',
-                on_step=True,
-                on_epoch=False,
-                batch_size=loss_output.n_obs_minibatch,
+        # Add classification-based metrics if they exist
+        if loss_output.classification_loss is not None:
+            # log how many classes of the whole embedding the model has seen so far
+            if mode == 'train':
+                self.log_with_mode(
+                    'n_unseen_classes',
+                    self.n_unseen_classes,
+                    mode='train',
+                    on_step=True,
+                    on_epoch=False,
+                    batch_size=loss_output.n_obs_minibatch,
+                    sync_dist=self.use_sync_dist,
+                )
+            classification_loss = loss_output.classification_loss
+            true_labels = loss_output.true_labels.squeeze(-1)
+            logits = loss_output.logits
+            predicted_labels = torch.argmax(logits, dim=-1)
+            # Assign unknown to classes that are outside of the training classes
+            predicted_labels = predicted_labels.masked_fill((predicted_labels >= self.n_classes), self.n_classes)
+
+            accuracy = tmf.classification.multiclass_accuracy(
+                predicted_labels,
+                true_labels,
+                self.n_classes+1,
+                average=self.average
             )
-        classification_loss = loss_output.classification_loss
-        true_labels = loss_output.true_labels.squeeze(-1)
-        logits = loss_output.logits
-        predicted_labels = torch.argmax(logits, dim=-1)
-        # Assign unknown to classes that are outside of the training classes
-        predicted_labels = predicted_labels.masked_fill((predicted_labels >= self.n_classes), self.n_classes)
-
-        accuracy = tmf.classification.multiclass_accuracy(
-            predicted_labels,
-            true_labels,
-            self.n_classes+1,
-            average=self.average
-        )
-        f1 = tmf.classification.multiclass_f1_score(
-            predicted_labels,
-            true_labels,
-            self.n_classes+1,
-            average=self.average,
-        )
-
-        self.log_with_mode(
-            METRIC_KEYS.CLASSIFICATION_LOSS_KEY,
-            classification_loss,
-            mode,
-            on_step=False,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-        )
-        self.log_with_mode(
-            METRIC_KEYS.ACCURACY_KEY,
-            accuracy,
-            mode,
-            on_step=False,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-        )
-        self.log_with_mode(
-            METRIC_KEYS.F1_SCORE_KEY,
-            f1,
-            mode,
-            on_step=False,
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-        )
+            f1 = tmf.classification.multiclass_f1_score(
+                predicted_labels,
+                true_labels,
+                self.n_classes+1,
+                average=self.average,
+            )
+        else:
+            # Set metrics to defaults
+            classification_loss, accuracy, f1 = np.inf, 0.0, 0.0
+        
+        # Add metrics to extra metrics for internal logging
+        loss_output.extra_metrics[METRIC_KEYS.CLASSIFICATION_LOSS_KEY] = classification_loss
+        loss_output.extra_metrics[METRIC_KEYS.ACCURACY_KEY] = accuracy
+        loss_output.extra_metrics[METRIC_KEYS.F1_SCORE_KEY] = f1
+        # Compute and log all metrics
+        super().compute_and_log_metrics(loss_output, metrics, mode)
 
     def _get_batch_class_embedding(self, batch_idx: int | None = None, **kwargs) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if self.cls_emb is None:
             return None, None
         # Use full embedding
+        cls_emb = self.cls_emb
+        cls_sim = self.cls_sim
         if self.use_full_cls_emb:
-            cls_emb = self.cls_emb
-            cls_sim = self.cls_sim
             # Randomly subsample embeddings outside of training classes if there are more available
             if self.incl_n_unseen is not None and self.incl_n_unseen > 0 and self.n_all_classes > self.n_classes:
                 # Seen class indices
@@ -449,7 +423,20 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             return cls_emb, cls_sim
         # Or use fixed part of embedding
         else:
-            return self.train_cls_emb, self.train_cls_sim
+            cls_emb = self.train_cls_emb
+            cls_sim = self.train_cls_sim
+        # Add learnable control embedding if given and re-calculate class similarities
+        if self.module.ctrl_class_idx is not None:
+            # Clone to avoid modifying the buffer in-place
+            cls_emb = cls_emb.clone()
+            # Ensure control_emb is on same device and normalized
+            control_emb = F.normalize(self.module.control_emb, dim=-1).to(cls_emb.device)
+            # Replace single control embedding with learnable embedding
+            cls_emb[self.module.ctrl_class_idx] = control_emb.squeeze(0)
+            # Normalize entire embedding matrix for cosine-similarity
+            cls_emb = F.normalize(cls_emb, dim=-1)
+            cls_sim = cls_emb @ cls_emb.T
+        return cls_emb, cls_sim
 
     def _calc_cls_sim(self, cls_emb: torch.Tensor | None) -> torch.Tensor | None:
         if cls_emb is None:

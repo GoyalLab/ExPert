@@ -15,6 +15,7 @@ class _ConfKeys(NamedTuple):
     PLAN: str = 'plan'
     TRAIN: str = 'train'
     MODEL: str = 'model'
+    MODEL_SETUP: str = 'model_setup'
 
 class _NestedConfKeys(NamedTuple):
     SCHEDULES_KEY: str = 'anneal_schedules'

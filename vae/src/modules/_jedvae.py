@@ -1,6 +1,6 @@
 from typing import Iterable
 
-from src.modules._base import EmbeddingClassifier, Encoder, DecoderSCVI
+from src.modules._base import Classifier, EmbeddingClassifier, Encoder, DecoderSCVI
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 from src.utils.distributions import rescale_targets
 from src.utils.common import pearson, BatchCache
@@ -52,6 +52,7 @@ class JEDVAE(VAE):
         n_layers: int = 2,
         dropout_rate_encoder: float = 0.2,
         dropout_rate_decoder: float | None = None,
+        use_embedding_classifier: bool = True,
         class_embed_dim: int = 128,
         n_continuous_cov: int = 0,
         n_cats_per_cov: Iterable[int] | None = None,
@@ -72,7 +73,8 @@ class JEDVAE(VAE):
         l_mask: str | list[str] | None = None,
         focal_gamma: float = 1.0,
         init_t: float = 0.07,
-        classification_loss_strategy: Literal['cross_entropy', 'similarity', 'kl', 'focal', 'symmetric_contrastive'] | list[str] = 'kl',
+        classification_loss_strategy: Literal['similarity', 'kl', 'focal', 'symmetric_contrastive'] | list[str] = 'kl',
+        ctrl_class_idx: int | None = None,
         kl_class_temperature: float = 0.1,
         contrastive_temperature: float = 0.1,
         reduction: Literal['mean', 'sum'] = 'sum',
@@ -117,6 +119,7 @@ class JEDVAE(VAE):
         # Classifier parameters
         self.classifier_parameters = classifier_parameters
         self.linear_classifier = linear_classifier
+        self.use_embedding_classifier = use_embedding_classifier
         self.class_weights = cls_weights
         self.class_embed_dim = class_embed_dim
         self._update_cls_params()
@@ -130,6 +133,13 @@ class JEDVAE(VAE):
         self.non_elbo_reduction = non_elbo_reduction
         # Initialize learnable temperature scaling for logits
         self.logit_scale = torch.nn.Parameter(torch.log(torch.tensor(1.0 / init_t)))
+        # Setup learnable control embedding
+        self.ctrl_class_idx = ctrl_class_idx
+        if self.ctrl_class_idx is not None:
+            # Learnable control embedding
+            self.control_emb = torch.nn.Parameter(torch.randn(1, self.class_embed_dim) * 0.02)
+        else:
+            self.control_emb = None 
 
         # Setup normalizations for en- and decoder
         use_batch_norm_encoder = use_batch_norm == 'encoder' or use_batch_norm == 'both'
@@ -140,7 +150,7 @@ class JEDVAE(VAE):
         # Check config
         self.cls_strategies = self.classification_loss_strategy if isinstance(self.classification_loss_strategy, list) else [self.classification_loss_strategy]
         for cls_strategy in self.cls_strategies:
-            if cls_strategy not in ['cross_entropy', 'similarity', 'kl', 'focal', 'symmetric_contrastive']:
+            if cls_strategy not in ['similarity', 'kl', 'focal', 'symmetric_contrastive']:
                 raise ValueError(f'Got invalid argument for `classification_loss_strategy` {cls_strategy}')
 
         # Setup encoder input dimensions
@@ -181,7 +191,8 @@ class JEDVAE(VAE):
         )
 
         # Initialize embedding classifier
-        self.classifier = EmbeddingClassifier(
+        classifier_cls = EmbeddingClassifier if use_embedding_classifier else Classifier
+        self.classifier = classifier_cls(
             n_latent,
             n_labels=n_labels,
             class_embed_dim=class_embed_dim,
@@ -569,8 +580,6 @@ class JEDVAE(VAE):
         # Choose reduction method based on cls_scores
         o_red = reduction
         reduction = reduction if cls_scores is None else None
-        # Get model temperature
-        T = 1.0 / self.logit_scale.clamp(0, 4.6).exp()
         # Collect classification losses
         ce_loss = torch.tensor(0.0)
         for cls_strategy in self.cls_strategies:
@@ -628,7 +637,7 @@ class JEDVAE(VAE):
         cat_covs = labelled_dataset[cat_key] if cat_key in labelled_dataset.keys() else None
 
         # Classify
-        logits, cz, ez = self.classify(
+        cls_output = self.classify(
             x, 
             batch_index=batch_idx, 
             g=g,
@@ -637,7 +646,12 @@ class JEDVAE(VAE):
             use_posterior_mean=use_posterior_mean,
             class_embeds=cls_emb
         )  # (n_obs, n_labels)
-        
+        if self.use_embedding_classifier:
+            # Unpack embedding projections
+            logits, cz, ez = cls_output
+        else:
+            # Set embeddings to z, TODO: set to None or empty tensors?
+            logits, cz, ez = cls_output, x, x
         # Calculate classification loss from logits and true labels
         ce_loss = self._calc_classification_loss(
             z=cz,
@@ -807,7 +821,6 @@ class JEDVAE(VAE):
         alignment_loss_weight: float | None = None,
         contrastive_loss_weight: float | None = None,
         use_contrastive_cls_sim: bool = False,
-        class_kl_temperature: float = 0.1,
         target_scale: float = 4.0,
         use_posterior_mean: bool = True,
         use_ext_emb: bool = True,
@@ -863,10 +876,13 @@ class JEDVAE(VAE):
         # Create extra metric container
         extra_metrics = {}
 
+        # Get model temperature
+        T = 1.0 / self.logit_scale.clamp(0, 4.6).exp()
+
         # Add contrastive loss if it is specified
         if contrastive_loss_weight is not None and contrastive_loss_weight > 0:
             _cls_sim = cls_sim if use_contrastive_cls_sim else None
-            contr_loss = self._contrastive_loss(z, tensors, temperature=self.contrastive_temperature, reduction=self.non_elbo_reduction, cls_sim=_cls_sim)
+            contr_loss = self._contrastive_loss(z, tensors, temperature=T, reduction=self.non_elbo_reduction, cls_sim=_cls_sim)
             lo_kwargs['loss'] += contr_loss * contrastive_loss_weight
             extra_metrics['contrastive_loss'] = contr_loss
         # Add classification based losses
@@ -879,7 +895,7 @@ class JEDVAE(VAE):
                 use_cls_scores=use_cls_scores,
                 alignment_loss_weight=alignment_loss_weight,
                 reduction=self.non_elbo_reduction,
-                T=class_kl_temperature,
+                T=T,
                 target_scale=target_scale,
                 **kwargs
             )

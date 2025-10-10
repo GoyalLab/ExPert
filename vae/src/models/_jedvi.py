@@ -28,7 +28,7 @@ from anndata import AnnData
 
 # scvi imports
 from scvi.model._utils import get_max_epochs_heuristic
-from scvi.train import TrainRunner
+from scvi.train import TrainRunner, SaveCheckpoint
 from scvi.data._utils import get_anndata_attribute, _check_if_view
 from scvi.utils import setup_anndata_dsp
 from scvi.utils._docstrings import devices_dsp
@@ -77,6 +77,7 @@ class JEDVI(
         dropout_rate_decoder: float | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
+        ctrl_class: str | None = None,
         linear_classifier: bool = False,
         cls_weight_method: str | None = None,
         **model_kwargs,
@@ -84,6 +85,7 @@ class JEDVI(
         super().__init__(adata)
         self._model_kwargs = dict(model_kwargs)
         self.use_gene_emb = self.adata_manager.registry.get('field_registries', {}).get(REGISTRY_KEYS.GENE_EMB_KEY, None) is not None
+        self.ctrl_class = ctrl_class
         # Initialize indices and labels for this VAE
         self._setup()
 
@@ -112,6 +114,7 @@ class JEDVI(
             dropout_rate_encoder=dropout_rate,
             dropout_rate_decoder=dropout_rate_decoder,
             class_embed_dim=self.n_dims_emb,
+            ctrl_class_idx=self.ctrl_class_idx,
             n_continuous_cov=self.summary_stats.get('n_extra_continuous_covs', 0),
             n_cats_per_cov=n_cats_per_cov,
             dispersion=dispersion,
@@ -133,8 +136,10 @@ class JEDVI(
             f"{self.__class__} Model with the following params: \n"
             f"n_classes: {self.n_labels}, "
             f"n_unseen_classes: {self.n_unseen_labels}, "
-            f"use_gene_emb: {self.use_gene_emb} "
+            f"use_gene_emb: {self.use_gene_emb}"
         )
+        if self.ctrl_class_idx is not None:
+            self._model_summary_string += f"\ncontrol_class_idx: {self.ctrl_class_idx}"
 
     def _get_cls_weights(
         self,
@@ -176,7 +181,7 @@ class JEDVI(
         self.n_unseen_labels = None
         self._code_to_label = dict(enumerate(self._label_mapping))
         # order class embedding according to label mapping and transform to matrix
-        if REGISTRY_KEYS.CLS_EMB_KEY in self.adata.uns:
+        if len(self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CLS_EMB_KEY, {})) > 0:
             if REGISTRY_KEYS.CLS_EMB_INIT not in self.adata.uns:
                 cls_emb: pd.DataFrame = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY]
                 if not isinstance(cls_emb, pd.DataFrame):
@@ -186,6 +191,20 @@ class JEDVI(
                     _label_series = pd.Series(self._code_to_label.values())
                     _label_overlap = _label_series.isin(cls_emb.index)
                     _shared_labels = _label_series[_label_overlap].values
+                    # Remove control embedding if given
+                    if self.ctrl_class is not None:
+                        self.ctrl_class_idx = 0
+                        # Create empty embedding for control
+                        if self.ctrl_class not in _shared_labels:
+                            # Create empty embedding
+                            dummy_emb = pd.DataFrame(np.zeros((1, cls_emb.shape[-1])), index=[self.ctrl_class], columns=cls_emb.columns)
+                            cls_emb = pd.concat((dummy_emb, cls_emb), axis=0)
+                        # Set control index to first embedding index
+                        _shared_labels = np.concatenate((np.array([self.ctrl_class]), np.array(_shared_labels[_shared_labels != self.ctrl_class])))
+                        # Reset label overlap
+                        _label_overlap = _label_series.isin(_shared_labels)
+                    else:
+                        self.ctrl_class_idx = None
                     _unseen_labels = cls_emb.index.difference(_shared_labels)
                     self.n_train_labels = _shared_labels.shape[0]
                     self.n_unseen_labels = _unseen_labels.shape[0]
@@ -234,6 +253,7 @@ class JEDVI(
         else:
             logging.info(f'No class embedding found in adata, falling back to internal embeddings with dimension 128. You can change this by specifying `n_dims_emb`.')
             self.n_dims_emb = self._model_kwargs.get('n_dims_emb', 128)
+            self.ctrl_class_idx = None
 
     def get_cls_emb(self, use_full_cls_emb: bool | None = None) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Helper getter to return either training or full class embedding"""
@@ -333,16 +353,18 @@ class JEDVI(
     @classmethod
     def from_base_model(
         cls,
-        scvi_model,
+        pretrained_model,
         labels_key: str | None = None,
         adata: AnnData | None = None,
+        excl_setup_keys: list[str] = ['class_emb_uns_key'],
+        excl_states: list[str] = ['learned_class_embeds'],
         **model_kwargs,
     ):
         """Initialize jedVI model with weights from pretrained :class:`~scvi.model.JEDVI` model.
 
         Parameters
         ----------
-        scvi_model
+        pretrained_model
             Pretrained scvi model
         labels_key
             key in `adata.obs` for label information. Label categories can not be different if
@@ -362,46 +384,52 @@ class JEDVI(
         )
         from scvi.data._utils import _is_minified
 
-        scvi_model._check_if_trained(message="Passed in scvi model hasn't been trained yet.")
+        pretrained_model._check_if_trained(message="Passed in scvi model hasn't been trained yet.")
 
         model_kwargs = dict(model_kwargs)
-        init_params = scvi_model.init_params_
+        init_params = pretrained_model.init_params_
         non_kwargs = init_params["non_kwargs"]
         kwargs = init_params["kwargs"]
         kwargs = {k: v for (i, j) in kwargs.items() for (k, v) in j.items()}
         for k, v in {**non_kwargs, **kwargs}.items():
             if k in model_kwargs.keys():
-                warnings.warn(
-                    f"Ignoring param '{k}' as it was already passed in to pretrained "
-                    f"SCVI model with value {v}.",
-                    UserWarning,
-                    stacklevel=settings.warnings_stacklevel,
-                )
                 del model_kwargs[k]
-
+        # Fall back to pre-training data if no new traiing data is provided
         if adata is None:
-            adata = scvi_model.adata
+            adata = pretrained_model.adata
         else:
             if _is_minified(adata):
                 raise ValueError(f"Please provide a non-minified `adata` to initialize {cls.__name__}.")
             # validate new anndata against old model
-            scvi_model._validate_anndata(adata)
-
-        scvi_setup_args = deepcopy(scvi_model.adata_manager.registry[_SETUP_ARGS_KEY])
-        scvi_labels_key = scvi_setup_args["labels_key"]
-        if labels_key is None and scvi_labels_key is None:
+            pretrained_model._validate_anndata(adata)
+        # Use pretraining adata setup kwargs
+        pretrained_setup_args = deepcopy(pretrained_model.adata_manager.registry[_SETUP_ARGS_KEY])
+        pretrained_labels_key = pretrained_setup_args["labels_key"]
+        # Set labels for classification if not already specified in pre-training
+        if labels_key is None and pretrained_labels_key is None:
             raise ValueError(
                 "A `labels_key` is necessary as the scVI model was initialized without one."
             )
-        if scvi_labels_key is None:
-            scvi_setup_args.update({"labels_key": labels_key})
+        if pretrained_labels_key is None:
+            pretrained_setup_args.update({"labels_key": labels_key})
+        # Exclude adata setup keys from pr-etraining
+        pretrained_setup_args = {k: v for k, v in pretrained_setup_args.items() if k not in excl_setup_keys}
+        # Setup new training adata
         cls.setup_anndata(
             adata,
-            **scvi_setup_args,
+            **pretrained_setup_args,
         )
+        # Create fine-tune model
         model = cls(adata, **non_kwargs, **kwargs, **model_kwargs)
-        scvi_state_dict = scvi_model.module.state_dict()
-        model.module.load_state_dict(scvi_state_dict, strict=False)
+        # Load pre-trained model weights
+        pretrained_state_dict = pretrained_model.module.state_dict()
+        # Remove weights that should be excluded
+        pretrained_states = pd.Series(pretrained_state_dict.keys(), dtype=str)
+        pretrained_state_mask = ~pretrained_states.isin(excl_states)
+        pretrained_state_dict = {k: v for k in pretrained_state_dict.items() if k in pretrained_states[pretrained_state_mask]}
+        # Load pre-trained weights
+        model.module.load_state_dict(pretrained_state_dict, strict=False)
+        # Label model as pre-trained
         model.was_pretrained = True
 
         return model
@@ -565,7 +593,7 @@ class JEDVI(
             cat_key = REGISTRY_KEYS.CAT_COVS_KEY
             cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
             # Run classification process
-            pred, cz, ez = self.module.classify(
+            cls_output = self.module.classify(
                 x,
                 batch_index=batch,
                 g=self.gene_emb,
@@ -573,16 +601,26 @@ class JEDVI(
                 cont_covs=cont_covs,
                 class_embeds=cls_emb
             )
+            # Handle output based on classifier used
+            if self.module.use_embedding_classifier:
+                # Unpack embedding projections
+                pred, cz, ez = cls_output
+                y_cz.append(cz.detach().cpu())
+                y_ez.append(ez.detach().cpu())
+            else:
+                # Set embeddings to z, TODO: set to None or empty tensors?
+                pred = cls_output
             if not soft:
                 pred = pred.argmax(dim=1)
             y_pred.append(pred.detach().cpu())
-            y_cz.append(cz.detach().cpu())
-            y_ez.append(ez.detach().cpu())
         # Concatenate batch results
         y_pred = torch.cat(y_pred).numpy()
-        y_cz = torch.cat(y_cz).numpy()
-        # Calculate mean embedding projections
-        y_ez = torch.stack(y_ez, dim=0).mean(dim=0).numpy()
+        if self.module.use_embedding_classifier:
+            y_cz = torch.cat(y_cz).numpy()
+            # Calculate mean embedding projections
+            y_ez = torch.stack(y_ez, dim=0).mean(dim=0).numpy()
+        else:
+            y_cz, y_ez = None, None
         if not soft:
             predictions = []
             for p in y_pred:
@@ -600,8 +638,10 @@ class JEDVI(
                 columns=self._label_mapping[:n_labels] if self.cls_emb is None else self.idx_to_label[:n_labels],
                 index=adata.obs_names[indices],
             )
-        if return_latent:
+        # Return latent projections if they are available
+        if return_latent and y_cz is not None and y_ez is not None:
             return pred, y_cz, y_ez
+        # Return predictions only
         else:
             return pred
         
@@ -694,21 +734,45 @@ class JEDVI(
             plan_kwargs['use_contr_in_val'] = True
         # Share code to label mapping with training plan
         plan_kwargs['_code_to_label'] = self._code_to_label.copy()
-        # create training plan
+        # Create training plan
         training_plan = self.get_training_plan(**plan_kwargs)
-        check_val_every_n_epoch = train_params.pop('check_val_every_n_epoch', 1)
+        # Check if tensorboard logger is given
+        logger = train_params.get('logger')
+        callbacks = []
+        # Manage checkpoint callback
+        use_checkpoint = train_params.pop('checkpoint', False)
+        checkpoint_monitor = train_params.pop('checkpoint_monitor', 'f1_score_validation')
+        checkpoint_mode = train_params.pop('checkpoint_mode', 'max')
+        checkpoint_dir = None
+        # Create checkpoint for max validation f1-score model
+        if logger is not None and use_checkpoint:
+            # Create checkpoint instance, save only best model
+            checkpoint_dir = f"{logger.log_dir}/checkpoints"
+            checkpoint_callback = SaveCheckpoint(
+                dirpath=checkpoint_dir,  # match logger directory
+                monitor=checkpoint_monitor,
+                mode=checkpoint_mode,
+                save_top_k=1,
+            )
+            logging.info(f'Saving model checkpoints to: {checkpoint_dir}')
+            # Add to list of callbacks
+            callbacks.append(checkpoint_callback)
+        # Add callbacks to Trainer kwargs
+        train_params['callbacks'] = callbacks
      
-        # create training runner
+        # Create training runner
         runner = TrainRunner(
             self,
             training_plan=training_plan,
             data_splitter=data_splitter,
             accelerator='auto',
             devices='auto',
-            check_val_every_n_epoch=check_val_every_n_epoch,
+            enable_checkpointing=use_checkpoint,
+            default_root_dir=checkpoint_dir,
             **train_params
         )
-        if 'logger' in train_params.keys():
+        # Save hyperparameters to model output dir
+        if logger is not None:
             # Don't log the class embedding
             plan_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY, None)
             # save hyper-parameters to lightning logs
@@ -778,13 +842,36 @@ class JEDVI(
             adata.uns = uns
         # Sort .var to same order as observed in model's adata
         return adata[:,self.adata.var_names].copy()
+    
+    @classmethod
+    def load_checkpoint(
+        cls,
+        model_dir: str,
+        adata: AnnData | None,
+        n: int = 0,
+        checkpoint_dirname: str = 'checkpoints',
+        model_name: str = 'model.pt'
+    ):
+        import os
+        import glob
+        # Look for checkpoints
+        checkpoint_dir = os.path.join(model_dir, checkpoint_dirname)
+        if os.path.exists(checkpoint_dir):
+            checkpoint_model_paths = glob.glob(f'{checkpoint_dir}/**/{model_name}')
+            if len(checkpoint_model_paths) > 0:
+                checkpoint_model_p = checkpoint_model_paths[n] if n > 0 and n < len(checkpoint_model_paths) else checkpoint_model_paths[0]
+                logging.info(f'Loading model checkpoint {checkpoint_model_p}.')
+                checkpoint_model_dir = os.path.dirname(checkpoint_model_p)
+                return super().load(checkpoint_model_dir, adata=adata)
+        logging.info('Could not find model checkpoint(s).')    
+        return None
 
     @classmethod
     @setup_anndata_dsp.dedent
     def setup_anndata(
         cls,
         adata: AnnData,
-        labels_key: str,
+        labels_key: str | None = None,
         layer: str | None = None,
         class_emb_uns_key: str | None = 'cls_embedding',
         class_certainty_key: str | None = None,

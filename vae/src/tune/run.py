@@ -20,10 +20,10 @@ import anndata as ad
 from tqdm import tqdm
 
 from src.utils.constants import REGISTRY_KEYS, TRAINING_KEYS, MODULE_KEYS
-from src.utils.io import read_config
+from src.utils.io import read_config, read_adata
 from ._statics import CONF_KEYS, NESTED_CONF_KEYS
 from ..models._jedvi import JEDVI
-from ..plotting import get_model_results, get_classification_report, get_latest_tensor_dir, plot_confusion
+from ..plotting import get_model_results, get_classification_report, get_latest_tensor_dir
 from ..performance import get_library, performance_metric
 
 
@@ -183,10 +183,11 @@ def _train(
     # Setup model
     logging.info('Setting up model.')
     # Setup anndata with model
+    setup_kwargs = {'batch_key': batch_key, 'labels_key': cls_label}
+    setup_kwargs.update(config.get(CONF_KEYS.MODEL_SETUP, {}))
     JEDVI.setup_anndata(
         model_set,
-        batch_key=batch_key,
-        labels_key=cls_label
+        **setup_kwargs
     )
     model = JEDVI(model_set, **config[CONF_KEYS.MODEL].copy())
     if verbose:
@@ -211,31 +212,33 @@ def _train(
     )
     return model, results, latent
 
-def load_test_data(test_adata_p: str, model: nn.Module, incl_unseen: bool = True):
+def load_test_data(test_adata_p: str, model: nn.Module, incl_unseen: bool = True, verbose: bool = True):
     # Read adata from file
-    test_ad = sc.read(test_adata_p)
-    # Convert gene names if needed
-    if test_ad.var_names.str.lower().str.startswith('ens').all():
-        logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
-        test_ad = ens_to_symbol(test_ad).copy()
+    test_ad = read_adata(test_adata_p)
+    # Get training adata
     adata = model.adata
-
+    # Get training and testing labels
     train_perturbations = set(adata.obs.perturbation.unique())
     test_perturbations = set(test_ad.obs.perturbation.unique())
-    embedding_perturbations = set(
-        adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels'].str.replace('[neg;|pos;]', '', regex=True)
-    )
+    if REGISTRY_KEYS.CLS_EMB_INIT in adata.uns:
+        # Set total available embeddings to class embedding keys
+        embedding_perturbations = set(
+            adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels'].str.replace('[neg;|pos;]', '', regex=True)
+        )
+    else:
+        # Fall back to internal training embeddings
+        embedding_perturbations = train_perturbations
 
     shared = test_perturbations.intersection(train_perturbations)
     unseen = test_perturbations.difference(train_perturbations)
     test_embedding = test_perturbations.intersection(embedding_perturbations)
-
-    logging.info(f"Found {len(train_perturbations)} trained class embeddings in model.")
-    logging.info(f"Found {len(embedding_perturbations)} total class embeddings in model.")
-    logging.info(f"Found {len(test_perturbations)} test perturbations.")
-    logging.info(f"Found {len(shared)} shared perturbations between training and testing.")
-    logging.info(f"Found {len(unseen)} unseen perturbations between training and testing.")
-    logging.info(f"Found {len(test_embedding)} perturbations in model's class embedding.")
+    if verbose:
+        logging.info(f"Found {len(train_perturbations)} trained class embeddings in model.")
+        logging.info(f"Found {len(embedding_perturbations)} total class embeddings in model.")
+        logging.info(f"Found {len(test_perturbations)} test perturbation(s).")
+        logging.info(f"Found {len(shared)} shared perturbations between training and testing.")
+        logging.info(f"Found {len(unseen)} unseen perturbations between training and testing.")
+        logging.info(f"Found {len(test_embedding)} perturbations in model's class embedding.")
 
     if incl_unseen:
         test_ad._inplace_subset_obs(test_ad.obs.perturbation.isin(test_embedding))
@@ -297,10 +300,17 @@ def run_model_predictions(model, test_ad, cls_label, batch_key, incl_unseen: boo
 
     # Get latent representation of model
     test_ad.obsm['latent_z'] = model.get_latent_representation(adata=test_ad)
-    predictions, cz, cls_emb_z = model.predict(adata=test_ad, return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
-    # Store in adata
-    test_ad.obsm['latent_cz'] = cz
-    test_ad.uns['cls_emb_z'] = cls_emb_z
+    pred_out = model.predict(adata=test_ad, return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
+    # Check if model has an embedding classifier or not
+    if isinstance(pred_out, tuple):
+        predictions, cz, cls_emb_z = pred_out
+        # Store in adata
+        if cz is not None:
+            test_ad.obsm['latent_cz'] = cz
+        if cls_emb_z is not None:
+            test_ad.uns['cls_emb_z'] = cls_emb_z
+    else:
+        predictions = pred_out
     test_ad.obs['cls_prediction'] = predictions.columns[predictions.values.argmax(axis=-1)]
     test_ad.obs['cls_score'] = predictions.max(axis=1) - predictions.mean(axis=1)
 
@@ -529,28 +539,6 @@ def plot_f1_groups(no_random: pd.DataFrame, plt_dir: str, groupby: str = 'cellty
     plt.savefig(os.path.join(plt_dir, o))
     plt.close()
 
-def ens_to_symbol(adata: ad.AnnData, gene_symbol_keys: list[str] = ['gene_symbol', 'gene_name', 'gene', 'gene symbol', 'gene name']) -> ad.AnnData:
-    # Look for possible gene symbol columns
-    gscl = adata.var.columns.intersection(set(gene_symbol_keys)).values
-    if len(gscl) == 0:
-        raise ValueError(f'Could not find a column that describes gene symbol mappings in adata.var, looked for {gene_symbol_keys}')
-    # Choose first hit if multiple
-    gsh = list(gscl)[0]
-    # Convert index
-    adata.var.reset_index(names='ensembl_id', inplace=True)
-    adata.var.set_index(gsh, inplace=True)
-    # Check for duplicate index conflicts
-    if adata.var_names.nunique() != adata.shape[0]:
-        logging.info(f'Found duplicate indices for ensembl to symbol mapping, highest number of conflicts: {adata.var_names.value_counts().max()}')
-        # Fix conflicts by choosing the gene with the higher harmonic mean of mean expression and normalized variance out of pool
-        if len(set(['means', 'variances_norm']).intersection(adata.var.columns)) == 2:
-            adata.var['hm_var'] = (2 * adata.var.means * adata.var.variances_norm) / (adata.var.means + adata.var.variances_norm)
-        else:
-            adata.var['hm_var'] = np.arange(adata.n_vars)
-        idx = adata.var.reset_index().groupby(gsh, observed=True).hm_var.idxmax().values
-        adata = adata[:,idx]
-    return adata
-
 def update_latent(
         model: nn.Module, 
         test_ad: ad.AnnData, 
@@ -567,7 +555,8 @@ def update_latent(
     plt_dir = os.path.join(output_dir, 'plots')
     latent = sc.read(os.path.join(version_dir, 'latent.h5ad'))
     # Plot combination of latent spaces
-    _, model_cz, cls_emb_z = model.predict(return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
+    pred_out = model.predict(return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
+    # Build index map
     idx_map = (
         latent.obs
         .reset_index(names='idx')
@@ -580,18 +569,35 @@ def update_latent(
     )
     # Add batch label to latent
     latent.obs[orig_group_key] = latent.obs[batch_key].values
-    latent.obsm['cz'] = model_cz[idx_map.model_index]
+    
     # Add test set
     test_ad.obs['mode'] = 'test'
     test_z = test_ad.obsm['latent_z']
     test_z = ad.AnnData(test_z, obs=test_ad.obs)
-    test_z.obsm['cz'] = test_ad.obsm['latent_cz']
+    # Add latent class projection if it exists
+    if 'latent_cz' in test_ad.obsm:
+        test_z.obsm['cz'] = test_ad.obsm['latent_cz']
     test_z.obsm['soft_predictions'] = test_ad.obsm['soft_predictions']
+    # Model has embedding projections
+    use_rep = 'X'
+    field = 'layer'
+    # Add model
+    if isinstance(pred_out, tuple):
+        _, model_cz, _ = pred_out
+        latent.obsm['cz'] = model_cz[idx_map.model_index]
+        latent.uns['cls_emb_z'] = test_ad.uns['cls_emb_z']
+        use_rep = 'cz'
+        field = 'obsm'
     # Combine latent spaces
     latent = ad.concat([latent, test_z], axis=0)
     # TODO: save cz umap as individual .obsm and not overwrite existing latent umap
-    latent.obsm['cz_pca'] = sc.pp.pca(latent.obsm['cz'])
-    latent.uns['cls_emb_z'] = test_ad.uns['cls_emb_z']
+    if field == 'layer':
+        pca_input = latent.X if use_rep == 'X' else latent.layers[use_rep]
+    elif field == 'obsm':
+        pca_input = latent.obsm[use_rep]
+    else:
+        raise ValueError(f'Field in adata has to be "layer" or "obsm", got: {field}')
+    latent.obsm['cz_pca'] = sc.pp.pca(pca_input)
     sc.pp.neighbors(latent, use_rep='cz_pca')
     sc.tl.umap(latent)
     # Write updated latent space to file
@@ -627,6 +633,7 @@ def test(
         plot: bool = False,
         return_results: bool = False
     ):
+    logging.info(f'Testing model with: {test_adata_p}')
     # Load test set
     test_ad = load_test_data(test_adata_p, model, incl_unseen=incl_unseen)
     # Setup test set labels
@@ -655,14 +662,24 @@ def full_run(
         model_dir: str,
         test_p: str,
         test_unseen: bool = False,
+        load_best: bool = True,
+        **kwargs
     ) -> dict:
     # Get config name
     config_name = os.path.basename(config_p).replace('.yaml', '')
     # Train model with loaded config file
-    train_output = train(adata_p=train_p, config_p=config_p, out_dir=model_dir)
+    train_output = train(adata_p=train_p, config_p=config_p, out_dir=model_dir, **kwargs)
+    # Try to load best checkpoint
+    if load_best:
+        model = JEDVI.load_checkpoint(
+            train_output[TRAINING_KEYS.OUTPUT_KEY],
+            adata=train_output[TRAINING_KEYS.MODEL_KEY].adata
+        )
+    else:
+        model = train_output[TRAINING_KEYS.MODEL_KEY]
     # Test model with specified test set
     top_n_predictions, _ = test(
-        model=train_output[TRAINING_KEYS.MODEL_KEY],
+        model=model,
         test_adata_p=test_p,
         output_dir=train_output[TRAINING_KEYS.OUTPUT_KEY],
         incl_unseen=False,
@@ -673,7 +690,7 @@ def full_run(
     # Test model with unseen perturbations
     if test_unseen:
         top_n_predictions_unseen, _ = test(
-            model=train_output[TRAINING_KEYS.MODEL_KEY],
+            model=model,
             test_adata_p=test_p,
             output_dir=train_output[TRAINING_KEYS.OUTPUT_KEY],
             incl_unseen=True,

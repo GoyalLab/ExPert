@@ -1,5 +1,10 @@
+import os
+import glob
 import yaml
 import logging
+import numpy as np
+import scanpy as sc
+import anndata as ad
 
 import torch.nn as nn
 
@@ -45,3 +50,33 @@ def read_config(config_p: str, setup: bool = True) -> dict:
         # Set up nested structure
         setup_config(config=config)
     return config
+
+def ens_to_symbol(adata: ad.AnnData, gene_symbol_keys: list[str] = ['gene_symbol', 'gene_name', 'gene', 'gene symbol', 'gene name']) -> ad.AnnData:
+    # Look for possible gene symbol columns
+    gscl = adata.var.columns.intersection(set(gene_symbol_keys)).values
+    if len(gscl) == 0:
+        raise ValueError(f'Could not find a column that describes gene symbol mappings in adata.var, looked for {gene_symbol_keys}')
+    # Choose first hit if multiple
+    gsh = list(gscl)[0]
+    # Convert index
+    adata.var.reset_index(names='ensembl_id', inplace=True)
+    adata.var.set_index(gsh, inplace=True)
+    # Check for duplicate index conflicts
+    if adata.var_names.nunique() != adata.shape[0]:
+        logging.info(f'Found duplicate indices for ensembl to symbol mapping, highest number of conflicts: {adata.var_names.value_counts().max()}')
+        # Fix conflicts by choosing the gene with the higher harmonic mean of mean expression and normalized variance out of pool
+        if len(set(['means', 'variances_norm']).intersection(adata.var.columns)) == 2:
+            adata.var['hm_var'] = (2 * adata.var.means * adata.var.variances_norm) / (adata.var.means + adata.var.variances_norm)
+        else:
+            adata.var['hm_var'] = np.arange(adata.n_vars)
+        idx = adata.var.reset_index().groupby(gsh, observed=True).hm_var.idxmax().values
+        adata = adata[:,idx]
+    return adata
+
+def read_adata(adata_p: str, check_gene_names: bool = True) -> ad.AnnData:
+    adata = sc.read(adata_p)
+    # Convert gene names if needed
+    if check_gene_names and adata.var_names.str.lower().str.startswith('ens').all():
+        logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
+        adata = ens_to_symbol(adata).copy()
+    return adata
