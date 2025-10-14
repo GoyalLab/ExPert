@@ -47,8 +47,13 @@ def get_classification_report(
     return summary, report_data
 
 
-def get_library(library="KEGG_2019_Human", organism="Human"):
-    return gp.get_library(name=library, organism=organism)
+def get_library(library="KEGG_2019_Human", organism="Human") -> dict | None:
+    # Load gene pathway library
+    try:
+        return gp.get_library(name=library, organism=organism)
+    except Exception as e:
+        print(f"Error loading library '{library}' for organism '{organism}': {e}")
+        return None
 
 def build_gene2pathways(genes, library_obj=None):
     """Return dict: GENE -> set({pathways}) using a library from gseapy."""

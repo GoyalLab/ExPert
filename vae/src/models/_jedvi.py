@@ -114,6 +114,7 @@ class JEDVI(
             dropout_rate_encoder=dropout_rate,
             dropout_rate_decoder=dropout_rate_decoder,
             class_embed_dim=self.n_dims_emb,
+            use_embedding_classifier=self.use_embedding_classifier,
             ctrl_class_idx=self.ctrl_class_idx,
             n_continuous_cov=self.summary_stats.get('n_extra_continuous_covs', 0),
             n_cats_per_cov=n_cats_per_cov,
@@ -180,9 +181,24 @@ class JEDVI(
         self._label_mapping = labels_state_registry.categorical_mapping
         self.n_unseen_labels = None
         self._code_to_label = dict(enumerate(self._label_mapping))
-        # order class embedding according to label mapping and transform to matrix
+        # Check if adata has a class embedding registered
         if len(self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CLS_EMB_KEY, {})) > 0:
-            if REGISTRY_KEYS.CLS_EMB_INIT not in self.adata.uns:
+            # Check if adata has already been registered with this model class
+            if REGISTRY_KEYS.CLS_EMB_INIT in self.adata.uns and self.__class__ == self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['model']:
+                logging.info(f'Adata has already been initialized with {self.__class__}, loading model settings from adata.')
+                # Set to embeddings found in adata
+                self.cls_emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY]
+                self.cls_sim = self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY]
+                # Init train embeddings from adata
+                n_train = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_train_labels']
+                self.train_cls_emb = self.cls_emb[:n_train,:]
+                self.train_cls_sim = self.cls_sim[:n_train,:n_train]
+                # Set indices
+                self.idx_to_label = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels']
+                # Set control class index
+                self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['ctrl_class_idx']
+            else:
+                # Register adata's class embedding with this model
                 cls_emb: pd.DataFrame = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY]
                 if not isinstance(cls_emb, pd.DataFrame):
                     logging.warning(f'Class embedding has to be a dataframe with labels as index, got {cls_emb.__class__}. Falling back to internal embedding.')
@@ -236,24 +252,18 @@ class JEDVI(
                         'labels': cls_emb.index,
                         'n_train_labels': self.n_train_labels, 
                         'n_unseen_labels': self.n_unseen_labels,
+                        'ctrl_class_idx': self.ctrl_class_idx
                     }
-            else:
-                logging.info(f'Class embedding has already been initialized with {self.__class__} for this adata.')
-                # Set to embeddings found in adata
-                self.cls_emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY]
-                self.cls_sim = self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY]
-                # Init train embeddings from adata
-                n_train = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_train_labels']
-                self.train_cls_emb = self.cls_emb[:n_train,:]
-                self.train_cls_sim = self.cls_sim[:n_train,:n_train]
-                # Set indices
-                self.idx_to_label = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels']
             # Set embedding dimension
             self.n_dims_emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
+            # Use class embedding classifier
+            self.use_embedding_classifier = True
         else:
             logging.info(f'No class embedding found in adata, falling back to internal embeddings with dimension 128. You can change this by specifying `n_dims_emb`.')
             self.n_dims_emb = self._model_kwargs.get('n_dims_emb', 128)
             self.ctrl_class_idx = None
+            # Use base classifier
+            self.use_embedding_classifier = False
 
     def get_cls_emb(self, use_full_cls_emb: bool | None = None) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Helper getter to return either training or full class embedding"""
@@ -850,7 +860,8 @@ class JEDVI(
         adata: AnnData | None,
         n: int = 0,
         checkpoint_dirname: str = 'checkpoints',
-        model_name: str = 'model.pt'
+        model_name: str = 'model.pt',
+        default_dirname: str = 'model'
     ):
         import os
         import glob
@@ -863,8 +874,9 @@ class JEDVI(
                 logging.info(f'Loading model checkpoint {checkpoint_model_p}.')
                 checkpoint_model_dir = os.path.dirname(checkpoint_model_p)
                 return super().load(checkpoint_model_dir, adata=adata)
-        logging.info('Could not find model checkpoint(s).')    
-        return None
+        logging.info(f'Could not find model checkpoint(s). Using default "{default_dirname}" directory.')    
+        model_state_dir = os.path.join(model_dir, default_dirname)
+        return super().load(model_state_dir, adata=adata)
 
     @classmethod
     @setup_anndata_dsp.dedent

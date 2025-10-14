@@ -1142,6 +1142,7 @@ class DecoderSCVI(nn.Module):
         px_r = self.px_r_decoder(px) if dispersion == "gene-cell" else None
         return px_scale, px_r, px_rate, px_dropout
 
+
 class EmbeddingClassifier(nn.Module):
     """Classifier where latent attends to class embeddings, optionally externally provided,
     using dot product or cosine similarity. Compatible with external CE loss logic.
@@ -1155,16 +1156,16 @@ class EmbeddingClassifier(nn.Module):
         n_layers: int = 1,
         dropout_rate: float = 0.1,
         logits: bool = True,
-        use_batch_norm: bool = True,
-        use_layer_norm: bool = False,
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = True,
         activation_fn: nn.Module = nn.LeakyReLU,
         class_embed_dim: int = 128,
         shared_projection_dim: int | None = None,
         skip_projection: bool = False,
         use_cosine_similarity: bool = True,
-        temperature: float = 1,
+        temperature: float = 1.0,
         return_latents: bool = True,
-        mode: Literal['latent_to_class', 'class_to_latent', 'shared'] = 'latent_to_class',
+        mode: Literal["latent_to_class", "class_to_latent", "shared"] = "latent_to_class",
         **kwargs,
     ):
         super().__init__()
@@ -1177,95 +1178,85 @@ class EmbeddingClassifier(nn.Module):
         self.return_latents = return_latents
         self.mode = mode
 
-        # -------- Projections depending on mode -------- #
-        # Latent -> Class embedding space
-        if mode == 'latent_to_class':
-            # No class projection necessary
+        # ---- Helper for building projections ---- #
+        def build_projection(n_in: int, n_out: int) -> nn.Module:
+            """Creates a projection block based on n_hidden/n_layers settings."""
+            if skip_projection and n_in == n_out:
+                return nn.Identity()
+            # Add funnel layer projections
+            if n_hidden > 0 and n_layers > 0:
+                return FunnelFCLayers(
+                    n_in=n_in,
+                    n_out=n_out,
+                    n_layers=n_layers,
+                    dropout_rate=dropout_rate,
+                    use_batch_norm=use_batch_norm,
+                    use_layer_norm=use_layer_norm,
+                    activation_fn=activation_fn,
+                    **kwargs,
+                )
+            # Project with a single linear layer
+            else:
+                layers = [nn.Linear(n_in, n_out)]
+                if use_layer_norm:
+                    layers.append(nn.LayerNorm(n_out))
+                if dropout_rate > 0:
+                    layers.append(nn.Dropout(dropout_rate))
+                return nn.Sequential(*layers)
+
+        # Latent --> Class embedding space projection
+        if mode == "latent_to_class":
+            self.latent_projection = build_projection(n_input, class_embed_dim)
             self.class_projection = nn.Identity()
-            if n_input == class_embed_dim and skip_projection:
-                self.latent_projection = nn.Identity()
-            else:
-                # Initialize layers
-                if n_hidden > 0 and n_layers > 0:
-                    self.latent_projection = FunnelFCLayers(
-                        n_in=n_input,
-                        n_out=class_embed_dim,
-                        n_layers=n_layers,
-                        dropout_rate=dropout_rate,
-                        use_batch_norm=use_batch_norm,
-                        use_layer_norm=use_layer_norm,
-                        activation_fn=activation_fn,
-                        **kwargs,
-                    )
-                else:
-                    # Set encoder to a single linear layer
-                    self.latent_projection = nn.Linear(n_input, class_embed_dim)
-        
-        # Class embedding -> Latent space
-        elif mode == 'class_to_latent':
-            # No latent projection needed
+        # Class embedding space --> latent space projection
+        elif mode == "class_to_latent":
             self.latent_projection = nn.Identity()
-            if n_input == class_embed_dim and skip_projection:
-                self.class_projection = nn.Identity()
-            else:
-                self.class_projection = nn.Linear(class_embed_dim, n_input)
-        
-        # Both -> shared space
-        elif mode == 'shared':
+            self.class_projection = build_projection(class_embed_dim, n_input)
+        # Latent --> shared dim <-- Class embedding space
+        elif mode == "shared":
             if shared_projection_dim is None:
                 shared_projection_dim = min(n_input, class_embed_dim)
-            self.latent_projection = nn.Linear(n_input, shared_projection_dim)
-            self.class_projection = nn.Linear(class_embed_dim, shared_projection_dim)
-
+            self.latent_projection = build_projection(n_input, shared_projection_dim)
+            self.class_projection = build_projection(class_embed_dim, shared_projection_dim)
         else:
-            raise ValueError(f'Unknown mode: {mode}')
+            raise ValueError(f"Unknown mode: {mode}")
 
-        # Add dropout
+        # ---- Dropout ---- #
         self.dropout = nn.Dropout(p=dropout_rate)
 
-        # Init learnable class embeddings (used if external not provided)
+        # ---- Learnable class embeddings ---- #
         self.learned_class_embeds = nn.Parameter(torch.randn(n_labels, class_embed_dim))
 
     def forward(self, x: torch.Tensor, class_embeds: torch.Tensor | None = None):
         """
         Parameters
         ----------
-        x : Tensor
-            Input latent features, shape (batch, l)
-        class_embeds : Optional[Tensor]
-            External class embeddings, shape (n_labels, d)
+        x : Tensor, shape (batch, latent_dim)
+        class_embeds : Optional[Tensor], shape (n_labels, embed_dim)
         """
-        
-        # Get class embeddings for step
-        if class_embeds is None:
-            class_embeds = self.learned_class_embeds
-        else:
-            class_embeds = class_embeds.to(x.device)
-        # Latent -> Class projection
-        z = self.latent_projection(x)  # (batch, d) | (batch, l)
-        # Class -> Latent projection
-        c = self.class_projection(class_embeds)     # (n_labels, l) | (n_labels, d)
-        # Randomly dropout some elements in the projection
+        # Get class embeddings
+        class_embeds = (
+            self.learned_class_embeds if class_embeds is None else class_embeds.to(x.device)
+        )
+
+        # Apply projections
+        z = self.latent_projection(x)               # (batch, d)
+        c = self.class_projection(class_embeds)     # (n_labels, d)
         if self.dropout_rate > 0:
             z = self.dropout(z)
-        # Calculate classification logits
+
+        # Compute logits
         if self.use_cosine_similarity:
-            z_norm = F.normalize(z, dim=-1)            # (batch, d | l)
-            c_norm = F.normalize(c, dim=-1)            # (n_labels, d | l)
-            logits = torch.matmul(z_norm, c_norm.T) / self.temperature    # (batch, n_labels)
-            _z = z_norm
-            _c = c_norm
+            z_norm = F.normalize(z, dim=-1)
+            c_norm = F.normalize(c, dim=-1)
+            logits = torch.matmul(z_norm, c_norm.T) / self.temperature
+            _z, _c = z_norm, c_norm
         else:
-            z = z.unsqueeze(1)  # (batch, 1, d)
-            class_seq = class_embeds.unsqueeze(0).expand(z.size(0), -1, -1)  # (batch, n_labels, d)
-            logits = torch.bmm(z, class_seq.transpose(1, 2)).squeeze(1)      # (batch, n_labels)
-            _z = z
-            _c = c
-        l = logits if self.logits else F.softmax(logits, dim=-1)
-        if self.return_latents:
-            return l, _z, _c
-        else:
-            return l
+            logits = torch.matmul(z, c.T) / self.temperature
+            _z, _c = z, c
+
+        output = logits if self.logits else F.softmax(logits, dim=-1)
+        return (output, _z, _c) if self.return_latents else output
 
 
 class Classifier(nn.Module):

@@ -41,7 +41,7 @@ def _compute_weight(
     n_epochs_warmup: int | None,
     n_steps_warmup: int | None,
     n_epochs_stall: int | None = None,
-    max_weight: float | None = 1.0,
+    max_weight: float | None = 0.0,
     min_weight: float | None = 0.0,
     schedule: Literal["linear", "sigmoid", "exponential"] = "sigmoid",
     anneal_k: float = 10.0,
@@ -317,6 +317,19 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
         # Add scheduling params if given
         kwargs = self.anneal_schedules.get('class_kl_temperature', {})
+        sched_kwargs.update(kwargs)
+        klw = _compute_weight(**sched_kwargs)
+        return (
+            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
+        )
+    
+    @property
+    def adversarial_context_lambda(self):
+        """Lambda for adversial context loss during training. Consider Jax"""
+        # Init basic args
+        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        # Add scheduling params if given
+        kwargs = self.anneal_schedules.get('adversarial_context_lambda', {})
         sched_kwargs.update(kwargs)
         klw = _compute_weight(**sched_kwargs)
         return (

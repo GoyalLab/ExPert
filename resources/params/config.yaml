@@ -16,20 +16,22 @@ cls:
   dropout_rate: 0.1                                 # Classifier dropout rate
   use_cosine_similarity: true                       # Use cosine similarity to class embeddings for logits calculation (recommended)
   temperature: 1                                    # Temperature scaling of logits (1)
+  mode: "latent_to_class"                           # Sets mode for how to combine latent and class embedding: ['latent_to_class', 'class_to_latent', 'shared']
+  shared_projection_dim: null                         # Set shared dimension for mode=='shared'
   skip_projection: false                            # Allows model to skip projection to class embedding and use z directly (if dimensions match)
 
 # Encoder parameters
 encoder:
   encoder_type: "transformer"                       # ["transformer", "funnel", "fc"]
-  linear_encoder: true                              # Use linear layers while encoding
-  n_layers: 0                                       # Number of layers to use in encoder
+  linear_encoder: false                              # Use linear layers while encoding
+  n_layers: 1                                       # Number of layers to use in encoder
   # Attention params
-  use_attention: true                               # Whether to use attention in encoder
+  use_attention: false                               # Whether to use attention in encoder
   n_head: 8                                         # Number of attention heads (aim for 16-64 d_h, ideally 32)
-  n_attn_layers: 4                                  # Number of attention layers in encoder
+  n_attn_layers: 2                                  # Number of attention layers in encoder
   ff_mult: 4                                        # Latent expansion factor (transformer only)
   activation_fn: "nn.LeakyReLU"                     # Activation function
-  noise_std: 0.000001                                   # Noisy encoder option
+  noise_std: 0.0                                    # Noisy encoder option
 
 # Decoder parameters
 decoder:
@@ -40,12 +42,24 @@ decoder:
 
 # Weight schedules
 schedules:
+  rl_weight:                                        # Reconstruction loss weight schedule
+    schedule: "sigmoid"
+    anneal_k: 10
+    n_epochs_stall: 0
+    min_weight: 1
+    max_weight: 1
   classification_ratio:                             # Classification loss weight schedule
     schedule: "sigmoid"
     anneal_k: 10
     n_epochs_stall: 0
     min_weight: 1
     max_weight: 1
+  class_kl_temperature:
+    schedule: "sigmoid"
+    anneal_k: 10
+    n_epochs_stall: 0
+    max_weight: 0.1
+    min_weight: 0.1
   contrastive_loss_weight:                          # Contrastive loss weight schedule
     schedule: "sigmoid"
     anneal_k: 10
@@ -56,46 +70,51 @@ schedules:
     schedule: "sigmoid"
     anneal_k: 10
     n_epochs_stall: 0
-    min_weight: 1
-    max_weight: 1
-  class_kl_temperature:                             # KL classification temperature range: [0.01-1]
+    min_weight: 0
+    max_weight: 0
+  adversarial_context_lambda:                       # Adversial context loss to disentangle context from latent
     schedule: "sigmoid"
     anneal_k: 10
     n_epochs_stall: 0
-    min_weight: 0.1
-    max_weight: 0.1
+    min_weight: 0
+    max_weight: 1
 
 # Training plan
 plan:
   lr: 0.0005                                        # Learning rate (LR)
   lr_patience: 30                                   # LR patience
   weight_decay: 0.00001                             # Weight decay
-  use_full_cls_emb: false                           # Use full class embedding during training or subset to observed classes
-  n_epochs_warmup: 300                              # Warmup period for schedules
+  use_full_cls_emb: true                            # Use full class embedding during training or subset to observed classes
+  n_epochs_warmup: 500                              # Warmup period for schedules
   min_kl_weight: 0                                  # KL weight schedule
   max_kl_weight: 1
-  target_scale: 3.0                                 # Classification KL logit rescaler value , 1==one-hot, >1==class modules
+  target_scale: 2.0                                 # Classification KL logit rescaler value , 1==one-hot, >1==class modules
+  observed_only: false                              # Calculate KL-classification loss only on classes in batch
   use_posterior_mean: "val"                         # Use full z or mean for classifier ["train", "val", "both"]
   use_contr_in_val: false                           # Use contrastive loss in validations set
-  lr_scheduler_metric: "validation_loss"            # LR metric
+  lr_scheduler_metric: "classification_loss_validation"            # LR metric
   # Tensorboard logging options
   log_class_distribution: false                     # Log class label distribution in batch
-  full_val_log_every_n_epoch: 10                    # Log full validation metrics, slows down training a bit if low
+  full_val_log_every_n_epoch: 10                     # Log full validation metrics, slows down training a bit if low
   plot_umap: null                                   # Plot umap of latent space ["train", "val", "both", null]
 
 # Train parameters
 train:
-  max_epochs: 300                                   # Max training epochs
+  max_epochs: 500                                   # Max training epochs
   early_stopping: false                             # Early stopping
-  early_stopping_monitor: "validation_loss"         # Early stopping metrics
-  early_stopping_patience: 30
+  early_stopping_monitor: "f1_score_validation"     # Early stopping metric
+  early_stopping_mode: "max"
+  early_stopping_patience: 60
+  checkpoint: true                                  # Create model checkpoints
+  checkpoint_monitor: "f1_score_validation"
+  checkpoint_mode: "max"
   check_val_every_n_epoch: 1
 
 # Model parameters
 model:
   n_latent: 128                                     # Latent space dimension (z)
   n_hidden: -1                                      # Start dimension, -1==full gene space, other==1st encoder layer projection
-  dropout_rate: 0.3                                 # Overall dropout rate
+  dropout_rate: 0.2                                 # Overall dropout rate
   dispersion: "gene"
   use_batch_norm: "none"
   use_layer_norm: "both"
@@ -103,11 +122,20 @@ model:
   linear_classifier: true                           # Overwrites classifier parameters
   log_variational: true
   l1_lambda: 0.0                                    # Should be 0 when using attention
-  l2_lambda: 0.001                                   # Should always be > 0, help prevent overfitting
-  l_mask: ["attn", "Attention", "class_projection"] # Use l1 / l2 regularization on these layers
-  classification_loss_strategy: "kl"                # Enable KL-based class embedding classification
+  l2_lambda: 0.001                                  # Should always be > 0, helps prevent overfitting
+  l_mask: ["attn"]                                  # Use l1 / l2 regularization on these layers (word has to be contained in layer name)
+  classification_loss_strategy: ["kl"]                # Set classification loss strategy (or multiple)
+  use_learnable_temperature: false                  # Learn own temperature scaling
+  ctrl_class: null                             # Specify control class, will include a learnable embedding for that class
   contrastive_temperature: 0.1                      # Contrastive logit temperature scaling, lower --> sharper distinction
   reduction: "sum"                                  # ELBO-loss reduction method (i.e. reconstruction & KL)
   non_elbo_reduction: "sum"                         # Non-ELBO-loss reduction method (i.e. classification, contrastive)
   use_feature_mask: false                           # Randomly dropout input features
   drop_prob: 0.001                                  # Feature dropout rate
+
+# Model setup parameters
+model_setup:
+  batch_key: "dataset"                              # Context key to normalize for in .obs
+  labels_key: "cls_label"                           # Label columns in .obs
+  class_emb_uns_key: "cls_embedding"                           # .uns key for class embedding
+  gene_emb_varm_key: null                           # .varm key for gene embeddings

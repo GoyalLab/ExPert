@@ -673,7 +673,7 @@ def full_run(
     if load_best:
         model = JEDVI.load_checkpoint(
             train_output[TRAINING_KEYS.OUTPUT_KEY],
-            adata=train_output[TRAINING_KEYS.MODEL_KEY].adata
+            adata=sc.read(train_p)
         )
     else:
         model = train_output[TRAINING_KEYS.MODEL_KEY]

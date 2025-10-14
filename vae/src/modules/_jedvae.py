@@ -3,7 +3,7 @@ from typing import Iterable
 from src.modules._base import Classifier, EmbeddingClassifier, Encoder, DecoderSCVI
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 from src.utils.distributions import rescale_targets
-from src.utils.common import pearson, BatchCache
+from src.utils.common import pearson, BatchCache, GradientReversalFn
 
 from typing import Iterable
 
@@ -32,7 +32,7 @@ class JEDVAE(VAE):
     
     def _update_cls_params(self):
         cls_parameters = {
-            'n_layers': 0 if self.linear_classifier else self.classifier_parameters.get('n_layers', 10),
+            'n_layers': 0 if self.linear_classifier else self.classifier_parameters.get('n_layers', 1),
             'n_hidden': 0 if self.linear_classifier else self.classifier_parameters.get('n_hidden', 128),
             'dropout_rate': self.classifier_parameters.get('dropout_rate', 0.1),
             'logits': True,         # Logits are required for this model
@@ -65,17 +65,21 @@ class JEDVAE(VAE):
         latent_distribution: Literal['normal', 'ln'] = 'normal',
         encode_covariates: bool = False,
         deeply_inject_covariates: bool = True,
-        use_batch_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'both',
-        use_layer_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'none',
+        use_batch_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'none',
+        use_layer_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'both',
         var_activation: Callable[[torch.Tensor], torch.Tensor] | None = None,
         l1_lambda: float | None = 1e-5,
         l2_lambda: float | None = 1e-3,
         l_mask: str | list[str] | None = None,
         focal_gamma: float = 1.0,
-        init_t: float = 0.07,
+        init_t: float = 0.1,
         classification_loss_strategy: Literal['similarity', 'kl', 'focal', 'symmetric_contrastive'] | list[str] = 'kl',
         ctrl_class_idx: int | None = None,
         kl_class_temperature: float = 0.1,
+        use_learnable_temperature: bool = False,
+        use_adversial_context_cls: bool = True,
+        context_classifier_layers: int = 2,
+        context_classifier_n_hidden: int = 256,
         contrastive_temperature: float = 0.1,
         reduction: Literal['mean', 'sum'] = 'sum',
         non_elbo_reduction: Literal['mean', 'sum'] = 'sum',
@@ -133,6 +137,9 @@ class JEDVAE(VAE):
         self.non_elbo_reduction = non_elbo_reduction
         # Initialize learnable temperature scaling for logits
         self.logit_scale = torch.nn.Parameter(torch.log(torch.tensor(1.0 / init_t)))
+        self.use_learnable_temperature = use_learnable_temperature
+        # Setup an adversion context classifier
+        self.use_adversial_context_cls = use_adversial_context_cls
         # Setup learnable control embedding
         self.ctrl_class_idx = ctrl_class_idx
         if self.ctrl_class_idx is not None:
@@ -185,7 +192,7 @@ class JEDVAE(VAE):
             n_hidden=n_hidden,
             use_batch_norm=use_batch_norm_decoder, 
             use_layer_norm=use_layer_norm_decoder,
-            scale_activation="softmax",
+            scale_activation='softmax',
             inject_covariates=deeply_inject_covariates,
             **_extra_decoder_kwargs,
         )
@@ -200,6 +207,17 @@ class JEDVAE(VAE):
             use_layer_norm=use_layer_norm_encoder,
             **self.cls_parameters,
         )
+
+        # Initialize an adversial context (batch/cell type or line) classifier
+        if self.use_adversial_context_cls:
+            self.context_classifier = Classifier(
+                n_input=n_latent,
+                n_hidden=context_classifier_n_hidden,
+                n_labels=n_batch,
+                n_layers=context_classifier_layers,
+                dropout_rate=0.1,
+                logits=True,
+            )
 
         # Debug
         self.use_cache = False
@@ -243,7 +261,7 @@ class JEDVAE(VAE):
             categorical_input = torch.split(cat_covs, 1, dim=1)
         else:
             categorical_input = ()
-        if self.batch_representation == "embedding" and self.encode_covariates:
+        if self.batch_representation == 'embedding' and self.encode_covariates:
             batch_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index)
             encoder_input = torch.cat([encoder_input, batch_rep], dim=-1)
             qz, z = self.z_encoder(encoder_input, *categorical_input, g=g)
@@ -252,7 +270,7 @@ class JEDVAE(VAE):
 
         ql = None
         if not self.use_observed_lib_size:
-            if self.batch_representation == "embedding":
+            if self.batch_representation == 'embedding':
                 ql, library_encoded = self.l_encoder(encoder_input, *categorical_input)
             else:
                 ql, library_encoded = self.l_encoder(
@@ -410,6 +428,35 @@ class JEDVAE(VAE):
         cls_sim_corr = 1.0 - pearson(logits, target_sim, dim=-1)
         cls_sim_corr = cls_sim_corr.sum() if reduction == 'sum' else cls_sim_corr.mean()
         return alpha * direct_align_score + beta * cls_sim_corr
+    
+    def adversarial_context_loss(
+            self,
+            z: torch.Tensor,
+            context_labels: torch.Tensor,
+            lambda_adv: float = 1.0,
+            reduction: str = 'mean',
+        ) -> torch.Tensor:
+        """
+        Adversarial context loss: encourage encoder to remove context information.
+        The gradient is reversed before passing through the context classifier.
+        """
+        if not getattr(self, 'context_classifier', False):
+            return torch.tensor(1e-5, device=z.device)
+
+        # Reverse gradient before classification
+        z_rev = GradientReversalFn.apply(z, lambda_adv)
+
+        # Predict context
+        context_logits = self.context_classifier(z_rev)
+
+        # Set labels
+        if len(context_labels.shape) > 1:
+            # Reshape labels to 1d array
+            context_labels = context_labels.reshape(-1)
+
+        # Normal cross-entropy loss for the context head
+        loss = F.cross_entropy(context_logits, context_labels, reduction=reduction)
+        return loss
         
     def cosine_alignment_loss(
             self, 
@@ -820,8 +867,10 @@ class JEDVAE(VAE):
         classification_ratio: float | None = None,
         alignment_loss_weight: float | None = None,
         contrastive_loss_weight: float | None = None,
-        use_contrastive_cls_sim: bool = False,
+        use_contrastive_cls_sim: bool = True,
+        class_kl_temperature: float = 0.1,
         target_scale: float = 4.0,
+        adversarial_context_lambda: float = 0.1,
         use_posterior_mean: bool = True,
         use_ext_emb: bool = True,
         use_cls_scores: bool = True,
@@ -832,6 +881,7 @@ class JEDVAE(VAE):
 
         # X inference and generative
         x: torch.Tensor = tensors[REGISTRY_KEYS.X_KEY]
+        b: torch.Tensor = tensors[REGISTRY_KEYS.BATCH_KEY]
         z: torch.Tensor = inference_outputs[MODULE_KEYS.Z_KEY]
         px: Distribution = generative_outputs[MODULE_KEYS.PX_KEY]
         qz: Distribution = inference_outputs[MODULE_KEYS.QZ_KEY]
@@ -877,12 +927,15 @@ class JEDVAE(VAE):
         extra_metrics = {}
 
         # Get model temperature
-        T = 1.0 / self.logit_scale.clamp(0, 4.6).exp()
+        if self.use_learnable_temperature:
+            T = 1.0 / self.logit_scale.clamp(0, 4.6).exp()
+        else:
+            T = class_kl_temperature
 
         # Add contrastive loss if it is specified
         if contrastive_loss_weight is not None and contrastive_loss_weight > 0:
             _cls_sim = cls_sim if use_contrastive_cls_sim else None
-            contr_loss = self._contrastive_loss(z, tensors, temperature=T, reduction=self.non_elbo_reduction, cls_sim=_cls_sim)
+            contr_loss = self._contrastive_loss(z, tensors, temperature=self.contrastive_temperature, reduction=self.non_elbo_reduction, cls_sim=_cls_sim)
             lo_kwargs['loss'] += contr_loss * contrastive_loss_weight
             extra_metrics['contrastive_loss'] = contr_loss
         # Add classification based losses
@@ -921,6 +974,11 @@ class JEDVAE(VAE):
         if self.l2_lambda is not None and self.l2_lambda > 0:
             extra_metrics['L2'] = l2
             lo_kwargs['loss'] += l2 * self.l2_lambda
+        # Add adversional context loss if lambda > 0 (should be last to see z as it inverts the gradient flow)
+        if adversarial_context_lambda > 0 and self.use_adversial_context_cls:
+            _adv_loss = self.adversarial_context_loss(z, context_labels=b, lambda_adv=adversarial_context_lambda, reduction=self.non_elbo_reduction)
+            lo_kwargs['loss'] += _adv_loss
+            extra_metrics['adversial_context_loss'] = _adv_loss
                     
         if len(extra_metrics) > 0:
             # Add extra metrics to loss output
@@ -930,7 +988,7 @@ class JEDVAE(VAE):
     def on_load(self, model: BaseModelClass):
         manager = model.get_anndata_manager(model.adata, required=True)
         source_version = manager._source_registry[_constants._SCVI_VERSION_KEY]
-        version_split = source_version.split(".")
+        version_split = source_version.split('.')
 
         if int(version_split[0]) >= 1 and int(version_split[1]) >= 1:
             return
@@ -940,9 +998,9 @@ class JEDVAE(VAE):
         manager.registry[_constants._SCVI_VERSION_KEY] = source_version
 
         # pre 1.1 logits fix
-        model_kwargs = model.init_params_.get("model_kwargs", {})
-        cls_params = model_kwargs.get("classifier_parameters", {})
-        user_logits = cls_params.get("logits", False)
+        model_kwargs = model.init_params_.get('model_kwargs', {})
+        cls_params = model_kwargs.get('classifier_parameters', {})
+        user_logits = cls_params.get('logits', False)
 
         if not user_logits:
             self.classifier.logits = False
