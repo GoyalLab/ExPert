@@ -751,7 +751,7 @@ def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.M
         config=config,
         **kwargs
     )
-    # Get latest lightning directory
+    # Get latest lightning directory TODO: replace this by looking up the version via tensorboard logger object
     version_dir = get_latest_tensor_dir(step_model_dir)
     return {
         TRAINING_KEYS.MODEL_KEY: model,
