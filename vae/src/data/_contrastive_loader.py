@@ -6,15 +6,11 @@ import numpy as np
 from torch.utils.data import (
     BatchSampler,
     DataLoader,
-    RandomSampler,
     Sampler,
-    SequentialSampler,
 )
 
 from scvi import REGISTRY_KEYS, settings
 from scvi.data import AnnDataManager
-from scvi.data._utils import get_anndata_attribute
-from scvi.dataloaders._samplers import BatchDistributedSampler
 
 from src.data._contrastive_sampler import DistributedContrastiveBatchSampler, RandomContrastiveBatchSampler
 
@@ -77,13 +73,14 @@ class ContrastiveAnnDataLoader(DataLoader):
     def __init__(
         self,
         adata_manager: AnnDataManager,
-        batches: list[int] | list[bool],
-        labels: list[int] | list[bool],
+        batches: list[str] | list[bool],
+        labels: list[str] | list[bool],
         indices: list[int] | list[bool] | None = None,
         batch_size: int = 512,
         max_cells_per_batch: int = 32,
         max_classes_per_batch: int = 16,
         shuffle: bool = False,
+        ctrl_class: str | None = None,
         sampler: Sampler | None = None,
         drop_last: bool = False,
         drop_dataset_tail: bool = False,
@@ -136,9 +133,12 @@ class ContrastiveAnnDataLoader(DataLoader):
                     batch_size=batch_size,
                     max_cells_per_batch=max_cells_per_batch,
                     max_classes_per_batch=max_classes_per_batch,
+                    ctrl_class=ctrl_class,
                     shuffle=shuffle,
                     drop_last=drop_last,
                 )
+                # Control cells are added as another batch
+                batch_size = int(batch_size*2) if ctrl_class is not None else batch_size
                 sampler = BatchSampler(
                     sampler=sampler_cls,
                     batch_size=batch_size,

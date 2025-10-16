@@ -47,21 +47,26 @@ def _compute_weight(
     anneal_k: float = 10.0,
     invert: bool = False
 ) -> float:
+    # Set undefined weights to
     if min_weight is None:
         min_weight = 0.0
     if max_weight is None:
         max_weight = 0.0
+    # Auto-invert if min > max
     if min_weight > max_weight:
-        raise ValueError(f"min_weight={min_weight} is larger than max_weight={max_weight}.")
+        min_weight, max_weight = max_weight, min_weight
+        invert = not invert
 
     # Apply stall
     if n_epochs_stall is not None and epoch < n_epochs_stall:
         return max_weight if invert else 0.0
+    # Reset epochs if stalling is enabled
     if n_epochs_stall:
         epoch -= n_epochs_stall
         n_epochs_warmup -= n_epochs_stall
+    # Calculate slope for function
     slope = max_weight - min_weight
-
+    # Calculate time points
     if n_epochs_warmup is not None:
         t = epoch
         T = n_epochs_warmup
@@ -70,9 +75,9 @@ def _compute_weight(
         T = n_steps_warmup
     else:
         return 0.0 if invert else max_weight
-
+    # Set start point
     t = min(t, T)
-
+    # Select schedule
     if schedule == "linear":
         w = t / T
     elif schedule == "sigmoid":
@@ -83,7 +88,11 @@ def _compute_weight(
         raise ValueError(f"Invalid schedule type: '{schedule}'")
     # Get final weight
     weight = min_weight + slope * w
-    return max_weight - weight if invert else weight
+    # Invert function if needed
+    if invert:
+        return max_weight - weight + min_weight
+    else:
+        return weight
 
 
 class ContrastiveSupervisedTrainingPlan(TrainingPlan):
@@ -154,7 +163,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         anneal_schedules: dict[str, dict[str | float]] | None = None,
         full_val_log_every_n_epoch: int = 10,
         use_contr_in_val: bool = False,
-        multistage_kl_min: float = 0.1,
+        multistage_kl_frac: float = 0.1,
         **loss_kwargs,
     ):
         super().__init__(
@@ -176,7 +185,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.anneal_schedules = anneal_schedules
         self.n_epochs_warmup = n_epochs_warmup
         self.n_steps_warmup = n_steps_warmup
-        self.multistage_kl_min = multistage_kl_min
+        self.multistage_kl_frac = multistage_kl_frac
         self.kl_reset_epochs = self._get_stall_epochs()
         # CLS params
         self.n_classes = n_classes
@@ -210,7 +219,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.train_class_counts = []
         self.class_batch_counts = defaultdict(list)
         self.observed_classes = set()
-        self.n_unseen_classes = 0
         # Cache
         self.cache = {}
 
@@ -256,7 +264,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             min_weight = self.min_kl_weight
         # New loss
         else:
-            min_weight = self.multistage_kl_min
+            min_weight = self.max_kl_weight * self.multistage_kl_frac if self.multistage_kl_frac > 0 else self.min_kl_weight
         # Set KL weight to restart at multistage min (0.1) for every new loss that gets activated
         klw = _compute_weight(
             self.current_epoch,
@@ -362,17 +370,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 )
         # Add classification-based metrics if they exist
         if loss_output.classification_loss is not None:
-            # log how many classes of the whole embedding the model has seen so far
-            if mode == 'train':
-                self.log_with_mode(
-                    'n_unseen_classes',
-                    self.n_unseen_classes,
-                    mode='train',
-                    on_step=True,
-                    on_epoch=False,
-                    batch_size=loss_output.n_obs_minibatch,
-                    sync_dist=self.use_sync_dist,
-                )
             classification_loss = loss_output.classification_loss
             true_labels = loss_output.true_labels.squeeze(-1)
             logits = loss_output.logits
@@ -473,6 +470,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == mode or self.use_posterior_mean == "both"})
         self.loss_kwargs.update({"class_kl_temperature": self.class_kl_temperature})
+        self.loss_kwargs.update({"adversarial_context_lambda": self.adversarial_context_lambda})
         # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
@@ -512,6 +510,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.log(
             "classification_ratio",
             self.loss_kwargs['classification_ratio'],
+            on_epoch=True,
+            batch_size=loss_output.n_obs_minibatch,
+            prog_bar=False,
+        )
+        self.log(
+            "class_kl_temperature",
+            self.loss_kwargs['class_kl_temperature'],
             on_epoch=True,
             batch_size=loss_output.n_obs_minibatch,
             prog_bar=False,

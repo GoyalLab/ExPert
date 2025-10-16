@@ -171,6 +171,7 @@ def plot_soft_predictions(model: nn.Module, data: ad.AnnData, soft_predictions: 
     n_labels = model.adata.obs._scvi_labels.nunique()
     y = data.obs._scvi_labels.values
     labels = data.obs.cls_label.values
+    n_labels = y.max()
     max_idx = np.argsort(soft_predictions, axis=1)
     # Look at top N predictions (can be useful for pathways etc.)
     top_n_predictions = []

@@ -78,11 +78,14 @@ class JEDVAE(VAE):
         kl_class_temperature: float = 0.1,
         use_learnable_temperature: bool = False,
         use_adversial_context_cls: bool = True,
+        use_reconstruction_control: bool = False,                           # Use control cells for reconstruction loss
+        use_classification_control: bool = False,                           # Try to classify control cells
+        use_contrastive_control: bool = True,                               # Use control cells as negatives in contrastive loss
         context_classifier_layers: int = 2,
         context_classifier_n_hidden: int = 256,
         contrastive_temperature: float = 0.1,
-        reduction: Literal['mean', 'sum'] = 'sum',
-        non_elbo_reduction: Literal['mean', 'sum'] = 'sum',
+        reduction: Literal['mean', 'sum', 'batchmean'] = 'mean',
+        non_elbo_reduction: Literal['mean', 'sum', 'batchmean'] = 'mean',
         use_feature_mask: bool = False,
         drop_prob: float = 1e-3,
         extra_encoder_kwargs: dict | None = None,
@@ -129,11 +132,15 @@ class JEDVAE(VAE):
         self._update_cls_params()
         self.focal_gamma = focal_gamma
         self.classification_loss_strategy = classification_loss_strategy
-        self.reduction = reduction
         self.kl_class_temperature = kl_class_temperature
+        # Contrastive parameters
         self.contrastive_temperature = contrastive_temperature
-        if non_elbo_reduction not in ['sum', 'mean']:
-            raise ValueError(f'Invalid reduction for extra loss metrics: {non_elbo_reduction}, choose either "sum", or "mean".')
+        # Set reduction metrics
+        if reduction not in ['batchmean', 'mean']:
+            raise ValueError(f'Invalid reduction for elbo loss metrics: {reduction}, choose either "batchmean", or "mean".')
+        if non_elbo_reduction not in ['batchmean', 'mean', 'sum']:
+            raise ValueError(f'Invalid reduction for extra loss metrics: {non_elbo_reduction}, choose either "batchmean", or "mean".')
+        self.reduction = reduction
         self.non_elbo_reduction = non_elbo_reduction
         # Initialize learnable temperature scaling for logits
         self.logit_scale = torch.nn.Parameter(torch.log(torch.tensor(1.0 / init_t)))
@@ -141,6 +148,10 @@ class JEDVAE(VAE):
         # Setup an adversion context classifier
         self.use_adversial_context_cls = use_adversial_context_cls
         # Setup learnable control embedding
+        self.use_reconstruction_control = use_reconstruction_control
+        self.use_classification_control = use_classification_control
+        self.use_contrastive_control = use_contrastive_control
+        # Set control class index
         self.ctrl_class_idx = ctrl_class_idx
         if self.ctrl_class_idx is not None:
             # Learnable control embedding
@@ -162,14 +173,15 @@ class JEDVAE(VAE):
 
         # Setup encoder input dimensions
         n_input_encoder = n_input + n_continuous_cov * encode_covariates
+        # Setup categorical co-variates
         cat_list = [n_batch] + list([] if n_cats_per_cov is None else n_cats_per_cov)
         self.cat_list = cat_list
         encoder_cat_list = cat_list if encode_covariates else None
-        
+        # Setup extra en- and decoder params
         _extra_encoder_kwargs = extra_encoder_kwargs or {}
         _extra_decoder_kwargs = extra_decoder_kwargs or {}
 
-        # Re-Init encoder for X (rna-seq)
+        # Re-Init z encoder
         self.z_encoder = Encoder(
             n_input=n_input_encoder, 
             n_output=n_latent, 
@@ -185,6 +197,7 @@ class JEDVAE(VAE):
             return_dist=True,
         )
 
+        # Setup decoder
         self.decoder = DecoderSCVI(
             n_input=n_latent,
             n_output=n_input,
@@ -252,6 +265,7 @@ class JEDVAE(VAE):
             library = torch.log(x.sum(1)).unsqueeze(1)
         if self.log_variational:
             x_ = torch.log1p(x_)
+        # TODO: add min-max scaling
 
         if cont_covs is not None and self.encode_covariates:
             encoder_input = torch.cat((x_, cont_covs), dim=-1)
@@ -305,6 +319,7 @@ class JEDVAE(VAE):
         cat_covs: torch.Tensor | None = None,
         use_posterior_mean: bool = True,
         class_embeds: torch.Tensor | None = None,
+        inference_outputs: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass through the encoder and classifier.
 
@@ -330,7 +345,8 @@ class JEDVAE(VAE):
         Before v1.1, this method by default returned probabilities per label,
         see #2301 for more details.
         """
-        inference_outputs = self.inference(x, batch_index, g, cont_covs, cat_covs)
+        if inference_outputs is None:
+            inference_outputs = self.inference(x, batch_index, g, cont_covs, cat_covs)
         qz = inference_outputs[MODULE_KEYS.QZ_KEY]
         z = inference_outputs[MODULE_KEYS.Z_KEY]
         z = qz.loc if use_posterior_mean else z
@@ -342,7 +358,7 @@ class JEDVAE(VAE):
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
-        reduction: str | None = 'sum',
+        reduction: str | None = 'mean',
         penalize_cls_uncertaintly: bool = True,
         soft: bool = False,
     ) -> torch.Tensor:
@@ -355,12 +371,12 @@ class JEDVAE(VAE):
         # + overall similarity of cell to classes (classification uncertainty)
         if penalize_cls_uncertaintly:
             cs_scores += logits[~cls_mask].mean(dim=-1)
-        if reduction is not None:
-            cs_loss = cs_scores.mean() if reduction == 'mean' else cs_scores.sum()
-        if not soft:
-            return cs_loss
-        else:
+        if reduction is None or reduction == 'none':
             return cs_scores
+        elif reduction == 'mean':
+            return cs_scores.mean(-1)
+        else:
+            return cs_scores.sum(-1)
 
     def focal_loss(
         self, 
@@ -368,27 +384,24 @@ class JEDVAE(VAE):
         targets: torch.Tensor, 
         alpha: torch.Tensor | None = None, 
         gamma: float = 2.0, 
-        reduction: str | None = 'sum',
+        reduction: str = 'mean',
     ) -> torch.Tensor:
         """
         logits: Tensor of shape (batch_size, num_classes)
         targets: Tensor of shape (batch_size,) with class indices
         alpha: Optional weighting tensor of shape (num_classes,)
         gamma: Focusing parameter
-        reduction: 'mean', 'sum', or 'none'
+        reduction: 'mean', 'sum', 'batchmean'
         """
         ce_loss = F.cross_entropy(logits, targets, weight=alpha, reduction='none')  # per-sample loss
         pt = torch.exp(-ce_loss)  # pt = softmax prob of correct class
         focal_loss = ((1 - pt) ** gamma) * ce_loss
-        # Use class scores if available
-        if reduction is None:
+        if reduction is None or reduction == 'none':
             return focal_loss
-        if reduction == 'mean':
-            return focal_loss.mean()
-        elif reduction == 'sum':
-            return focal_loss.sum()
+        elif reduction == 'mean':
+            return focal_loss.mean(-1)
         else:
-            return focal_loss
+            return focal_loss.sum(-1)
 
     def geom_alignment_loss(
             self, 
@@ -425,8 +438,17 @@ class JEDVAE(VAE):
         # Compare similarities from targets to other classes
         target_sim = cls_sim[y]
         # Calculate pearson correlation
-        cls_sim_corr = 1.0 - pearson(logits, target_sim, dim=-1)
-        cls_sim_corr = cls_sim_corr.sum() if reduction == 'sum' else cls_sim_corr.mean()
+        _cls_sim_corr = 1.0 - pearson(logits, target_sim, dim=-1)
+        if reduction is None:
+            cls_sim_corr = _cls_sim_corr
+        if reduction == 'mean':
+            cls_sim_corr = _cls_sim_corr.mean()
+        elif reduction == 'sum':
+            cls_sim_corr = _cls_sim_corr.sum()
+        elif reduction == 'batchmean':
+            cls_sim_corr = _cls_sim_corr.sum(-1).mean()
+        else:
+            raise ValueError(f'Unknown reduction: {reduction}')
         return alpha * direct_align_score + beta * cls_sim_corr
     
     def adversarial_context_loss(
@@ -489,7 +511,7 @@ class JEDVAE(VAE):
         elif reduction == 'sum':
             return cos_diff.sum()
         else:
-            raise ValueError(f"Reduction has to be either 'sum', or 'mean'")
+            raise ValueError(f'Invalid reduction: {reduction}')
 
     def _cosine_classification_loss(
         self,
@@ -521,7 +543,7 @@ class JEDVAE(VAE):
         y: torch.Tensor,
         cls_emb: torch.Tensor,
         T: float = 0.1,
-        reduction: str | None = 'mean',
+        reduction: str = 'mean',
         **kwargs
     ) -> torch.Tensor:
         """
@@ -555,37 +577,26 @@ class JEDVAE(VAE):
         # Symmetric loss per sample
         loss_per_sample = 0.5 * (loss_z2c + loss_c2z)
 
-        # Apply reduction
-        if reduction == 'mean':
-            loss = loss_per_sample.mean()
-        elif reduction == 'sum':
-            loss = loss_per_sample.sum()
-        elif reduction == 'batchmean':
-            loss = loss_per_sample.sum() / z.size(0)
-        elif reduction in (None, 'none'):
-            loss = loss_per_sample
+        if reduction is None or reduction == 'none':
+            return loss_per_sample
+        elif reduction == 'mean':
+            return loss_per_sample.mean(-1)
         else:
-            raise ValueError(f'Invalid reduction: {reduction}')
-        return loss
+            return loss_per_sample.sum(-1)
         
     def _kl_classification_loss(
         self,
         logits: torch.Tensor,
         y: torch.Tensor,
         class_sim: torch.Tensor,
-        reduction: str | None = 'mean',
         target_scale: float = 2.0,
         teacher_T: float = 0.1,
         student_T: float = 0.1,
-        scale_by_temp: bool = False,
+        scale_by_temp: bool = True,
         observed_only: bool = False,
+        reduction: str = 'batchmean',
         **kwargs
     ) -> torch.Tensor:
-        # Adjust reduction
-        if reduction is None:
-            reduction = 'none'
-        elif reduction == 'mean':
-            reduction = 'batchmean'
         # Select soft targets for each label
         cls_sim_weight = class_sim / class_sim.max()
         soft_targets = cls_sim_weight[y]
@@ -599,14 +610,22 @@ class JEDVAE(VAE):
             soft_targets = rescale_targets(soft_targets, scale=target_scale)
         # Apply softmax with temperature scaling to highlight top peaks
         soft_targets = F.softmax(soft_targets / teacher_T, dim=-1)
+        soft_targets = soft_targets / (soft_targets.sum(dim=-1, keepdim=True) + 1e-12)
         # Student logits with same temperature scaling
         sm_logits = F.log_softmax(logits / student_T, dim=-1)
         # KL divergence
-        kl_loss = F.kl_div(sm_logits, soft_targets, reduction=reduction)
+        kl_loss = F.kl_div(sm_logits, soft_targets, reduction='none')
         # Scale by T^2 (distillation correction)
         if scale_by_temp:
             kl_loss = kl_loss / student_T**2
-        return kl_loss
+        # KL-loss is defined as a sum over probabilites
+        if reduction is None or reduction == 'none':
+            return kl_loss
+        # Sum over classes, if batchmean the mean is taken afterwards
+        elif reduction == 'sum' or reduction == 'batchmean':
+            return kl_loss.sum(-1)
+        else:
+            return kl_loss.mean(-1)
     
     def _calc_classification_loss(
         self,
@@ -616,56 +635,62 @@ class JEDVAE(VAE):
         reduction: str = 'mean',
         cls_emb: torch.Tensor | None = None,
         cls_sim: torch.Tensor | None = None,
-        cls_scores: torch.Tensor | None = None,
         T: float = 0.1,
         target_scale: float = 4.0,
+        ctrl_mask: torch.Tensor | None = None,
         **kwargs
     ) -> torch.Tensor:
         # Get class weights
         cw = self.class_weights.to(device=y.device) if self.class_weights is not None else None
         y = y.view(-1).long()
-        # Choose reduction method based on cls_scores
-        o_red = reduction
-        reduction = reduction if cls_scores is None else None
         # Collect classification losses
         ce_loss = torch.tensor(0.0)
+        # These functions all return losses for each cell (b,1)
         for cls_strategy in self.cls_strategies:
             # Determine which loss to use
             if cls_strategy == 'focal':
-                _ce_loss = self.focal_loss(logits, y, alpha=cw, gamma=self.focal_gamma, reduction=reduction)
+                _ce_loss = self.focal_loss(logits, y, alpha=cw, gamma=self.focal_gamma)
             elif cls_strategy == 'similarity':
-                _ce_loss = self._class_similarity_loss(logits, y, reduction=reduction)
+                _ce_loss = self._class_similarity_loss(logits, y)
             elif cls_strategy == 'kl' and cls_emb is not None:
-                _ce_loss = self._kl_classification_loss(logits, y, class_sim=cls_sim, reduction=reduction, student_T=T, target_scale=target_scale, **kwargs)
+                _ce_loss = self._kl_classification_loss(logits, y, class_sim=cls_sim, student_T=T, target_scale=target_scale, **kwargs)
             elif cls_strategy == 'symmetric_contrastive':
-                _ce_loss = self._sym_contrastive_classification_loss(z=z, logits=logits, y=y, cls_emb=cls_emb, T=T, reduction=reduction, **kwargs)
+                _ce_loss = self._sym_contrastive_classification_loss(z=z, logits=logits, y=y, cls_emb=cls_emb, T=T, **kwargs)
             else:
                 raise ValueError(f'Invalid classification strategy {cls_strategy}')
             # Combine losses
             ce_loss = ce_loss + _ce_loss
-        # Scale by class scores if provided
-        if cls_scores is not None:
-            if o_red == 'sum':
-                return (cls_scores * ce_loss).sum()
-            elif o_red == 'mean':
-                return (cls_scores * ce_loss).sum() / (cls_scores.sum() + 1e-8)
-            else:
-                return cls_scores * ce_loss
-        else:
+        # Take mean over classification losses if multiple are provided
+        if len(self.cls_strategies) > 1:
+            ce_loss = ce_loss / len(self.cls_strategies)
+        # Ignore control classification if needed
+        if not self.use_classification_control and ctrl_mask is not None:
+            ce_loss[ctrl_mask] = 0.0
+        # Apply reduction over the batch to produce a single value
+        if reduction == 'mean' or reduction == 'batchmean':
+            return ce_loss.mean()
+        elif reduction == 'sum':
+            return ce_loss.sum()
+        # Return the entire batch loss if needed
+        elif reduction in (None, 'none'):
             return ce_loss
+        else:
+            raise ValueError(f'Invalid reduction: {reduction}')
 
     @auto_move_data
     def classification_loss(
         self, 
         labelled_dataset: dict[str, torch.Tensor], 
+        inference_outputs: dict[str, torch.Tensor] | None = None,
         use_posterior_mean: bool = True,
         cls_emb: torch.Tensor | None = None,
         cls_sim: torch.Tensor | None = None,
         use_cls_scores: bool = True,
         alignment_loss_weight: float | None = None,
-        reduction: str = 'batchmean',
+        reduction: str = 'mean',
         T: float = 0.1,
         target_scale: float = 4.0,
+        ctrl_mask: torch.Tensor | None = None,
         **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         x = labelled_dataset[REGISTRY_KEYS.X_KEY]  # (n_obs, n_vars)
@@ -691,7 +716,8 @@ class JEDVAE(VAE):
             cat_covs=cat_covs, 
             cont_covs=cont_covs, 
             use_posterior_mean=use_posterior_mean,
-            class_embeds=cls_emb
+            class_embeds=cls_emb,
+            inference_outputs=inference_outputs
         )  # (n_obs, n_labels)
         if self.use_embedding_classifier:
             # Unpack embedding projections
@@ -699,6 +725,9 @@ class JEDVAE(VAE):
         else:
             # Set embeddings to z, TODO: set to None or empty tensors?
             logits, cz, ez = cls_output, x, x
+        # Set control logits to 0 for downstream classifications
+        if not self.use_classification_control:
+            logits[:,self.ctrl_class_idx] = 1e-12
         # Calculate classification loss from logits and true labels
         ce_loss = self._calc_classification_loss(
             z=cz,
@@ -710,6 +739,7 @@ class JEDVAE(VAE):
             cls_scores=cls_scores, 
             T=T,
             target_scale=target_scale,
+            ctrl_mask=ctrl_mask,
             **kwargs
         )
         # Calculate alignment between zx and class projection if external embedding is given
@@ -738,7 +768,6 @@ class JEDVAE(VAE):
                 l1_norm += torch.sum(torch.abs(param))
                 l2_norm += torch.sum(param ** 2)
         return l1_norm, l2_norm
-        
 
     def _contrastive_loss_custom(
             self,
@@ -789,6 +818,7 @@ class JEDVAE(VAE):
             scale_by_temperature: bool = False,
             eps: float = 1e-12,
             cls_sim: torch.Tensor | None = None,
+            ctrl_mask: torch.Tensor | None = None,
         ) -> torch.Tensor:
         """
         Calculate contrastive loss as defined by Khosla et al., 2020.
@@ -809,7 +839,7 @@ class JEDVAE(VAE):
                 A scaling factor for the cosine similarity logits. Default is 0.1.
             reduction (str, optional): 
                 Specifies the reduction to apply to the output. 
-                Options are 'sum' or 'mean'. Default is 'sum'.
+                Options are 'sum' or 'mean'. Default is 'mean' since its not probability-based.
             scale_by_temperature (bool, optional):
                 According to original paper, the gradient of this loss inversely scales with temperature, so this should counteract that.
 
@@ -831,16 +861,19 @@ class JEDVAE(VAE):
         pos_mask = (y == y.T).float()  # 1 if same class, 0 otherwise
         self_mask = torch.eye(pos_mask.size(0), device=pos_mask.device)  # mask out i == j (diagonal)
         pos_mask = pos_mask * (1 - self_mask)  # now only i ≠ j positives are kept
+        if ctrl_mask is not None:
+            # Step 4b: Remove control cells from positive relationships
+            # (they can't be positive anchors or positive partners)
+            pos_mask[ctrl_mask, :] = 0.0  # control anchors --> no positives
+            pos_mask[:, ctrl_mask] = 0.0  # no one can treat controls as positives
         # Step 5: Construct mask for denominator A(i): all indices ≠ i (exclude self)
         logits_mask = 1 - self_mask  # mask with 0s on diagonal, 1s elsewhere
         # Step 6: Weight negatives by class embedding distances if provided
         if cls_sim is not None:
             weights = cls_sim[y.squeeze()][:, y.squeeze()]  # (n, n)
             weights = weights / (weights.max() + eps)  # normalize to [0,1]
-        else:
-            weights = torch.ones_like(logits)
-        # Apply weights to exp logits
-        exp_logits = (exp_logits * weights)
+            # Apply weights to exp logits
+            exp_logits = (exp_logits * weights)
         # Step 7: Compute softmax denominator: ∑_{a ∈ A(i)} exp(z_i • z_a / τ)
         denom = (exp_logits * logits_mask).sum(dim=1, keepdim=True)  # shape (n_obs, 1)
         # Step 8: Compute log-softmax for each pair: log( exp(z_i • z_p / τ) / denom )
@@ -851,11 +884,22 @@ class JEDVAE(VAE):
         mean_log_prob_pos = (log_probs * pos_mask).sum(dim=1) / (pos_mask.sum(dim=1) + eps)
         # Step 10: Compute final loss: negative mean log-probability
         loss = -mean_log_prob_pos  # shape (n_obs,)
-        # Step 11: Optional gradient rescaling — counteracts ∂L/∂z ∝ 1/τ
+        if ctrl_mask is not None:
+            # Step 11: Zero out loss for control anchors (no positive term)
+            loss = loss.masked_fill(ctrl_mask, 0.0)
+        # Step 12: Optional gradient rescaling — counteracts ∂L/∂z ∝ 1/τ
         if scale_by_temperature:
             loss *= temperature
-        # Step 12: Reduce across batch
-        return loss.sum() if reduction == 'sum' else loss.mean()
+        # Step 13: Reduce across batch
+        # Apply reduction
+        if reduction == 'mean':
+            return loss.mean()
+        elif reduction == 'sum':
+            return loss.sum()
+        elif reduction == 'batchmean':
+            return loss.sum(-1).mean()
+        else:
+            raise ValueError(f'Invalid reduction: {reduction}')
         
     def loss(
         self,
@@ -882,6 +926,7 @@ class JEDVAE(VAE):
         # X inference and generative
         x: torch.Tensor = tensors[REGISTRY_KEYS.X_KEY]
         b: torch.Tensor = tensors[REGISTRY_KEYS.BATCH_KEY]
+        l: torch.Tensor = tensors[REGISTRY_KEYS.LABELS_KEY]
         z: torch.Tensor = inference_outputs[MODULE_KEYS.Z_KEY]
         px: Distribution = generative_outputs[MODULE_KEYS.PX_KEY]
         qz: Distribution = inference_outputs[MODULE_KEYS.QZ_KEY]
@@ -899,29 +944,41 @@ class JEDVAE(VAE):
         kl_divergence_z_mat = kl_divergence(qz, pz)
         # Calculate reconstruction loss over batch and all features
         reconst_loss_mat = -px.log_prob(x)
-        # Aggregate elbo losses over latent dimensions / input features
-        if self.reduction == 'sum':
-            kl_divergence_z = kl_divergence_z_mat.sum(-1)
+        # Aggregate elbo losses over latent dimensions / input features, will get batch normalized internally
+        if self.reduction == 'batchmean':
+            kl_divergence_z = kl_divergence_z_mat.sum(-1) # (b,1)
             reconst_loss = reconst_loss_mat.sum(-1)
         elif self.reduction == 'mean':
-            kl_divergence_z = kl_divergence_z_mat.mean(-1)
+            kl_divergence_z = kl_divergence_z_mat.mean(-1) # Tensor (b, 1)
             reconst_loss = reconst_loss_mat.mean(-1)
         else:
-            raise ValueError(f'reduction has to be either "sum" or "mean", got {self.reduction}')
+            raise ValueError(f'reduction has to be either "batchmean" or "mean", got {self.reduction}')
         
-        # weighted reconstruction and KL
+        # Handle control cells for elbo loss
+        if self.ctrl_class_idx is not None and not self.use_reconstruction_control:
+            # Calculate control mask
+            ctrl_mask = (l == self.ctrl_class_idx).reshape(-1)
+            # Disregard elbo for control cells
+            reconst_loss[ctrl_mask] = 0.0
+            kl_divergence_z[ctrl_mask] = 0.0
+        else:
+            ctrl_mask = None
+        
+        # Weighted reconstruction and KL
         weighted_reconst_loss = rl_weight * reconst_loss
         weighted_kl_local = kl_weight * kl_divergence_z
 
         # Save reconstruction losses
         kl_locals = {MODULE_KEYS.KL_Z_KEY: kl_divergence_z}
-        
-        # Collect losses
+        # Batch normalize elbo loss of reconstruction + kl --> batchmean reduction
+        elbo_loss = torch.mean(weighted_reconst_loss + weighted_kl_local)
+        # Setup final loss tensor
+        total_loss = elbo_loss
+        # Collect inital loss and extra parameters
         lo_kwargs = {
-            'loss': torch.mean(weighted_reconst_loss + weighted_kl_local),
             'reconstruction_loss': reconst_loss,
             'kl_local': kl_locals,
-            'true_labels': tensors[REGISTRY_KEYS.LABELS_KEY]
+            'true_labels': l
         }
         # Create extra metric container
         extra_metrics = {}
@@ -935,25 +992,31 @@ class JEDVAE(VAE):
         # Add contrastive loss if it is specified
         if contrastive_loss_weight is not None and contrastive_loss_weight > 0:
             _cls_sim = cls_sim if use_contrastive_cls_sim else None
-            contr_loss = self._contrastive_loss(z, tensors, temperature=self.contrastive_temperature, reduction=self.non_elbo_reduction, cls_sim=_cls_sim)
-            lo_kwargs['loss'] += contr_loss * contrastive_loss_weight
+            contr_loss = self._contrastive_loss(
+                z, 
+                tensors, 
+                temperature=self.contrastive_temperature, 
+                cls_sim=_cls_sim, 
+                ctrl_mask=ctrl_mask
+            )
+            total_loss = total_loss + contr_loss * contrastive_loss_weight
             extra_metrics['contrastive_loss'] = contr_loss
         # Add classification based losses
         if classification_ratio is not None and classification_ratio > 0:
             ce_loss, true_labels, logits, align_loss = self.classification_loss(
                 labelled_dataset=tensors, 
+                inference_outputs=inference_outputs,
                 use_posterior_mean=use_posterior_mean,
                 cls_emb=cls_emb,
                 cls_sim=cls_sim,
                 use_cls_scores=use_cls_scores,
                 alignment_loss_weight=alignment_loss_weight,
-                reduction=self.non_elbo_reduction,
                 T=T,
                 target_scale=target_scale,
                 **kwargs
             )
             # Add z classification loss to overall loss
-            lo_kwargs['loss'] += ce_loss * classification_ratio
+            total_loss = total_loss + ce_loss * classification_ratio
             
             # Add classification loss details
             lo_kwargs.update({
@@ -964,25 +1027,27 @@ class JEDVAE(VAE):
             # Add alignment loss if it has been calculated
             if align_loss is not None:
                 extra_metrics['alignment_loss'] = align_loss
-                lo_kwargs['loss'] += align_loss * alignment_loss_weight
+                total_loss = total_loss + align_loss * alignment_loss_weight
         
         # Add L regularizations (L1 and/or L2)
         l1, l2 = self.l_regularization()
         if self.l1_lambda is not None and self.l1_lambda > 0:
             extra_metrics['L1'] = l1
-            lo_kwargs['loss'] += l1 * self.l1_lambda
+            total_loss = total_loss + l1 * self.l1_lambda
         if self.l2_lambda is not None and self.l2_lambda > 0:
             extra_metrics['L2'] = l2
-            lo_kwargs['loss'] += l2 * self.l2_lambda
+            total_loss = total_loss + l2 * self.l2_lambda
         # Add adversional context loss if lambda > 0 (should be last to see z as it inverts the gradient flow)
         if adversarial_context_lambda > 0 and self.use_adversial_context_cls:
             _adv_loss = self.adversarial_context_loss(z, context_labels=b, lambda_adv=adversarial_context_lambda, reduction=self.non_elbo_reduction)
-            lo_kwargs['loss'] += _adv_loss
+            total_loss = total_loss + _adv_loss
             extra_metrics['adversial_context_loss'] = _adv_loss
                     
         if len(extra_metrics) > 0:
             # Add extra metrics to loss output
             lo_kwargs['extra_metrics'] = extra_metrics
+        # Set total loss
+        lo_kwargs['loss'] = total_loss
         return LossOutput(**lo_kwargs)
 
     def on_load(self, model: BaseModelClass):

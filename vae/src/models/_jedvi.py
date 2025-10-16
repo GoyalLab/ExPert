@@ -86,11 +86,12 @@ class JEDVI(
         self._model_kwargs = dict(model_kwargs)
         self.use_gene_emb = self.adata_manager.registry.get('field_registries', {}).get(REGISTRY_KEYS.GENE_EMB_KEY, None) is not None
         self.ctrl_class = ctrl_class
+        # Set number of classes
+        self.n_labels = self.summary_stats.n_labels
+
         # Initialize indices and labels for this VAE
         self._setup()
-
-        # Set number of classes
-        n_labels = self.summary_stats.n_labels
+        # Get covariates
         n_cats_per_cov = (
             self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
             if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
@@ -107,7 +108,7 @@ class JEDVI(
         self.module = self._module_cls(
             n_input=self.summary_stats.n_vars,
             n_batch=n_batch,
-            n_labels=n_labels,
+            n_labels=self.n_labels,
             n_latent=n_latent,
             n_hidden=n_hidden,
             n_layers=n_layers,
@@ -128,7 +129,6 @@ class JEDVI(
         self.supervised_history_ = None
         self.init_params_ = self._get_init_params(locals())
         self.was_pretrained = False
-        self.n_labels = n_labels
         self.use_full_cls_emb = False
         self.use_ctrl_emb = False
         # Give model summary
@@ -139,8 +139,8 @@ class JEDVI(
             f"n_unseen_classes: {self.n_unseen_labels}, "
             f"use_gene_emb: {self.use_gene_emb}"
         )
-        if self.ctrl_class_idx is not None:
-            self._model_summary_string += f"\ncontrol_class_idx: {self.ctrl_class_idx}"
+        if self.ctrl_class is not None:
+            self._model_summary_string += f"\nctrl_class: {self.ctrl_class}"
 
     def _get_cls_weights(
         self,
@@ -196,6 +196,7 @@ class JEDVI(
                 # Set indices
                 self.idx_to_label = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels']
                 # Set control class index
+                self.ctrl_class = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['ctrl_class']
                 self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['ctrl_class_idx']
             else:
                 # Register adata's class embedding with this model
@@ -207,27 +208,38 @@ class JEDVI(
                     _label_series = pd.Series(self._code_to_label.values())
                     _label_overlap = _label_series.isin(cls_emb.index)
                     _shared_labels = _label_series[_label_overlap].values
+                    _unseen_labels = cls_emb.index.difference(_shared_labels)
                     # Remove control embedding if given
                     if self.ctrl_class is not None:
-                        self.ctrl_class_idx = 0
                         # Create empty embedding for control
                         if self.ctrl_class not in _shared_labels:
-                            # Create empty embedding
+                            logging.info(f'Adding empty control class embedding, will be learned by model.')
+                            # Create empty embedding at last slot
+                            self.ctrl_class_idx = np.where(_label_series == self.ctrl_class)[0][0]
                             dummy_emb = pd.DataFrame(np.zeros((1, cls_emb.shape[-1])), index=[self.ctrl_class], columns=cls_emb.columns)
-                            cls_emb = pd.concat((dummy_emb, cls_emb), axis=0)
-                        # Set control index to first embedding index
-                        _shared_labels = np.concatenate((np.array([self.ctrl_class]), np.array(_shared_labels[_shared_labels != self.ctrl_class])))
+                            # Add dummy embedding as 
+                            _shared_cls_emb = cls_emb.loc[_shared_labels]
+                            _unseen_cls_emb = cls_emb.loc[_unseen_labels]
+                            cls_emb = pd.concat((_shared_cls_emb, dummy_emb, _unseen_cls_emb), axis=0)
+                            # Set control index to first embedding index
+                            _shared_labels = np.concatenate((
+                                np.array(_shared_labels[_shared_labels != self.ctrl_class]),
+                                np.array([self.ctrl_class])
+                            ))
+                        else:
+                            logging.info(f'Overwriting existing control class embedding, will be learned by model.')
+                            # Set control idx for embedding
+                            self.ctrl_class_idx = np.where(_label_series==self.ctrl_class)[0]-1
                         # Reset label overlap
                         _label_overlap = _label_series.isin(_shared_labels)
                     else:
+                        # Set no label as control class
                         self.ctrl_class_idx = None
-                    _unseen_labels = cls_emb.index.difference(_shared_labels)
                     self.n_train_labels = _shared_labels.shape[0]
                     self.n_unseen_labels = _unseen_labels.shape[0]
                     n_missing = _label_overlap.shape[0] - _label_overlap.sum()
                     if n_missing > 0:
                         raise ValueError(f'Found {n_missing} missing labels in cls embedding: {_label_series[~_label_overlap]}')
-
                     # Re-order embedding: first training labels then rest
                     cls_emb = pd.concat([cls_emb.loc[_shared_labels], cls_emb.loc[_unseen_labels]], axis=0)
                     # Include class similarity as pre-calculated matrix
@@ -252,7 +264,8 @@ class JEDVI(
                         'labels': cls_emb.index,
                         'n_train_labels': self.n_train_labels, 
                         'n_unseen_labels': self.n_unseen_labels,
-                        'ctrl_class_idx': self.ctrl_class_idx
+                        'ctrl_class': self.ctrl_class,
+                        'ctrl_class_idx': self.ctrl_class_idx,
                     }
             # Set embedding dimension
             self.n_dims_emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
@@ -729,6 +742,8 @@ class JEDVI(
             mcb = data_params.get("max_classes_per_batch", 16)
             batch_size = int(msb * mcb)
             data_params["batch_size"] = batch_size
+        # Add control class index to data params
+        data_params['ctrl_class'] = self.ctrl_class
 
         # Create data splitter
         data_splitter = ContrastiveDataSplitter(
@@ -897,7 +912,7 @@ class JEDVI(
         **kwargs,
     ):
         """
-        Setup AnnData object for training a GPVI model.
+        Setup AnnData object for training a JEDVI model.
         """
         if not isinstance(adata.X, sp.csr_matrix) and cast_to_csr:
             logging.info('Converting adata.X to csr matrix to boost training efficiency.')

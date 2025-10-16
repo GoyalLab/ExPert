@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 from src.utils.constants import REGISTRY_KEYS, TRAINING_KEYS, MODULE_KEYS
 from src.utils.io import read_config, read_adata
+from src.utils.preprocess import neighborhood_purity
 from ._statics import CONF_KEYS, NESTED_CONF_KEYS
 from ..models._jedvi import JEDVI
 from ..plotting import get_model_results, get_classification_report, get_latest_tensor_dir
@@ -212,9 +213,27 @@ def _train(
     )
     return model, results, latent
 
-def load_test_data(test_adata_p: str, model: nn.Module, incl_unseen: bool = True, verbose: bool = True):
+def load_test_data(
+        test_adata_p: str, 
+        model: nn.Module, 
+        incl_unseen: bool = True, 
+        verbose: bool = True, 
+        label_key: str = 'perturbation', 
+        ctrl_key: str = 'control', 
+        control_neighbor_threshold: float = 0.0
+    ) -> ad.AnnData:
     # Read adata from file
     test_ad = read_adata(test_adata_p)
+    # Filter adata
+    if control_neighbor_threshold > 0:
+        logging.info(f'Filtering test data for min class neighbor proportion of {control_neighbor_threshold}.')
+        neighborhood_purity(
+            test_ad, 
+            label_key=label_key, 
+            ignore_class=ctrl_key, 
+            new_label_key=label_key, 
+            threshold=control_neighbor_threshold
+        )
     # Get training adata
     adata = model.adata
     # Get training and testing labels
@@ -628,14 +647,18 @@ def test(
         output_dir: str,
         incl_unseen: bool = True,
         use_fixed_dataset_label: bool = True,
+        label_key: str = 'perturbation',
+        ctrl_key: str = 'control',
+        control_neighbor_threshold: float = 0.0,
         min_ms: float = 4.0,
         min_cpp: int = 10,
         plot: bool = False,
-        return_results: bool = False
+        return_results: bool = False,
+        verbose: bool = True
     ):
     logging.info(f'Testing model with: {test_adata_p}')
     # Load test set
-    test_ad = load_test_data(test_adata_p, model, incl_unseen=incl_unseen)
+    test_ad = load_test_data(test_adata_p, model, incl_unseen=incl_unseen, label_key=label_key, ctrl_key=ctrl_key, control_neighbor_threshold=control_neighbor_threshold)
     # Setup test set labels
     cls_label, batch_key, orig_batch_key = setup_labels(test_ad, test_adata_p, model, use_fixed_dataset_label)
     # Filter test set for labels in class embedding

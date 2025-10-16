@@ -120,6 +120,7 @@ rule process_dataset:
         use_perturbation_pool = config['use_perturbation_pool'],
         use_feature_pool = config['use_feature_pool'],
         z_score_filter = config['z_score_filter'],
+        control_neighbor_threshold = config['control_neighbor_threshold'],
         min_cells_per_class = config['min_cells_per_class'],
         single_perturbations_only = config['single_perturbations_only'],
         p_col = config['perturbation_col'],
