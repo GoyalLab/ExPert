@@ -165,13 +165,16 @@ def get_soft_predictions(model: nn.Module, adata: ad.AnnData | None = None, mode
 
 def plot_soft_predictions(model: nn.Module, data: ad.AnnData, soft_predictions: pd.DataFrame, mode: str = 'val', plt_dir: str | None = None, n: int = 10) -> pd.DataFrame:
     from sklearn.metrics import precision_recall_fscore_support
+    from sklearn.exceptions import UndefinedMetricWarning
     from tqdm import tqdm
+    import warnings
+    warnings.simplefilter('ignore', category=UndefinedMetricWarning)
 
     # Plot wo ctrl
     n_labels = model.adata.obs._scvi_labels.nunique()
     y = data.obs._scvi_labels.values
     labels = data.obs.cls_label.values
-    n_labels = y.max()
+    n_labels = soft_predictions.shape[1]
     max_idx = np.argsort(soft_predictions, axis=1)
     # Look at top N predictions (can be useful for pathways etc.)
     top_n_predictions = []

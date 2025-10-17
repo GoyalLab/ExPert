@@ -150,6 +150,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         compile: bool = False,
         compile_kwargs: dict | None = None,
         average: str = "macro",
+        top_k: int = 1,
         use_posterior_mean: Literal["train", "val", "both"] | None = "val",
         use_cls_scores: Literal["train", "val", "both"] | None = "train",
         log_class_distribution: bool = False,
@@ -210,7 +211,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.encoder_freezed = False
         self.use_contr_in_val = use_contr_in_val
         # Misc
-        self.average = average
+        self.average = average                                                      # How to reduce the classification metrics
+        self.top_k = top_k                                                          # How many top predictions to consider for metrics
         self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
         self.plot_umap = self.loss_kwargs.pop("plot_umap", None)
         self.log_full_val = log_full_val
@@ -368,35 +370,72 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                     batch_size=loss_output.n_obs_minibatch,
                     prog_bar=True,
                 )
+        # Initialize default classification metrics
+        metrics_dict = {
+            METRIC_KEYS.CLASSIFICATION_LOSS_KEY: np.inf,
+            METRIC_KEYS.ACCURACY_KEY: 0.0,
+            METRIC_KEYS.F1_SCORE_KEY: 0.0,
+        }
         # Add classification-based metrics if they exist
         if loss_output.classification_loss is not None:
             classification_loss = loss_output.classification_loss
             true_labels = loss_output.true_labels.squeeze(-1)
             logits = loss_output.logits
-            predicted_labels = torch.argmax(logits, dim=-1)
+            # Take argmax of logits to get highest predicted label
+            predicted_labels = torch.argmax(logits, dim=-1).squeeze(-1)
+            n_classes = self.n_classes
+            # Exclude control class for multiclass metrics
+            if not self.module.use_classification_control:
+                n_classes -= 1
+            # Check if any classes are outside of training classes, i.e
+            unknown_mask = (predicted_labels >= n_classes)
+            if unknown_mask.any():
+                # Assign unknown to classes that are outside of the training classes
+                predicted_labels = predicted_labels.masked_fill(unknown_mask, n_classes)
+                n_classes += 1
             # Assign unknown to classes that are outside of the training classes
-            predicted_labels = predicted_labels.masked_fill((predicted_labels >= self.n_classes), self.n_classes)
-
+            predicted_labels = predicted_labels.masked_fill((predicted_labels >= n_classes), n_classes)
+            # Calculate accuracy over predicted and true labels
             accuracy = tmf.classification.multiclass_accuracy(
                 predicted_labels,
                 true_labels,
-                self.n_classes+1,
+                n_classes,
                 average=self.average
             )
+            # Calculate F1 score over predicted and true labels
             f1 = tmf.classification.multiclass_f1_score(
                 predicted_labels,
                 true_labels,
-                self.n_classes+1,
+                n_classes,
                 average=self.average,
             )
-        else:
-            # Set metrics to defaults
-            classification_loss, accuracy, f1 = np.inf, 0.0, 0.0
+            # Update metrics
+            metrics_dict[METRIC_KEYS.CLASSIFICATION_LOSS_KEY] = classification_loss
+            metrics_dict[METRIC_KEYS.ACCURACY_KEY] = accuracy
+            metrics_dict[METRIC_KEYS.F1_SCORE_KEY] = f1
+            # Include top k predictions as well
+            if self.top_k > 1:
+                top_k_acc_key = f'{METRIC_KEYS.ACCURACY_KEY}_top_{self.top_k}'
+                top_k_f1_key = f'{METRIC_KEYS.F1_SCORE_KEY}_top_{self.top_k}'
+                top_k_accuracy = tmf.classification.multiclass_accuracy(
+                    logits,
+                    true_labels,
+                    n_classes,
+                    average=self.average,
+                    top_k=self.top_k,
+                )
+                top_k_f1 = tmf.classification.multiclass_f1_score(
+                    logits,
+                    true_labels,
+                    n_classes,
+                    average=self.average,
+                    top_k=self.top_k,
+                )
+                metrics_dict[top_k_acc_key] = top_k_accuracy
+                metrics_dict[top_k_f1_key] = top_k_f1
         
         # Add metrics to extra metrics for internal logging
-        loss_output.extra_metrics[METRIC_KEYS.CLASSIFICATION_LOSS_KEY] = classification_loss
-        loss_output.extra_metrics[METRIC_KEYS.ACCURACY_KEY] = accuracy
-        loss_output.extra_metrics[METRIC_KEYS.F1_SCORE_KEY] = f1
+        loss_output.extra_metrics.update(metrics_dict)
         # Compute and log all metrics
         super().compute_and_log_metrics(loss_output, metrics, mode)
 
@@ -633,20 +672,29 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                     
     def _log_full_val_metrics(self, mode_data: dict[str, np.ndarray]) -> None:
         true_labels = torch.tensor(mode_data.get('labels'))
-        predicted_labels = torch.tensor(mode_data.get('predicted_labels'))
-        # Assign unknown to classes that are outside of the training classes
-        predicted_labels = predicted_labels.masked_fill((predicted_labels >= self.n_classes), self.n_classes)
-
+        predicted_labels = torch.tensor(mode_data.get('predicted_labels')).squeeze(-1)
+        n_classes = self.n_classes
+        # Exclude control class for multiclass metrics
+        if not self.module.use_classification_control:
+            n_classes -= 1
+        # Check if any classes are outside of training classes, i.e
+        unknown_mask = (predicted_labels >= n_classes)
+        if unknown_mask.any():
+            # Assign unknown to classes that are outside of the training classes
+            predicted_labels = predicted_labels.masked_fill(unknown_mask, n_classes)
+            n_classes += 1
+        
+        # Calculate classification metrics
         accuracy = tmf.classification.multiclass_accuracy(
             predicted_labels,
             true_labels,
-            self.n_classes+1,
+            n_classes,
             average=self.average
         )
         f1 = tmf.classification.multiclass_f1_score(
             predicted_labels,
             true_labels,
-            self.n_classes+1,
+            n_classes,
             average=self.average,
         )
         self.log(
@@ -661,6 +709,37 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             on_epoch=True,
             prog_bar=False,
         )
+        # Include top k predictions as well
+        if self.top_k > 1:
+            logits = torch.tensor(mode_data.get('logits'))
+            top_k_acc_key = f'validation_full_accuracy_top_{self.top_k}'
+            top_k_f1_key = f'validation_full_f1{self.top_k}'
+            top_k_accuracy = tmf.classification.multiclass_accuracy(
+                logits,
+                true_labels,
+                n_classes,
+                average=self.average,
+                top_k=self.top_k,
+            )
+            top_k_f1 = tmf.classification.multiclass_f1_score(
+                logits,
+                true_labels,
+                n_classes,
+                average=self.average,
+                top_k=self.top_k,
+            )
+            self.log(
+                top_k_acc_key,
+                top_k_accuracy,
+                on_epoch=True,
+                prog_bar=False,
+            )
+            self.log(
+                top_k_f1_key,
+                top_k_f1,
+                on_epoch=True,
+                prog_bar=False,
+            )
 
     def _get_mode_data(self, mode: str = 'val') -> dict[str, np.ndarray]:
         if mode == 'train':
@@ -689,6 +768,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         labels = []
         predicted_labels = []
         covs = []
+        logits = []
         # Collect results for all batches
         for batch_idx, batch in enumerate(full_dataset):
             with torch.no_grad():
@@ -723,10 +803,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 if loss_output.logits is not None:
                     # Add predicted labels from each batch
                     predicted_labels.append(torch.argmax(loss_output.logits, dim=-1))
+                    logits.append(loss_output.logits)
         # Concat results pull to cpu, and reformat
         embeddings = torch.cat(embeddings, dim=0).cpu().numpy()
         labels = torch.cat(labels, dim=0).cpu().numpy().squeeze()
         predicted_labels = torch.cat(predicted_labels, dim=0).cpu().numpy().squeeze() if len(predicted_labels) > 0 else np.array([])
+        logits = torch.cat(logits, dim=0).cpu().numpy().squeeze() if len(logits) > 0 else np.array([])
         covs = torch.cat(covs, dim=0).cpu().numpy().squeeze()
         
         # Package data for return
@@ -734,6 +816,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             'embeddings': embeddings,
             'labels': labels,
             'predicted_labels': predicted_labels,
+            'logits': logits,
             'covs': covs
         }
 

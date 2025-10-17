@@ -28,7 +28,8 @@ class RandomContrastiveBatchSampler(Sampler):
         shuffle: bool = True,
         drop_last: bool = False,
         min_contexts_per_class: int = 2,
-        ctrl_class: str | None = None
+        ctrl_class: str | None = None,
+        ctrl_frac: float = 1.0,
     ):
         self.dataset = dataset
         self.epoch = 0
@@ -42,6 +43,7 @@ class RandomContrastiveBatchSampler(Sampler):
         self.max_classes_per_batch = max_classes_per_batch
         self.min_contexts_per_class = min_contexts_per_class
         self.ctrl_class = ctrl_class
+        self.ctrl_frac = ctrl_frac
         self.batch_sampler_cls = ContrastiveBatchSampler
         # Sample initial indices
         self._idc = self._sample_idc()
@@ -68,7 +70,8 @@ class RandomContrastiveBatchSampler(Sampler):
             last_first=True,
             shuffle_classes=self.shuffle,
             min_contexts_per_class=self.min_contexts_per_class,
-            ctrl_class=self.ctrl_class
+            ctrl_class=self.ctrl_class,
+            ctrl_frac=self.ctrl_frac,
         )
         batch_dict = sampler.sample(copy=True, return_details=False)
         # Return sampled class indices if no control cells are given
@@ -227,6 +230,7 @@ class ContrastiveBatchSampler:
         split_batches: bool = False,
         min_contexts_per_class: int = 2,
         ctrl_class: str | None = None,
+        ctrl_frac: float = 1.0,
         **kwargs
     ):
         self.batch_size = batch_size
@@ -239,6 +243,7 @@ class ContrastiveBatchSampler:
         self.split_batches = split_batches
         self.min_contexts_per_class = min_contexts_per_class
         self.ctrl_class = ctrl_class
+        self.ctrl_frac = ctrl_frac
         self.kwargs = kwargs
 
         # Index and label setup
@@ -260,7 +265,7 @@ class ContrastiveBatchSampler:
             self.ctrl_pools = {b: pool for b, pool in self.ctrl_pools.items() if len(pool) > 0}
             # Set some control specific parameters
             n_contexts = len(self.ctrl_pools)
-            self.n_ctrl_per_ctx = int(np.ceil(self.batch_size / n_contexts))
+            self.n_ctrl_per_ctx = int(np.ceil(self.batch_size * self.ctrl_frac / n_contexts))
 
             # remove control indices from normal sampling
             self.indices = self.indices[~ctrl_mask]

@@ -81,6 +81,7 @@ class ContrastiveAnnDataLoader(DataLoader):
         max_classes_per_batch: int = 16,
         shuffle: bool = False,
         ctrl_class: str | None = None,
+        ctrl_frac: float = 1.0,
         sampler: Sampler | None = None,
         drop_last: bool = False,
         drop_dataset_tail: bool = False,
@@ -134,11 +135,12 @@ class ContrastiveAnnDataLoader(DataLoader):
                     max_cells_per_batch=max_cells_per_batch,
                     max_classes_per_batch=max_classes_per_batch,
                     ctrl_class=ctrl_class,
+                    ctrl_frac=ctrl_frac,
                     shuffle=shuffle,
                     drop_last=drop_last,
                 )
                 # Control cells are added as another batch
-                batch_size = int(batch_size*2) if ctrl_class is not None else batch_size
+                batch_size = int(batch_size*(sampler_cls.ctrl_frac+1)) if ctrl_class is not None else batch_size
                 sampler = BatchSampler(
                     sampler=sampler_cls,
                     batch_size=batch_size,

@@ -210,12 +210,17 @@ class JEDVI(
                     _shared_labels = _label_series[_label_overlap].values
                     _unseen_labels = cls_emb.index.difference(_shared_labels)
                     # Remove control embedding if given
-                    if self.ctrl_class is not None:
+                    ctrl_class_idx_matches = np.where(_label_series==self.ctrl_class)[0]
+                    ctrl_exists_in_data = len(ctrl_class_idx_matches) > 0
+                    if not ctrl_exists_in_data:
+                        logging.warning(f'Specified control label {self.ctrl_class} is not in adata class labels, ignoring parameter.')
+                    if self.ctrl_class is not None and ctrl_exists_in_data:
+                        # Find control index
+                        self.ctrl_class_idx = ctrl_class_idx_matches[0]
                         # Create empty embedding for control
                         if self.ctrl_class not in _shared_labels:
                             logging.info(f'Adding empty control class embedding, will be learned by model.')
                             # Create empty embedding at last slot
-                            self.ctrl_class_idx = np.where(_label_series == self.ctrl_class)[0][0]
                             dummy_emb = pd.DataFrame(np.zeros((1, cls_emb.shape[-1])), index=[self.ctrl_class], columns=cls_emb.columns)
                             # Add dummy embedding as 
                             _shared_cls_emb = cls_emb.loc[_shared_labels]
@@ -223,13 +228,10 @@ class JEDVI(
                             cls_emb = pd.concat((_shared_cls_emb, dummy_emb, _unseen_cls_emb), axis=0)
                             # Set control index to first embedding index
                             _shared_labels = np.concatenate((
-                                np.array(_shared_labels[_shared_labels != self.ctrl_class]),
-                                np.array([self.ctrl_class])
+                                np.array(_shared_labels), np.array([self.ctrl_class])
                             ))
                         else:
                             logging.info(f'Overwriting existing control class embedding, will be learned by model.')
-                            # Set control idx for embedding
-                            self.ctrl_class_idx = np.where(_label_series==self.ctrl_class)[0]-1
                         # Reset label overlap
                         _label_overlap = _label_series.isin(_shared_labels)
                     else:
@@ -882,7 +884,7 @@ class JEDVI(
         import glob
         # Look for checkpoints
         checkpoint_dir = os.path.join(model_dir, checkpoint_dirname)
-        if os.path.exists(checkpoint_dir):
+        if os.path.exists(checkpoint_dir) and n > -1:
             checkpoint_model_paths = glob.glob(f'{checkpoint_dir}/**/{model_name}')
             if len(checkpoint_model_paths) > 0:
                 checkpoint_model_p = checkpoint_model_paths[n] if n > 0 and n < len(checkpoint_model_paths) else checkpoint_model_paths[0]
