@@ -139,11 +139,10 @@ class ContrastiveAnnDataLoader(DataLoader):
                     shuffle=shuffle,
                     drop_last=drop_last,
                 )
-                # Control cells are added as another batch
-                batch_size = int(batch_size*(sampler_cls.ctrl_frac+1)) if ctrl_class is not None else batch_size
+                # Use updated batch size if control cells are added
                 sampler = BatchSampler(
                     sampler=sampler_cls,
-                    batch_size=batch_size,
+                    batch_size=sampler_cls.full_batch_size,
                     drop_last=drop_last,
                 )
             else:

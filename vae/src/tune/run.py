@@ -295,7 +295,7 @@ def setup_labels(test_ad, test_adata_p: str, model, use_fixed_dataset_label: boo
     return cls_label, batch_key, orig_batch_key
 
 
-def filter_test_data(test_ad, min_ms: float, min_cpp: int):
+def filter_test_data(test_ad: ad.AnnData, min_ms: float, min_cpp: int):
     if 'mixscale_score' in test_ad.obs and min_ms is not None and min_ms > 0:
         ms_mask = test_ad.obs.mixscale_score >= min_ms
         test_ad._inplace_subset_obs(ms_mask)
@@ -319,7 +319,8 @@ def run_model_predictions(model, test_ad, cls_label, batch_key, incl_unseen: boo
 
     # Get latent representation of model
     test_ad.obsm['latent_z'] = model.get_latent_representation(adata=test_ad)
-    pred_out = model.predict(adata=test_ad, return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
+    use_full = None if not incl_unseen else True
+    pred_out = model.predict(adata=test_ad, return_latent=True, soft=True, use_full_cls_emb=use_full)
     # Check if model has an embedding classifier or not
     if isinstance(pred_out, tuple):
         predictions, cz, cls_emb_z = pred_out
@@ -574,7 +575,8 @@ def update_latent(
     plt_dir = os.path.join(output_dir, 'plots')
     latent = sc.read(os.path.join(version_dir, 'latent.h5ad'))
     # Plot combination of latent spaces
-    pred_out = model.predict(return_latent=True, soft=True, use_full_cls_emb=incl_unseen)
+    use_full = None if not incl_unseen else True
+    pred_out = model.predict(return_latent=True, soft=True, use_full_cls_emb=use_full)
     # Build index map
     idx_map = (
         latent.obs

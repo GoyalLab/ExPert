@@ -10,7 +10,66 @@ from typing import Literal, Iterable, Optional
 from torch.distributions import Normal
 
 from src.utils.constants import REGISTRY_KEYS
+from src.utils.common import to_tensor
 
+
+class ExternalClassEmbedding(nn.Module):
+    """External Class embedding. Can be a mix of static pre-trained embedding and learnable control embedding."""
+    def __init__(
+        self, 
+        cls_emb: torch.Tensor,
+        cls_sim: torch.Tensor | None,
+        ctrl_class_idx: int | None,
+        use_control: bool = True,
+        **kwargs
+    ):
+        super().__init__()
+        # Save class embedding
+        self.cls_emb = F.normalize(to_tensor(cls_emb), dim=-1)
+        # Calculate class similarities
+        self.cls_sim = to_tensor(cls_sim) if cls_sim is not None else self.cls_emb @ self.cls_emb.T
+        # Get number of classes and set control class index
+        self.cls_emb_dim = self.cls_emb.shape[-1]
+        self.ctrl_class_idx = ctrl_class_idx
+        # Initialize class embedding shape
+        self._ncls = self.cls_emb.shape[0]
+        self._ndims = self.cls_emb.shape[-1]
+        # Initialize learnable control parameter
+        if self.ctrl_class_idx is not None:
+            cls_range = torch.arange(self._ncls)
+            if self.ctrl_class_idx not in cls_range:
+                raise IndexError(f'Control class index "{self.ctrl_class_idx}" is outside of class embedding range "0:{self.cls_emb_dim}".')
+            # Remove control class from embedding
+            if not use_control:
+                no_ctrl_mask = self.ctrl_class_idx != cls_range
+                self.cls_emb = self.cls_emb[no_ctrl_mask]
+                self.cls_sim = self.cls_sim[no_ctrl_mask][:,no_ctrl_mask]
+                # Update self._shape
+                self._ncls = self.cls_emb.shape[0]
+                self.use_control_emb = False
+            else:
+                # Learnable control embedding
+                self.control_emb = torch.nn.Parameter(torch.randn(1, self.cls_emb_dim) * 0.02)
+                self.use_control_emb = True
+        else:
+            # Disable control embedding
+            self.use_control_emb = False
+
+    def forward(self, device: int | str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        # Determine output device
+        _device = device if device is not None else self.cls_emb.device
+        # Update control embedding and class similarities
+        if self.use_control_emb:
+            # Return static embedding + learnable control embedding
+            self.cls_emb[self.ctrl_class_idx] = self.control_emb.squeeze(0)
+            # Recalculate class similarities every time since control is changing
+            self.cls_sim = self.cls_emb @ self.cls_emb.T
+        # Move to device and return
+        return self.cls_emb.to(device=_device), self.cls_sim.to(device=_device)
+        
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self._ncls, self._ndims)
 
 def _identity(x):
     return x

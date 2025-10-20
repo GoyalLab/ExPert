@@ -170,10 +170,15 @@ def plot_soft_predictions(model: nn.Module, data: ad.AnnData, soft_predictions: 
     import warnings
     warnings.simplefilter('ignore', category=UndefinedMetricWarning)
 
-    # Plot wo ctrl
-    n_labels = model.adata.obs._scvi_labels.nunique()
-    y = data.obs._scvi_labels.values
+    # Filter for labels that we can actually predict
+    label_diff = pd.Series(list(set(data.obs.cls_label.values).difference(soft_predictions.columns)))
+    if label_diff.shape[0] > 0:
+        label_mask = ~data.obs.cls_label.isin(label_diff)
+        data = data[label_mask]
+        soft_predictions = soft_predictions[label_mask].copy()
+    # Get data labels and class indices
     labels = data.obs.cls_label.values
+    y = data.obs._scvi_labels.values
     n_labels = soft_predictions.shape[1]
     max_idx = np.argsort(soft_predictions, axis=1)
     # Look at top N predictions (can be useful for pathways etc.)
@@ -223,7 +228,7 @@ def plot_soft_predictions(model: nn.Module, data: ad.AnnData, soft_predictions: 
     plt.xlabel('Number of top predictions')
     plt.ylim([0.0, 1.0])
     plt.ylabel('F1-score per class')
-    plt.title(f'{mode.capitalize()} F1-score distribution over top predictions (N={model.summary_stats.n_labels})', pad=20)
+    plt.title(f'{mode.capitalize()} F1-score distribution over top predictions (N={n_labels})', pad=20)
     plt.savefig(f1_p, dpi=300, bbox_inches='tight')
     plt.close()
     return top_n_predictions

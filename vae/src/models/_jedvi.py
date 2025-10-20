@@ -80,6 +80,7 @@ class JEDVI(
         ctrl_class: str | None = None,
         linear_classifier: bool = False,
         cls_weight_method: str | None = None,
+        use_full_cls_emb: bool = False,
         **model_kwargs,
     ):
         super().__init__(adata)
@@ -88,6 +89,8 @@ class JEDVI(
         self.ctrl_class = ctrl_class
         # Set number of classes
         self.n_labels = self.summary_stats.n_labels
+        # Whether to use the full class embedding
+        self.use_full_cls_emb = use_full_cls_emb
 
         # Initialize indices and labels for this VAE
         self._setup()
@@ -103,7 +106,8 @@ class JEDVI(
         n_batch = self.summary_stats.n_batch
         # Check number of hidden neurons, set to input features if < 0 else use given number
         n_hidden = self.summary_stats.n_vars if n_hidden < 0 else n_hidden
-
+        # Get class embeddings
+        cls_emb, cls_sim = self.get_cls_emb()
         # Initialize genevae
         self.module = self._module_cls(
             n_input=self.summary_stats.n_vars,
@@ -112,6 +116,8 @@ class JEDVI(
             n_latent=n_latent,
             n_hidden=n_hidden,
             n_layers=n_layers,
+            cls_emb=cls_emb,
+            cls_sim=cls_sim,
             dropout_rate_encoder=dropout_rate,
             dropout_rate_decoder=dropout_rate_decoder,
             class_embed_dim=self.n_dims_emb,
@@ -129,7 +135,6 @@ class JEDVI(
         self.supervised_history_ = None
         self.init_params_ = self._get_init_params(locals())
         self.was_pretrained = False
-        self.use_full_cls_emb = False
         self.use_ctrl_emb = False
         # Give model summary
         self.n_unseen_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_unseen_labels'] if REGISTRY_KEYS.CLS_EMB_INIT in adata.uns else None
@@ -141,6 +146,7 @@ class JEDVI(
         )
         if self.ctrl_class is not None:
             self._model_summary_string += f"\nctrl_class: {self.ctrl_class}"
+            self._model_summary_string += f"\nuse_learnable_control_emb: {self.module.use_learnable_control_emb}"
 
     def _get_cls_weights(
         self,
@@ -284,6 +290,7 @@ class JEDVI(
         """Helper getter to return either training or full class embedding"""
         if self.cls_emb is None:
             return None, None
+        # Check if we want to train on full or observed embedding only
         use_full_cls_emb = use_full_cls_emb if use_full_cls_emb is not None else self.use_full_cls_emb
         if use_full_cls_emb:
             return self.cls_emb, self.cls_sim
@@ -526,7 +533,6 @@ class JEDVI(
         qz_means: list[Tensor] = []
         qz_vars: list[Tensor] = []
         for tensors in dataloader:
-            tensors[REGISTRY_KEYS.CLS_EMB_KEY], _ = self.get_cls_emb()
             tensors[REGISTRY_KEYS.GENE_EMB_KEY] = self.gene_emb
             outputs: dict[str, Tensor | Distribution | None] = self.module.inference(
                 **self.module._get_inference_input(tensors)
@@ -601,7 +607,12 @@ class JEDVI(
             batch_size=batch_size,
         )
         # Get class embeddings from model
-        cls_emb, _, = self.get_cls_emb(use_full_cls_emb=use_full_cls_emb)
+        if use_full_cls_emb is None or not use_full_cls_emb:
+            cls_emb, _ = self.module.class_embedding(device=self.device)
+        # Fall back to full model embeddings
+        else:
+            cls_emb = self.cls_emb
+
         if cls_emb is not None:
             logging.info(f'Using class embedding: {cls_emb.shape}')
         
@@ -671,12 +682,9 @@ class JEDVI(
             return pred
         
     def get_training_plan(self, **plan_kwargs):
-        cls_emb, cls_sim = self.get_cls_emb()
         return self._training_plan_cls(
             module=self.module, 
             n_classes=self.n_labels, 
-            cls_emb=cls_emb,
-            cls_sim=cls_sim,
             gene_emb=self.gene_emb,
             **plan_kwargs
         )

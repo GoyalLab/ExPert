@@ -157,9 +157,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         log_full_val: bool = True,
         freeze_encoder_epoch: int | None = None,
         gene_emb: torch.Tensor | None = None,
-        cls_emb: torch.Tensor | None = None,
-        cls_sim: torch.Tensor | None = None,
-        use_full_cls_emb: bool = False,
         incl_n_unseen: int | None = None,
         anneal_schedules: dict[str, dict[str | float]] | None = None,
         full_val_log_every_n_epoch: int = 10,
@@ -188,21 +185,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.n_steps_warmup = n_steps_warmup
         self.multistage_kl_frac = multistage_kl_frac
         self.kl_reset_epochs = self._get_stall_epochs()
+        self.reset_kl_at = np.array(sorted(self.kl_reset_epochs.values()))
         # CLS params
         self.n_classes = n_classes
         self.use_posterior_mean = use_posterior_mean
         self.gene_emb = to_tensor(gene_emb)
-        self.cls_emb = to_tensor(cls_emb)
-        self.cls_sim = self._calc_cls_sim(self.cls_emb) if cls_sim is None else to_tensor(cls_sim)
-        self.use_full_cls_emb = use_full_cls_emb
-        # Add train class embedding
-        if not use_full_cls_emb and self.cls_emb is not None:
-            self.train_cls_emb = self.cls_emb[:self.n_classes,:]
-            self.train_cls_sim = self.train_cls_emb @ self.train_cls_emb.T
-        # Get number of total classes in embedding
-        self.n_all_classes = self.cls_emb.shape[0] if self.cls_emb is not None else self.n_classes
-        if self.cls_emb is None:
-            logging.warning(f'No external class embeddings provided, falling back to internal class embeddings.')
+   
         self.incl_n_unseen = incl_n_unseen
         self.use_cls_scores = use_cls_scores
         # Contrastive params
@@ -227,6 +215,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def _get_stall_epochs(self) -> dict[str, int]:
         stalls = {'kl': 0}
         for name, schedule in self.anneal_schedules.items():
+            if name == 'kl_weight':
+                continue
             stall = schedule.get('n_epochs_stall', 0)
             if stall > 0:
                 stalls[name] = stall
@@ -257,25 +247,37 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     @property
     def kl_weight_multistage(self):
         """KL weight for forward process. Resets every time a new loss objective activates."""
-        reset_at = np.array(sorted(self.kl_reset_epochs.values()))
-        idx = (self.current_epoch > reset_at).sum() - 1
-        n_epochs_stall = reset_at[idx]
-        n_epochs_warmup = reset_at[idx+1] if idx+1 < len(reset_at) else self.n_epochs_warmup
-        # No new loss
-        if n_epochs_stall < 1:
-            min_weight = self.min_kl_weight
-        # New loss
+        # Get extra kl args from 
+        kwargs = self.anneal_schedules.get('kl_weight', {'min_weight': 0.0, 'max_weight': 1.0})
+        # Determine reset params
+        reset_at = self.reset_kl_at
+        # Handle stall schedules
+        if reset_at.shape[0] > 1:
+            idx = (self.current_epoch > reset_at).sum() - 1
+            n_epochs_stall = reset_at[idx]
+            n_epochs_warmup = reset_at[idx+1] if idx+1 < len(reset_at) else self.n_epochs_warmup
+            # No new loss
+            if n_epochs_stall < 1:
+                min_weight = kwargs['min_weight']
+            # New loss
+            else:
+                min_weight = kwargs['max_weight'] * self.multistage_kl_frac if self.multistage_kl_frac > 0 else kwargs['min_weight']
+            # Update min weight
+            kwargs['min_weight'] = min_weight
+        # No stall schedules
         else:
-            min_weight = self.max_kl_weight * self.multistage_kl_frac if self.multistage_kl_frac > 0 else self.min_kl_weight
+            n_epochs_stall = 0
+            n_epochs_warmup = self.n_epochs_warmup
+
+        # Update warmup, and stall epochs
+        kwargs['n_epochs_warmup'] = n_epochs_warmup
+        kwargs['n_steps_warmup'] = None
+        kwargs['n_epochs_stall'] = n_epochs_stall
         # Set KL weight to restart at multistage min (0.1) for every new loss that gets activated
         klw = _compute_weight(
             self.current_epoch,
             self.global_step,
-            n_epochs_warmup,
-            self.n_steps_warmup,
-            n_epochs_stall=n_epochs_stall,
-            min_weight=min_weight,
-            max_weight=self.max_kl_weight
+            **kwargs
         )
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
@@ -439,54 +441,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Compute and log all metrics
         super().compute_and_log_metrics(loss_output, metrics, mode)
 
-    def _get_batch_class_embedding(self, batch_idx: int | None = None, **kwargs) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if self.cls_emb is None:
-            return None, None
-        # Use full embedding
-        cls_emb = self.cls_emb
-        cls_sim = self.cls_sim
-        if self.use_full_cls_emb:
-            # Randomly subsample embeddings outside of training classes if there are more available
-            if self.incl_n_unseen is not None and self.incl_n_unseen > 0 and self.n_all_classes > self.n_classes:
-                # Seen class indices
-                seen_idx = torch.arange(self.n_classes, device=cls_emb.device)
-                # Unseen class indices
-                unseen_idx = torch.arange(self.n_classes, self.n_all_classes, device=cls_emb.device)
-                # Fix RNG seed based on batch_idx to make sampling deterministic per batch (optional)
-                if batch_idx is not None:
-                    g = torch.Generator(device=cls_emb.device)
-                    g.manual_seed(batch_idx + 1234)  # offset for reproducibility
-                    unseen_sample = unseen_idx[
-                        torch.randperm(len(unseen_idx), generator=g)[:self.incl_n_unseen]
-                    ]
-                else:
-                    unseen_sample = unseen_idx[
-                        torch.randperm(len(unseen_idx))[:self.incl_n_unseen]
-                    ]
-                # Combine seen + sampled unseen
-                selected_idx = torch.cat([seen_idx, unseen_sample], dim=0)
-                # Subset embeddings and similarity matrix
-                cls_emb = cls_emb[selected_idx]
-                cls_sim = cls_sim[selected_idx][:, selected_idx]
-
-            return cls_emb, cls_sim
-        # Or use fixed part of embedding
-        else:
-            cls_emb = self.train_cls_emb
-            cls_sim = self.train_cls_sim
-        # Add learnable control embedding if given and re-calculate class similarities
-        if self.module.ctrl_class_idx is not None:
-            # Clone to avoid modifying the buffer in-place
-            cls_emb = cls_emb.clone()
-            # Ensure control_emb is on same device and normalized
-            control_emb = F.normalize(self.module.control_emb, dim=-1).to(cls_emb.device)
-            # Replace single control embedding with learnable embedding
-            cls_emb[self.module.ctrl_class_idx] = control_emb.squeeze(0)
-            # Normalize entire embedding matrix for cosine-similarity
-            cls_emb = F.normalize(cls_emb, dim=-1)
-            cls_sim = cls_emb @ cls_emb.T
-        return cls_emb, cls_sim
-
     def _calc_cls_sim(self, cls_emb: torch.Tensor | None) -> torch.Tensor | None:
         if cls_emb is None:
             return None
@@ -518,9 +472,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             # Add gene embedding matrix to batch
             batch[REGISTRY_KEYS.GENE_EMB_KEY] = self.gene_emb
         # Add external embedding to batch
-        if self.cls_emb is not None:
-            # Add embedding for classes
-            batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding(batch_idx=batch_idx)
         # Choose to use class scores for scaling or not
         input_kwargs['use_cls_scores'] = self.use_cls_scores in [mode, 'both']
         # Perform full forward pass of model
@@ -785,10 +736,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 # Setup kwargs
                 input_kwargs = {}
                 input_kwargs.update(self.loss_kwargs)
-                # Add external embedding to batch
-                if self.cls_emb is not None:
-                    # Add embedding for classes that are not in the training data
-                    batch[REGISTRY_KEYS.CLS_EMB_KEY], batch[REGISTRY_KEYS.CLS_SIM_KEY] = self._get_batch_class_embedding(batch_idx=batch_idx)
                 # Add external gene embedding to batch
                 if self.gene_emb is not None:
                     # Add gene embedding matrix to batch

@@ -1,6 +1,6 @@
 from typing import Iterable
 
-from src.modules._base import Classifier, EmbeddingClassifier, Encoder, DecoderSCVI
+from src.modules._base import Classifier, EmbeddingClassifier, Encoder, DecoderSCVI, ExternalClassEmbedding
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 from src.utils.distributions import rescale_targets
 from src.utils.common import pearson, BatchCache, GradientReversalFn
@@ -50,6 +50,8 @@ class JEDVAE(VAE):
         n_hidden: int = 256,
         n_latent: int = 128,
         n_layers: int = 2,
+        cls_emb: torch.Tensor | None = None,
+        cls_sim: torch.Tensor | None = None,
         dropout_rate_encoder: float = 0.2,
         dropout_rate_decoder: float | None = None,
         use_embedding_classifier: bool = True,
@@ -76,6 +78,7 @@ class JEDVAE(VAE):
         classification_loss_strategy: Literal['similarity', 'kl', 'focal', 'symmetric_contrastive'] | list[str] = 'kl',
         ctrl_class_idx: int | None = None,
         kl_class_temperature: float = 0.1,
+        use_learnable_control_emb: bool = False,
         use_learnable_temperature: bool = False,
         use_adversial_context_cls: bool = True,
         use_reconstruction_control: bool = False,                           # Use control cells for reconstruction loss
@@ -155,11 +158,20 @@ class JEDVAE(VAE):
         self.use_contrastive_control = use_contrastive_control
         # Set control class index
         self.ctrl_class_idx = ctrl_class_idx
-        if self.ctrl_class_idx is not None:
-            # Learnable control embedding
-            self.control_emb = torch.nn.Parameter(torch.randn(1, self.class_embed_dim) * 0.02)
+        # Class embedding parameters
+        self.use_learnable_control_emb = use_learnable_control_emb
+        if cls_emb is not None:
+            # Initialize external embedding
+            self.class_embedding = ExternalClassEmbedding(
+                cls_emb=cls_emb, 
+                cls_sim=cls_sim, 
+                ctrl_class_idx=ctrl_class_idx, 
+                use_control=use_learnable_control_emb
+            )
+            logging.info(f'Registered class embedding with shape: {self.class_embedding.shape}, using control: {use_learnable_control_emb}')
         else:
-            self.control_emb = None 
+            logging.info(f'No external class embedding registered with model.')
+            self.class_embedding = None 
 
         # Setup normalizations for en- and decoder
         use_batch_norm_encoder = use_batch_norm == 'encoder' or use_batch_norm == 'both'
@@ -236,6 +248,7 @@ class JEDVAE(VAE):
 
         # Debug
         self.use_cache = False
+        self._step = 0
         self.cache = BatchCache(10)
 
     def _get_inference_input(
@@ -1027,13 +1040,12 @@ class JEDVAE(VAE):
         qz: Distribution = inference_outputs[MODULE_KEYS.QZ_KEY]
         pz: Distribution = generative_outputs[MODULE_KEYS.PZ_KEY]
 
+
         # Get external class embedding if specified
         cls_emb, cls_sim = None, None
-        if use_ext_emb:
-            cls_emb = tensors.get(REGISTRY_KEYS.CLS_EMB_KEY)       # (n_labels, n_emb)
-            cls_emb = cls_emb.to(x.device) if cls_emb is not None else None
-            cls_sim = tensors.get(REGISTRY_KEYS.CLS_SIM_KEY)       # (n_cls, n_cls)
-            cls_sim = cls_sim.to(x.device) if cls_sim is not None else None
+        if use_ext_emb and self.class_embedding is not None:
+            # Get class embedding and similarities
+            cls_emb, cls_sim = self.class_embedding(device=x.device)
         
         # Compute basic kl divergence between prior and posterior x distributions
         kl_divergence_z_mat = kl_divergence(qz, pz)
@@ -1048,11 +1060,12 @@ class JEDVAE(VAE):
             reconst_loss = reconst_loss_mat.mean(-1)
         else:
             raise ValueError(f'reduction has to be either "batchmean" or "mean", got {self.reduction}')
-        
+
+        # Calculate control mask
+        ctrl_mask = (l == self.ctrl_class_idx).reshape(-1)
         # Handle control cells for elbo loss
-        if self.ctrl_class_idx is not None:
-            # Calculate control mask
-            ctrl_mask = (l == self.ctrl_class_idx).reshape(-1)
+        if self.ctrl_class_idx is not None and ctrl_mask.sum() > 0:
+            # Calculate fraction of control cells in batch
             ctrl_frac = x.shape[0] / max(ctrl_mask.sum(), 1)    # avoid div/0
             # Divide elbo sum by class cells only
             n_obs_minibatch = (~ctrl_mask).sum()
@@ -1081,9 +1094,7 @@ class JEDVAE(VAE):
         # Save reconstruction losses
         kl_locals = {MODULE_KEYS.KL_Z_KEY: kl_divergence_z}
         # Batch normalize elbo loss of reconstruction + kl --> batchmean reduction
-        elbo_loss = torch.mean(weighted_reconst_loss + weighted_kl_local)
-        # Setup final loss tensor
-        total_loss = elbo_loss
+        total_loss = torch.mean(weighted_reconst_loss + weighted_kl_local)
         # Collect inital loss and extra parameters
         lo_kwargs = {
             'reconstruction_loss': reconst_loss,
@@ -1156,8 +1167,8 @@ class JEDVAE(VAE):
             total_loss = total_loss + _adv_loss
             extra_metrics['adversial_context_loss'] = _adv_loss
                     
+        # Add extra metrics to loss output
         if len(extra_metrics) > 0:
-            # Add extra metrics to loss output
             lo_kwargs['extra_metrics'] = extra_metrics
         # Set total loss
         lo_kwargs['loss'] = total_loss

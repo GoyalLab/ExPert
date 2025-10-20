@@ -254,6 +254,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         max_cells_per_batch: int = 24,
         max_classes_per_batch: int = 20,
         ctrl_class: str | None = None,
+        ctrl_frac: float | None = 1,
         last_first: bool = True,
         shuffle_classes: bool = True,
         pin_memory: bool = False,
@@ -273,6 +274,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         self.max_cells_per_batch = max_cells_per_batch
         self.max_classes_per_batch = max_classes_per_batch
         self.ctrl_class = ctrl_class
+        self.ctrl_frac = ctrl_frac
         self.last_first = last_first
         self.shuffle_classes = shuffle_classes
         self.use_contrastive_loader = use_contrastive_loader
@@ -285,7 +287,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         else:
             self.batch_size = _bs
         # Set indices, labels, and batch labels
-        self.indices = range(adata_manager.adata.n_obs)
+        self.indices = np.arange(adata_manager.adata.n_obs)
         labels_state_registry = adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         labels = get_anndata_attribute(
             adata_manager.adata,
@@ -305,11 +307,23 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
 
     def setup(self, stage: str | None = None):
         """Split indices in train/test/val sets."""
+        # Only split non-control cells into train and validation
+        ctrl_mask = self.labels == self.ctrl_class
+        # Split control cells beforehand
+        if ctrl_mask.sum() > 0:
+            class_indices = self.indices[~ctrl_mask]
+            class_labels = self.labels[~ctrl_mask]
+            ctrl_indices = np.array(self.indices[ctrl_mask])
+        else:
+            # Use all available indices if no control cells are given
+            class_indices = self.indices
+            class_labels = self.labels
+            ctrl_indices = None
         # Split dataset into train and validation set
         train_idx, val_idx = train_test_split(
-            self.indices,
+            class_indices,
             train_size=self.train_size,
-            stratify=self.labels,           # Preserve class distribution
+            stratify=class_labels,           # Preserve class distribution
             shuffle=self.shuffle_set_split,
             random_state=settings.seed
         )
@@ -319,11 +333,12 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         indices_val = np.array(val_idx)
         indices_test = np.array([])
 
+        # Add control indices to train pool
+        if ctrl_indices is not None:
+            indices_train = np.concatenate((indices_train, ctrl_indices))
+
         # Don't validate on control cells if we have any registered
         if self.ctrl_class is not None and self.use_control not in ['val', 'both']:
-            ctrl_mask = self.labels == self.ctrl_class
-            ctrl_indices = np.array(self.indices)[ctrl_mask]
-
             # Only keep non-control validation indices
             indices_val = np.setdiff1d(indices_val, ctrl_indices, assume_unique=True)
 
@@ -348,7 +363,8 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
                 'batches': self.train_batches,
                 'max_cells_per_batch': self.max_cells_per_batch,
                 'max_classes_per_batch': self.max_classes_per_batch,
-                'ctrl_class': self.ctrl_class
+                'ctrl_class': self.ctrl_class,
+                'ctrl_frac': self.ctrl_frac
             })
         # Set validation loader
         self.val_loader_class = AnnDataLoader
@@ -361,7 +377,8 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
                 'batches': self.val_batches,
                 'max_cells_per_batch': self.max_cells_per_batch,
                 'max_classes_per_batch': self.max_classes_per_batch,
-                'ctrl_class': self.ctrl_class
+                'ctrl_class': self.ctrl_class,
+                'ctrl_frac': self.ctrl_frac
             })
 
     def train_dataloader(self):
