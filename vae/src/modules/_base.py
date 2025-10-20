@@ -1221,22 +1221,26 @@ class EmbeddingClassifier(nn.Module):
         class_embed_dim: int = 128,
         shared_projection_dim: int | None = None,
         skip_projection: bool = False,
-        use_cosine_similarity: bool = True,
-        temperature: float = 1.0,
         return_latents: bool = True,
+        cos_angular_margin: float | None = 0.1,
+        temperature: float = 0.1,
+        use_learnable_temperature: bool = True,
         mode: Literal["latent_to_class", "class_to_latent", "shared"] = "latent_to_class",
         **kwargs,
     ):
         super().__init__()
         self.logits = logits
-        self.use_cosine_similarity = use_cosine_similarity
         self.class_embed_dim = class_embed_dim
         self.n_labels = n_labels
-        self.temperature = temperature
         self.dropout_rate = dropout_rate
         self.return_latents = return_latents
         self.mode = mode
-
+        self.cos_angular_margin = cos_angular_margin
+        self._temperature = temperature
+        self.use_learnable_temperature = use_learnable_temperature
+        # Create a learnable temperature scaling
+        if use_learnable_temperature:
+            self._temperature = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
         # ---- Helper for building projections ---- #
         def build_projection(n_in: int, n_out: int) -> nn.Module:
             """Creates a projection block based on n_hidden/n_layers settings."""
@@ -1286,12 +1290,21 @@ class EmbeddingClassifier(nn.Module):
         # ---- Learnable class embeddings ---- #
         self.learned_class_embeds = nn.Parameter(torch.randn(n_labels, class_embed_dim))
 
-    def forward(self, x: torch.Tensor, class_embeds: torch.Tensor | None = None):
+    @property
+    def temperature(self) -> torch.Tensor:
+        if self.use_learnable_temperature:
+            # Calculate logit scale
+            return 1.0 / self._temperature.clamp(0, 4.6).exp()
+        else:
+            return self._temperature
+    
+    def forward(self, x: torch.Tensor, class_embeds: torch.Tensor | None = None, labels: torch.Tensor | None = None):
         """
         Parameters
         ----------
         x : Tensor, shape (batch, latent_dim)
         class_embeds : Optional[Tensor], shape (n_labels, embed_dim)
+        labels : Optional[Tensor], shape (batch,)
         """
         # Get class embeddings
         class_embeds = (
@@ -1305,17 +1318,20 @@ class EmbeddingClassifier(nn.Module):
             z = self.dropout(z)
 
         # Compute logits
-        if self.use_cosine_similarity:
-            z_norm = F.normalize(z, dim=-1)
-            c_norm = F.normalize(c, dim=-1)
-            logits = torch.matmul(z_norm, c_norm.T) / self.temperature
-            _z, _c = z_norm, c_norm
-        else:
-            logits = torch.matmul(z, c.T) / self.temperature
-            _z, _c = z, c
+        z_norm = F.normalize(z, dim=-1)
+        c_norm = F.normalize(c, dim=-1)
+        logits = torch.matmul(z_norm, c_norm.T)
 
+        # Scale by temperature and optionally enforce angular seperation
+        if labels is not None and self.cos_angular_margin is not None and self.cos_angular_margin > 0:
+            one_hot = F.one_hot(labels, num_classes=c.shape[0]).float()
+            logits = (logits - one_hot * self.cos_angular_margin) / self.temperature
+        else:
+            logits = logits / self.temperature
+        # Optionally return softmax
         output = logits if self.logits else F.softmax(logits, dim=-1)
-        return (output, _z, _c) if self.return_latents else output
+        # Return logits only or tuple of logits and latent spaces
+        return (output, z_norm, c_norm) if self.return_latents else output
 
 
 class Classifier(nn.Module):

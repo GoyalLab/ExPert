@@ -446,6 +446,34 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             return None
         cls_emb = F.normalize(cls_emb, dim=-1)
         return cls_emb @ cls_emb.T
+    
+    def _log_temperatures(self, batch_size: int | None = None):
+        # Log classifier temperature
+        if self.module.use_learnable_temperature:
+            # Check classifier temperature
+            if getattr(self.module, 'use_embedding_classifier', False):
+                self.log(
+                    "T_classifier_logit",
+                    self.module.classifier.temperature,
+                    on_epoch=True,
+                    batch_size=batch_size,
+                    prog_bar=False,
+                )
+            # Log other learnable temperatures
+            self.log(
+                "T_contrastive_z",
+                self.module.contr_temp,
+                on_epoch=True,
+                batch_size=batch_size,
+                prog_bar=False,
+            )
+            self.log(
+                "T_clip_z",
+                self.module.clip_temp,
+                on_epoch=True,
+                batch_size=batch_size,
+                prog_bar=False,
+            )
 
     def step(self, mode, batch, batch_idx):
         """Step for supervised training"""
@@ -525,13 +553,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
             prog_bar=False,
         )
-        self.log(
-            "logit_temperature",
-            1.0 / self.module.logit_scale.clamp(0, 4.6).exp(),
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=False,
-        )
+        # Log learnable temperatures if given
+        self._log_temperatures()
+        # Log other metrics
         self.compute_and_log_metrics(loss_output, self.train_metrics, "train")
         y = loss_output.true_labels.squeeze(-1)
         # Count occurrences of each class in this batch
