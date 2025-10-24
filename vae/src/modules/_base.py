@@ -13,6 +13,59 @@ from src.utils.constants import REGISTRY_KEYS
 from src.utils.common import to_tensor
 
 
+class MemoryQueue:
+    def __init__(
+            self,
+            dim: int,
+            n: int = 12, 
+            device: str = "cpu"
+        ):
+        self.size = int(n * dim)
+        self.dim = dim
+        self.device = device
+
+        self.queue_z = torch.zeros(self.size, dim, device=device)
+        self.queue_y = torch.full((self.size,), -1, dtype=torch.long, device=device)
+        self.ptr = 0
+        self.filled = False
+
+    @torch.no_grad()
+    def enqueue(self, z, y):
+        """Store normalized embeddings and labels."""
+        z = F.normalize(z, dim=-1)
+        b = z.size(0)
+        if b >= self.size:
+            # if batch larger than queue, keep most recent samples
+            self.queue_z = z[-self.size:].clone()
+            self.queue_y = y[-self.size:].clone()
+            self.ptr = 0
+            self.filled = True
+            return
+
+        end = self.ptr + b
+        if end > self.size:
+            overflow = end - self.size
+            self.queue_z[self.ptr:] = z[: b - overflow]
+            self.queue_y[self.ptr:] = y[: b - overflow]
+            self.queue_z[:overflow] = z[b - overflow :]
+            self.queue_y[:overflow] = y[b - overflow :]
+            self.ptr = overflow
+            self.filled = True
+        else:
+            self.queue_z[self.ptr:end] = z
+            self.queue_y[self.ptr:end] = y
+            self.ptr = end % self.size
+            if self.ptr == 0:
+                self.filled = True
+
+    def get(self):
+        """Return current queue contents."""
+        if not self.filled and self.ptr == 0:
+            return None, None
+        n = self.size if self.filled else self.ptr
+        return self.queue_z[:n].clone(), self.queue_y[:n].clone()
+
+
 class ExternalClassEmbedding(nn.Module):
     """External Class embedding. Can be a mix of static pre-trained embedding and learnable control embedding."""
     def __init__(
@@ -21,9 +74,11 @@ class ExternalClassEmbedding(nn.Module):
         cls_sim: torch.Tensor | None,
         ctrl_class_idx: int | None,
         use_control: bool = True,
+        device: str | None = None,
         **kwargs
     ):
         super().__init__()
+        self.device = device
         # Save class embedding
         self.cls_emb = F.normalize(to_tensor(cls_emb), dim=-1)
         # Calculate class similarities
@@ -55,17 +110,41 @@ class ExternalClassEmbedding(nn.Module):
             # Disable control embedding
             self.use_control_emb = False
 
-    def forward(self, device: int | str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, labels: torch.Tensor | None = None, n_negatives: int | None = None, device: int | str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         # Determine output device
-        _device = device if device is not None else self.cls_emb.device
+        _device = device if device is not None else self.device
         # Update control embedding and class similarities
         if self.use_control_emb:
             # Return static embedding + learnable control embedding
             self.cls_emb[self.ctrl_class_idx] = self.control_emb.squeeze(0)
             # Recalculate class similarities every time since control is changing
             self.cls_sim = self.cls_emb @ self.cls_emb.T
+        # Create local output parameters
+        cls_emb = self.cls_emb.to(device=_device)
+        cls_sim = self.cls_sim.to(device=_device)
+        # Subset to observed classes only
+        if labels is not None:
+            # Remove all class indices that are not observed during training
+            indices = torch.arange(self._ncls, device=labels.device)
+            is_observed_mask = torch.isin(indices, labels.unique())
+            # Randomly include negative labels
+            if n_negatives is not None and n_negatives > 0:
+                # Get number of total negatives
+                n_neg = min(n_negatives, (~is_observed_mask).sum().item())
+                # Get indices of unobserved classes
+                neg_indices = indices[~is_observed_mask]
+                # Randomly sample n_neg indices
+                neg_idx = torch.randperm(len(neg_indices))[:n_neg]
+                neg_samples = neg_indices[neg_idx]
+                # Add negative samples to observed mask
+                is_observed_mask[neg_samples.long()] = True
+            # Mask all other classes with zeros
+            cls_emb = F.normalize(cls_emb, dim=-1)
+            cls_emb = cls_emb * (is_observed_mask).float().unsqueeze(-1)
+            cls_sim = cls_sim * is_observed_mask.float().unsqueeze(0) * is_observed_mask.float().unsqueeze(1)
+
         # Move to device and return
-        return self.cls_emb.to(device=_device), self.cls_sim.to(device=_device)
+        return cls_emb, cls_sim
         
     @property
     def shape(self) -> tuple[int, int]:
@@ -1269,10 +1348,12 @@ class EmbeddingClassifier(nn.Module):
 
         # Latent --> Class embedding space projection
         if mode == "latent_to_class":
+            self.n_output = class_embed_dim
             self.latent_projection = build_projection(n_input, class_embed_dim)
             self.class_projection = nn.Identity()
         # Class embedding space --> latent space projection
         elif mode == "class_to_latent":
+            self.n_output = n_input
             self.latent_projection = nn.Identity()
             self.class_projection = build_projection(class_embed_dim, n_input)
         # Latent --> shared dim <-- Class embedding space
@@ -1281,6 +1362,7 @@ class EmbeddingClassifier(nn.Module):
                 shared_projection_dim = min(n_input, class_embed_dim)
             self.latent_projection = build_projection(n_input, shared_projection_dim)
             self.class_projection = build_projection(class_embed_dim, shared_projection_dim)
+            self.n_output = shared_projection_dim
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -1298,7 +1380,7 @@ class EmbeddingClassifier(nn.Module):
         else:
             return self._temperature
     
-    def forward(self, x: torch.Tensor, class_embeds: torch.Tensor | None = None, labels: torch.Tensor | None = None):
+    def forward(self, x: torch.Tensor, class_embeds: torch.Tensor | None = None, labels: torch.Tensor | None = None, noise_sigma: float | None = None, **kwargs):
         """
         Parameters
         ----------
@@ -1314,6 +1396,9 @@ class EmbeddingClassifier(nn.Module):
         # Apply projections
         z = self.latent_projection(x)               # (batch, d)
         c = self.class_projection(class_embeds)     # (n_labels, d)
+        # Add some noise to class embedding to avoid having a fixed point
+        if noise_sigma is not None and noise_sigma > 0:
+            c = c + noise_sigma * F.normalize((torch.rand_like(c) * 2 - 1), dim=-1)
         if self.dropout_rate > 0:
             z = self.dropout(z)
 
@@ -1403,6 +1488,8 @@ class Classifier(nn.Module):
             layers.append(nn.Softmax(dim=-1))
 
         self.classifier = nn.Sequential(*layers)
+        # Number of output dimensions
+        self.n_output = n_labels
 
     def forward(self, x, *args, **kwargs):
         """Forward computation."""

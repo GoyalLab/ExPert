@@ -1,9 +1,9 @@
 from typing import Iterable
 
-from src.modules._base import Classifier, EmbeddingClassifier, Encoder, DecoderSCVI, ExternalClassEmbedding
+from src.modules._base import Classifier, EmbeddingClassifier, Encoder, DecoderSCVI, ExternalClassEmbedding, MemoryQueue
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
 from src.utils.distributions import rescale_targets
-from src.utils.common import pearson, BatchCache, GradientReversalFn
+from src.utils.common import pearson, Cache, GradientReversalFn
 
 from typing import Iterable
 
@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from scvi.data import _constants
+from scvi.data._constants import ADATA_MINIFY_TYPE
 from scvi.module.base import (
     LossOutput,
     auto_move_data,
@@ -85,6 +86,7 @@ class JEDVAE(VAE):
         use_kl_control: bool = False,                                       # Use control cells for KL loss
         use_classification_control: bool = False,                           # Try to classify control cells
         use_contrastive_control: bool = True,                               # Use control cells as negatives in contrastive loss
+        clip_memory_n: int | None = 0,
         context_classifier_layers: int = 2,
         context_classifier_n_hidden: int = 256,
         contrastive_temperature: float = 0.1,
@@ -151,7 +153,7 @@ class JEDVAE(VAE):
         if use_learnable_temperature:
             self.contr_logit_scale = torch.nn.Parameter(torch.log(torch.tensor(1.0 / init_t)))
             self.clip_logit_scale = torch.nn.Parameter(torch.log(torch.tensor(1.0 / init_t)))
-        
+            self.proxy_logit_scale = torch.nn.Parameter(torch.log(torch.tensor(1.0 / init_t)))
         # Setup an adversion context classifier
         self.use_adversial_context_cls = use_adversial_context_cls
         # Setup learnable control embedding
@@ -169,7 +171,8 @@ class JEDVAE(VAE):
                 cls_emb=cls_emb, 
                 cls_sim=cls_sim, 
                 ctrl_class_idx=ctrl_class_idx, 
-                use_control=use_learnable_control_emb
+                use_control=use_learnable_control_emb,
+                device=self.device
             )
             logging.info(f'Registered class embedding with shape: {self.class_embedding.shape}, using control: {use_learnable_control_emb}')
         else:
@@ -249,11 +252,16 @@ class JEDVAE(VAE):
                 dropout_rate=0.1,
                 logits=True,
             )
-
+        # Initialize memory queue for clip loss
+        self.clip_memory_n = clip_memory_n
+        if clip_memory_n is not None and clip_memory_n > 0:
+            self.clip_memory = MemoryQueue(dim=self.classifier.n_output, n=clip_memory_n)
+        else:
+            self.clip_memory = None
         # Debug
         self.use_cache = False
         self._step = 0
-        self.cache = BatchCache(10)
+        self.cache = Cache(10)
 
     @property
     def contr_temp(self) -> torch.Tensor:
@@ -270,19 +278,66 @@ class JEDVAE(VAE):
             return 1.0 / self.clip_logit_scale.clamp(0, 4.6).exp()
         else:
             return self.contrastive_temperature
+        
+    @property
+    def proxy_temp(self) -> torch.Tensor:
+        # Calculate logit scale
+        if self.use_learnable_temperature:
+            return 1.0 / self.proxy_logit_scale.clamp(0, 4.6).exp()
+        else:
+            return self.contrastive_temperature
+        
+    def freeze_vae_base(self) -> None:
+        """Freeze encoder and decoder module"""
+        self.freeze_module('z_encoder')
+        self.freeze_module('decoder')
+        
+    def freeze_module(self, key: str) -> None:
+        """Freeze a given module like encoder or decoder"""
+        module = getattr(self, key)
+        # Can't freeze what we don't have
+        if module is None or not isinstance(module, torch.nn.Module):
+            return
+        # Set module to eval mode
+        module.eval()
+        # Disable gradient flow for all module parameters
+        for param in module.parameters():
+            param.requires_grad = False
+        # Label the module as frozen
+        module.frozen = True
 
     def _get_inference_input(
         self,
         tensors: dict[str, torch.Tensor | None],
+        full_forward_pass: bool = False,
     ) -> dict[str, torch.Tensor | None]:
         """Get input tensors for the inference process."""
-        return {
-            MODULE_KEYS.X_KEY: tensors[REGISTRY_KEYS.X_KEY],
-            MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
-            MODULE_KEYS.G_EMB_KEY: tensors.get(REGISTRY_KEYS.GENE_EMB_KEY, None),
-            MODULE_KEYS.CONT_COVS_KEY: tensors.get(REGISTRY_KEYS.CONT_COVS_KEY, None),
-            MODULE_KEYS.CAT_COVS_KEY: tensors.get(REGISTRY_KEYS.CAT_COVS_KEY, None),
-        }
+        if full_forward_pass or self.minified_data_type is None:
+            loader = "full_data"
+        elif self.minified_data_type in [
+            ADATA_MINIFY_TYPE.LATENT_POSTERIOR,
+            ADATA_MINIFY_TYPE.LATENT_POSTERIOR_WITH_COUNTS,
+        ]:
+            loader = "minified_data"
+        else:
+            raise NotImplementedError(f"Unknown minified-data type: {self.minified_data_type}")
+        # Do full forward pass
+        if loader == "full_data":
+            return {
+                MODULE_KEYS.X_KEY: tensors[REGISTRY_KEYS.X_KEY],
+                MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
+                MODULE_KEYS.G_EMB_KEY: tensors.get(REGISTRY_KEYS.GENE_EMB_KEY, None),
+                MODULE_KEYS.CONT_COVS_KEY: tensors.get(REGISTRY_KEYS.CONT_COVS_KEY, None),
+                MODULE_KEYS.CAT_COVS_KEY: tensors.get(REGISTRY_KEYS.CAT_COVS_KEY, None),
+            }
+        # Perform a cached forward passed with minified model
+        else:
+            return {
+                MODULE_KEYS.QZM_KEY: tensors[REGISTRY_KEYS.LATENT_QZM_KEY],
+                MODULE_KEYS.QZV_KEY: tensors[REGISTRY_KEYS.LATENT_QZV_KEY],
+                REGISTRY_KEYS.OBSERVED_LIB_SIZE: tensors[REGISTRY_KEYS.OBSERVED_LIB_SIZE],
+            }
+
     
     @auto_move_data
     def _regular_inference(
@@ -356,6 +411,7 @@ class JEDVAE(VAE):
         class_embeds: torch.Tensor | None = None,
         inference_outputs: dict[str, torch.Tensor] | None = None,
         labels: torch.Tensor | None = None,
+        noise_sigma: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass through the encoder and classifier.
 
@@ -388,7 +444,7 @@ class JEDVAE(VAE):
         z = qz.loc if use_posterior_mean else z
 
         # Classify based on x and class external embeddings if provided
-        return self.classifier(z, class_embeds=class_embeds, labels=labels)
+        return self.classifier(z, class_embeds=class_embeds, labels=labels, noise_sigma=noise_sigma)
     
     def _class_similarity_loss(
         self,
@@ -571,6 +627,49 @@ class JEDVAE(VAE):
             loss = F.cross_entropy(sim_logits, y, reduction=reduction)
 
         return loss
+    
+    def _clip_loss_z2c(
+            self,
+            z: torch.Tensor, 
+            y: torch.Tensor, 
+            logits: torch.Tensor,
+        ):
+        """
+        z: (batch, d)
+        y: (batch,)
+        logits: (batch, num_classes)
+        cls_emb: (num_classes, d)
+        T: scalar
+        """
+
+        z = F.normalize(z, dim=-1)
+        loss_z2c = F.cross_entropy(logits, y, reduction='none')
+
+        # No memory registered, return default loss
+        if self.clip_memory is None:
+            return loss_z2c
+        
+        # Get classification temperature
+        T_cls = self.classifier.temperature
+        # Extend with similarities to queued latents (negatives)
+        q_z, q_y = self.clip_memory.get()
+        if q_z is not None:
+            q_z = F.normalize(q_z, dim=-1)
+            logits_queue = (z @ q_z.T) / T_cls
+            # Mask same-class queue entries -> don't treat as negatives
+            same_class_mask = (y.unsqueeze(1) == q_y.unsqueeze(0)).float()
+            logits_queue = logits_queue - 1e9 * same_class_mask  # -inf for same-class queue items
+
+            # Concatenate negatives
+            logits = torch.cat([logits, logits_queue], dim=-1)
+        # CE vs true class labels
+        loss_z2c = F.cross_entropy(logits, y, reduction='none')
+
+        # Update queue (no grad)
+        with torch.no_grad():
+            self.clip_memory.enqueue(z.detach(), y.detach())
+
+        return loss_z2c
 
     def _sym_contrastive_classification_loss(
         self,
@@ -579,6 +678,11 @@ class JEDVAE(VAE):
         y: torch.Tensor,
         cls_emb: torch.Tensor,
         reduction: str = 'mean',
+        lambda_proxy: float = 0.5,
+        lambda_energy: float = 0.3,
+        margin: float = 0.1,
+        proxy_margin: float = 0.1,
+        return_loss_dict: bool = True,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -597,6 +701,11 @@ class JEDVAE(VAE):
         """
         # Get model temperature
         T = self.clip_temp
+        # Set reduction method
+        if reduction == 'mean':
+            red_fn = torch.mean
+        else:
+            red_fn = torch.sum
         # Normalize
         z = F.normalize(z, dim=-1)
         cls_emb = F.normalize(cls_emb, dim=-1)
@@ -612,14 +721,35 @@ class JEDVAE(VAE):
         loss_c2z = F.cross_entropy(logits_c2z, labels_c2z, reduction='none')
 
         # Symmetric loss per sample
-        loss_per_sample = 0.5 * (loss_z2c + loss_c2z)
+        clip_loss_per_sample = 0.5 * (loss_z2c + loss_c2z)
+        clip_loss = red_fn(clip_loss_per_sample)
+        loss_z2c_red = red_fn(loss_z2c)
+        loss_c2z_red = red_fn(loss_c2z)
 
-        if reduction is None or reduction == 'none':
-            return loss_per_sample
-        elif reduction == 'mean':
-            return loss_per_sample.mean(-1)
+        # Use Proxy Anchor
+        y_oh = F.one_hot(y, num_classes=cls_emb.size(0)).float()
+        # Positive and negative anchors
+        pos_term = torch.log1p(torch.exp(-self.proxy_temp * (logits[y_oh.bool()] - proxy_margin))).mean()
+        neg_term = torch.log1p(torch.exp(self.proxy_temp * (logits[~y_oh.bool()] + proxy_margin))).mean()
+        loss_proxy = pos_term + neg_term
+
+        # Energy-based ranking
+        pos_sim = torch.sum(z * chosen, dim=-1)  # (B,), How similar is each sample to its embedding overall
+        pos_mask = (y==torch.arange(cls_emb.shape[0], device=y.device).reshape(-1, 1)).sum(-1)
+        neg_sim, _ = (z @ cls_emb[~pos_mask].T).max(dim=-1)     # Hardest negative per sample
+        energy_loss_per_sample = F.softplus(margin - pos_sim + neg_sim).mean(-1)
+        energy_loss = red_fn(energy_loss_per_sample)
+
+        # Combine final loss
+        loss = clip_loss \
+           + lambda_proxy * loss_proxy \
+           + lambda_energy * energy_loss
+
+        # Return full loss dict
+        if return_loss_dict:
+            return loss, {'clip_z2c': loss_z2c_red, 'clip_c2z': loss_c2z_red, 'proxy': loss_proxy, 'energy': energy_loss}
         else:
-            return loss_per_sample.sum(-1)
+            return loss
         
     def _kl_classification_loss(
         self,
@@ -673,11 +803,12 @@ class JEDVAE(VAE):
         cls_sim: torch.Tensor | None = None,
         target_scale: float = 4.0,
         **kwargs
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         # Get class weights
         cw = self.class_weights.to(device=y.device) if self.class_weights is not None else None
         # Collect classification losses
         ce_loss = torch.tensor(0.0)
+        full_loss_dict = {}
         # These functions all return losses for each cell (b,1)
         for cls_strategy in self.cls_strategies:
             # Determine which loss to use
@@ -688,7 +819,8 @@ class JEDVAE(VAE):
             elif cls_strategy == 'kl' and cls_emb is not None:
                 _ce_loss = self._kl_classification_loss(logits, y, class_sim=cls_sim, target_scale=target_scale, **kwargs)
             elif cls_strategy == 'symmetric_contrastive':
-                _ce_loss = self._sym_contrastive_classification_loss(z=z, logits=logits, y=y, cls_emb=cls_emb, **kwargs)
+                _ce_loss, _loss_dict = self._sym_contrastive_classification_loss(z=z, logits=logits, y=y, cls_emb=cls_emb, **kwargs)
+                full_loss_dict.update(_loss_dict)
             else:
                 raise ValueError(f'Invalid classification strategy {cls_strategy}')
             # Combine losses
@@ -698,14 +830,14 @@ class JEDVAE(VAE):
             ce_loss = ce_loss / len(self.cls_strategies)
         # Apply reduction over the batch to produce a single value
         if reduction == 'mean' or reduction == 'batchmean':
-            return ce_loss.mean()
+            loss = ce_loss.mean()
         elif reduction == 'sum':
-            return ce_loss.sum()
-        # Return the entire batch loss if needed
-        elif reduction in (None, 'none'):
-            return ce_loss
+            loss = ce_loss.sum()
         else:
             raise ValueError(f'Invalid reduction: {reduction}')
+        # Return loss dict
+        full_loss_dict['ce_loss'] = loss
+        return full_loss_dict
 
     @auto_move_data
     def classification_loss(
@@ -720,8 +852,9 @@ class JEDVAE(VAE):
         reduction: str = 'mean',
         target_scale: float = 4.0,
         ctrl_mask: torch.Tensor | None = None,
+        noise_sigma: float | None = 1e-2,
         **kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor | None]:
         x = labelled_dataset[REGISTRY_KEYS.X_KEY]  # (n_obs, n_vars)
         y = labelled_dataset[REGISTRY_KEYS.LABELS_KEY]  # (n_obs, 1)
         batch_idx = labelled_dataset[REGISTRY_KEYS.BATCH_KEY]
@@ -779,7 +912,8 @@ class JEDVAE(VAE):
             use_posterior_mean=use_posterior_mean,
             class_embeds=_cls_emb,
             inference_outputs=_inference_outputs,
-            labels=_y
+            labels=_y,
+            noise_sigma=noise_sigma
         )  # (n_obs, n_labels)
         if self.use_embedding_classifier:
             # Unpack embedding projections
@@ -788,7 +922,7 @@ class JEDVAE(VAE):
             # Set embeddings to z, TODO: set to None or empty tensors?
             logits, cz, ez = cls_output, x, x
         # Calculate classification loss from logits and true labels
-        ce_loss = self._calc_classification_loss(
+        ce_loss_dict = self._calc_classification_loss(
             z=cz,
             logits=logits, 
             y=_y, 
@@ -812,7 +946,7 @@ class JEDVAE(VAE):
             )
         else:
             align_loss = None
-        return ce_loss, _y, logits, align_loss
+        return ce_loss_dict, _y, logits, align_loss
 
     # L regularization function
     def l_regularization(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -833,8 +967,10 @@ class JEDVAE(VAE):
         labelled_tensors: dict[str, torch.Tensor],
         reduction: str = 'mean',
         scale_by_temperature: bool = False,
+        use_context_mask: bool = False,
         ctrl_mask: torch.Tensor | None = None,
         ctrl_scale: float | None = None,
+        lambda_neg: float | None = 0.2,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -865,8 +1001,17 @@ class JEDVAE(VAE):
         # Self mask
         self_mask = torch.eye(len(labels), device=z.device)
 
-        # Positives: same class but different context
-        pos_mask = same_class * (1 - same_context) * (1 - self_mask)
+        # Positives: same class but not same cells
+        pos_mask = same_class * (1 - self_mask)
+        # Positives: Only enforce different contexts if classes have multiple contexts available
+        if use_context_mask:
+            # Get number of contexts per class
+            n_contexts_per_class = torch.zeros(labels.max() + 1, device=z.device)
+            for label in labels.unique():
+                n_contexts_per_class[label] = contexts[labels == label].unique().numel()
+            # Only filter different contexts for classes with multiple contexts
+            has_multiple_contexts = n_contexts_per_class[labels] > 1
+            pos_mask = pos_mask * (1 - same_context * has_multiple_contexts.unsqueeze(1))
         
         # Use control cells as negatives only, don't try to pull control cells together
         if ctrl_mask is not None:
@@ -886,6 +1031,25 @@ class JEDVAE(VAE):
         
         # Final loss is negative log likelihood
         loss = -mean_log_prob_pos
+        # Remove control 0s
+        loss = loss[loss>0]
+
+        # --- Optional explicit negative term ---
+        if lambda_neg is not None and lambda_neg > 0:
+            neg_loss = 0.0
+            neg_mask = (1 - same_class) * (1 - self_mask)
+            # Leave out control cells for this loss
+            if ctrl_mask is not None:
+                neg_mask_ctrl = neg_mask * ctrl_mask.float().unsqueeze(0)
+                sim_neg = logits * neg_mask_ctrl
+            else:
+                sim_neg = logits * neg_mask
+            # Only keep valid pairs
+            valid_neg = sim_neg[sim_neg != 0]
+            if valid_neg.numel() > 0:
+                neg_loss = F.logsigmoid(-valid_neg).mean()
+            # Combine
+            loss = loss + lambda_neg * (-neg_loss)
 
         # Optional gradient rescaling — counteracts ∂L/∂z ∝ 1/τ
         if scale_by_temperature:
@@ -1002,14 +1166,17 @@ class JEDVAE(VAE):
         classification_ratio: float | None = None,
         alignment_loss_weight: float | None = None,
         contrastive_loss_weight: float | None = None,
-        class_kl_temperature: float = 0.1,
         target_scale: float = 4.0,
         adversarial_context_lambda: float = 0.1,
         use_posterior_mean: bool = True,
         use_ext_emb: bool = True,
         use_cls_scores: bool = True,
+        observed_only: bool = False,
+        n_negatives: int | None = None,
         **kwargs,
     ) -> LossOutput:
+        # ---- DEBUG ----
+        self._step = self._step + 1
         """Compute the loss."""
         from torch.distributions import kl_divergence
 
@@ -1026,9 +1193,10 @@ class JEDVAE(VAE):
         # Get external class embedding if specified
         cls_emb, cls_sim = None, None
         if use_ext_emb and self.class_embedding is not None:
+            # Filter class embedding for batch classes or not
+            _l = l if observed_only else None
             # Get class embedding and similarities
-            cls_emb, cls_sim = self.class_embedding(device=x.device)
-        
+            cls_emb, cls_sim = self.class_embedding(labels=_l, n_negatives=n_negatives, device=x.device)
         # Compute basic kl divergence between prior and posterior x distributions
         kl_divergence_z_mat = kl_divergence(qz, pz)
         # Calculate reconstruction loss over batch and all features
@@ -1100,7 +1268,7 @@ class JEDVAE(VAE):
             extra_metrics['contrastive_loss'] = contr_loss
         # Add classification based losses
         if classification_ratio is not None and classification_ratio > 0:
-            ce_loss, true_labels, logits, align_loss = self.classification_loss(
+            ce_loss_dict, true_labels, logits, align_loss = self.classification_loss(
                 labelled_dataset=tensors, 
                 inference_outputs=inference_outputs,
                 use_posterior_mean=use_posterior_mean,
@@ -1113,6 +1281,8 @@ class JEDVAE(VAE):
                 reduction=self.non_elbo_reduction,
                 **kwargs
             )
+            # Get main classification loss
+            ce_loss = ce_loss_dict.pop('ce_loss')
             # Add z classification loss to overall loss
             total_loss = total_loss + ce_loss * classification_ratio
             
@@ -1122,6 +1292,8 @@ class JEDVAE(VAE):
                 'true_labels': true_labels,
                 'logits': logits,
             })
+            # Add extra classification losses
+            extra_metrics.update(ce_loss_dict)
             # Add alignment loss if it has been calculated
             if align_loss is not None:
                 extra_metrics['alignment_loss'] = align_loss

@@ -81,16 +81,16 @@ def to_tensor(m: sp.csr_matrix | torch.Tensor | np.ndarray | pd.DataFrame | None
         return m
     raise ValueError(f'{m.__class__} is not compatible. Should be either sp.csr_matrix, np.ndarray, or torch.Tensor.')
 
-class BatchCache:
-    def __init__(self, batch_size: int):
+class Cache:
+    def __init__(self, n: int):
         self.data = []
-        self.maxlen = batch_size
+        self.n = n
     
-    def append(self, x):
-        if len(self.data) > self.maxlen:
-            self.data = [x]
+    def append(self, x: torch.Tensor):
+        if len(self.data) > self.n:
+            self.data = [x.detach()]
         else:
-            self.data.append(x)
+            self.data.append(x.detach())
 
 class GradientReversalFn(torch.autograd.Function):
     @staticmethod

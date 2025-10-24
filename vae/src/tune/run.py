@@ -39,6 +39,7 @@ def parse_args():
     parser.add_argument('--test', type=str, default=None, help='Path to h5ad test file (test split)')
     parser.add_argument('--config', type=str, required=True, help='config.yaml file that specififes hyperparameters for training')
     parser.add_argument('--outdir', type=str, default=None, help='Output directory, default is config file directory')
+    parser.add_argument('--test_unseen', action='store_true', help='Test model on unseen perturbations')
     return parser.parse_args()
 
 def generate_random_configs(space: dict, n_samples: int | None = None, fixed_weights: bool = True, seed: int | None = None):
@@ -112,7 +113,7 @@ def recursive_update(d: dict, u: dict) -> dict:
             d[k] = v
     return d
 
-def sample_configs(space: dict, src_config: dict, N: int = 10, base_dir: str | None = None):
+def sample_configs(space: dict, src_config: dict, N: int = 10, base_dir: str | None = None, verbose: bool = False):
     # Sample configs
     space_configs, config_paths = [], []
     for i, sample in enumerate(generate_random_configs(space, n_samples=N, seed=42)):
@@ -128,7 +129,8 @@ def sample_configs(space: dict, src_config: dict, N: int = 10, base_dir: str | N
         os.makedirs(run_dir, exist_ok=True)
         conf_out = os.path.join(run_dir, 'config.yaml')
         config_paths.append(conf_out)
-        logging.info(f'Saving run config to {conf_out}')
+        if verbose:
+            logging.info(f'Saving run config to {conf_out}')
         with open(conf_out, 'w') as f:
             yaml.dump(merged_config, f, sort_keys=False)
 
@@ -145,6 +147,7 @@ def _train(
         cls_label: str = 'cls_label',
         batch_key: str = 'dataset',
         verbose: bool = False,
+        **train_kwargs
     ) -> tuple[nn.Module, pd.DataFrame, ad.AnnData]:
     logging.info(f'Reading training data from: {adata_p}')
     model_set = sc.read(adata_p)
@@ -198,10 +201,10 @@ def _train(
     # Train the model
     logging.info(f'Running at: {step_model_dir}')
     model.train(
-        data_params=config[CONF_KEYS.DATA].copy(), 
-        model_params=config[CONF_KEYS.MODEL].copy(), 
-        train_params=config[CONF_KEYS.TRAIN].copy(), 
-        return_runner=False
+        data_params=config[CONF_KEYS.DATA].copy(),
+        model_params=config[CONF_KEYS.MODEL].copy(),
+        train_params=config[CONF_KEYS.TRAIN].copy(),
+        **train_kwargs
     )
     # Save results to lightning directory
     results, latent = get_model_results(
@@ -654,8 +657,9 @@ def test(
         control_neighbor_threshold: float = 0.0,
         min_ms: float = 4.0,
         min_cpp: int = 10,
-        plot: bool = False,
+        plot: bool = True,
         return_results: bool = False,
+        update_latent: bool = False,
         verbose: bool = True
     ):
     logging.info(f'Testing model with: {test_adata_p}')
@@ -676,8 +680,9 @@ def test(
     logging.info(f'Evaluating results for test set. Test output dir: {test_out_dir}')
     top_n_predictions = evaluate_predictions(test_ad, predictions, train_perturbations, output_dir=test_out_dir, plot=plot, groupby=orig_batch_key)
     # Update latent representation and calculate new umaps
-    logging.info(f'Updating latent space with test data.')
-    update_latent(model, test_ad=test_ad, output_dir=test_out_dir, version_dir=output_dir, incl_unseen=incl_unseen, batch_key=batch_key, orig_group_key=orig_batch_key)
+    if update_latent:
+        logging.info(f'Updating latent space with test data.')
+        update_latent(model, test_ad=test_ad, output_dir=test_out_dir, version_dir=output_dir, incl_unseen=incl_unseen, batch_key=batch_key, orig_group_key=orig_batch_key)
     if return_results:
         return top_n_predictions, test_ad
 
@@ -692,6 +697,8 @@ def full_run(
     ) -> dict:
     # Get config name
     config_name = os.path.basename(config_p).replace('.yaml', '')
+    # Set default model output to config directory
+    model_dir = model_dir if model_dir is not None else os.path.dirname(config_p)
     # Train model with loaded config file
     train_output = train(adata_p=train_p, config_p=config_p, out_dir=model_dir, **kwargs)
     # Try to load best checkpoint
@@ -702,6 +709,10 @@ def full_run(
         )
     else:
         model = train_output[TRAINING_KEYS.MODEL_KEY]
+    # Do not test model
+    if test_p is None or not os.path.exists(test_p):
+        logging.info(f'Skipping model test since no valid test path is provided.')
+        return None
     # Test model with specified test set
     top_n_predictions, _ = test(
         model=model,
@@ -765,12 +776,5 @@ def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.M
 if __name__ == '__main__':
     # Parse cmd line args
     args = parse_args()
-    # Train model
-    train_output = train(adata_p=args.input, config_p=args.config, out_dir=args.outdir)
-    # Get training results
-    version_dir = train_output[TRAINING_KEYS.OUTPUT_KEY]
-    model = train_output[TRAINING_KEYS.MODEL_KEY]
-    # Test model performance if path is given
-    if args.test is not None and os.path.exists(args.test) and args.test.endswith('.h5ad'):
-        logging.info(f'Testing with: {args.test}')
-        test(model, test_adata_p=args.test, output_dir=version_dir, plot=True)
+    # Full model run
+    full_run(config_p=args.config, train_p=args.input, model_dir=args.outdir, test_p=args.test, test_unseen=args.test_unseen)

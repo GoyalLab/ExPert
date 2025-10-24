@@ -272,23 +272,24 @@ class ContrastiveBatchSampler:
                 b: set(self.ctrl_indices[self.batch_labels[self.cls_labels == self.ctrl_class] == b])
                 for b in self.unique_batches
             }
-            # remove empty contexts
+            # remove empty control contexts
             self.ctrl_pools = {b: pool for b, pool in self.ctrl_pools.items() if len(pool) > 0}
             # Set some control specific parameters
-            n_contexts = len(self.ctrl_pools)
-
-            n_ctrl = self.batch_size * self.ctrl_frac
-            self.n_ctrl_per_ctx = int(np.ceil(n_ctrl / n_contexts))
-            self.n_ctrl = int(self.n_ctrl_per_ctx * n_contexts)
+            n_ctrl_contexts = len(self.ctrl_pools)
+            # Save specifics about control batching if we have have control cells available
+            if n_ctrl_contexts > 0:
+                n_ctrl = self.batch_size * self.ctrl_frac
+                self.n_ctrl_per_ctx = int(np.ceil(n_ctrl / n_ctrl_contexts))
+                self.n_ctrl = int(self.n_ctrl_per_ctx * n_ctrl_contexts)
+            # Disable control cell batching if none are found
+            else:
+                self.n_ctrl_per_ctx = 0
+                self.n_ctrl = 0
 
             # remove control indices from normal sampling
             self.indices = self.indices[~ctrl_mask]
             self.cls_labels = self.cls_labels[~ctrl_mask]
             self.batch_labels = self.batch_labels[~ctrl_mask]
-        else:
-            self.ctrl_indices = np.array([])
-            self.ctrl_pools = {}
-            self.n_ctrl_per_ctx = 0
 
         # --- build pools for non-control classes
         self.cells_per_class = self.cls_labels.value_counts()

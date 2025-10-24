@@ -10,6 +10,8 @@ from typing import List
 import scipy.sparse as sp
 import torch.nn as nn
 
+from scvi.data._utils import _get_adata_minify_type
+
 from src.utils.constants import MODULE_KEYS
 
 
@@ -128,13 +130,42 @@ def get_classification_report(latent: ad.AnnData, cls_label: str, mode: str, pre
     summary['mode'] = mode
     return summary, report_data
 
-def plot_performance_support_corr(summary: pd.DataFrame, o: str):
+def plot_performance_support_corr(summary: pd.DataFrame, o: str, hue: str | None = None):
     if summary['f1-score'].min() == summary['f1-score'].max():
-        logging.info(f'Got uniform values for f1-score, cannot plot kde for mode {summary["mode"].unique()[0]}.')
+        msg = f'Got uniform values for f1-score'
+        if hue and hue in summary.columns:
+            msg += f', cannot plot kde for mode {summary[hue].unique()[0]}.'
+        logging.info(msg)
         return
-    sns.kdeplot(summary, x='log_count', y='f1-score', hue='mode')
+
+    plt.figure(figsize=(6, 5))
+
+    # KDE plot
+    sns.kdeplot(
+        data=summary,
+        x='log_count',
+        y='f1-score',
+        hue=hue,
+        fill=True,
+        common_norm=False,
+        alpha=0.4
+    )
+
+    # Scatter plot
+    sns.scatterplot(
+        data=summary,
+        x='log_count',
+        y='f1-score',
+        hue=hue,
+        edgecolor='black',
+        alpha=0.7,
+        s=40,
+        legend=(hue is not None)  # only show legend if hue is used
+    )
+
     plt.xlabel('Class support (log)')
     plt.ylabel('Macro f1-score')
+    plt.tight_layout()
     plt.savefig(o, dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -241,13 +272,13 @@ def plot_model_results_mode(latent: ad.AnnData, mode: str, batch_key: str, cls_l
         plt.close()
         # plot confusion matrix
         if cl != batch_key and cm:
-            cm_p = os.path.join(plt_dir, f'{mode}_cm_{cl}.svg')
+            cm_p = os.path.join(plt_dir, f'{mode}_cm_{cl}.png')
             yt = latent.obs[cl]
             yp = latent.obs[MODULE_KEYS.PREDICTION_KEY].str.split(';').str[i]
             plot_confusion(yt, yp, plt_file=cm_p)
     if cm:
         # plot confusion matrix for exact label
-        cm_p = os.path.join(plt_dir, f'{mode}_cm_cls_label.svg')
+        cm_p = os.path.join(plt_dir, f'{mode}_cm_cls_label.png')
         yt = latent.obs['cls_label']
         yp = latent.obs[MODULE_KEYS.PREDICTION_KEY]
         plot_confusion(yt, yp, plt_file=cm_p)
@@ -366,6 +397,7 @@ def get_model_results(
         cls_labels: list[str], 
         log_dir: str, 
         modes: list[str] = ['train', 'val'], 
+        batch_label: str = 'dataset',
         test_adata: ad.AnnData | None = None,
         save: bool = True, 
         plot: bool = False,
@@ -378,6 +410,9 @@ def get_model_results(
     os.makedirs(plt_dir, exist_ok=True)
     # Save model itself
     if save:
+        # Always save adata if it has been minified, else fall back to given option
+        minified_type = _get_adata_minify_type(model.adata)
+        save_ad = True if minified_type is not None else save_ad
         model.save(dir_path=os.path.join(version_dir, 'model'), save_anndata=save_ad, overwrite=True)
     # plot for each mode
     summaries = []
@@ -401,7 +436,7 @@ def get_model_results(
         if plot:
             calc_umap(latent)
             plot_model_results_mode(latent, mode, batch_key, cls_labels, plt_dir)
-            plot_performance_support_corr(class_report, os.path.join(plt_dir, f'{mode}_support_corr.svg'))
+            plot_performance_support_corr(class_report, hue=None, o=os.path.join(plt_dir, f'{mode}_support_corr.svg'))
             soft_predictions_mode = plot_soft_predictions(model, data=mode_data, soft_predictions=soft_pred, mode=mode, plt_dir=plt_dir)
             soft_predictions.append(soft_predictions_mode)
             if 'zg' in latent.obsm:

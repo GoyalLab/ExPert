@@ -14,8 +14,6 @@ from scvi.train._constants import METRIC_KEYS
 from typing import Literal, Any
 from collections import defaultdict
 
-import logging
-
 
 def _sigmoid_schedule(t, T, k):
     if T == 0:
@@ -160,8 +158,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         incl_n_unseen: int | None = None,
         anneal_schedules: dict[str, dict[str | float]] | None = None,
         full_val_log_every_n_epoch: int = 10,
-        use_contr_in_val: bool = False,
+        use_contrastive_loader: Literal["train", "val", "both"] | None = "train",
         multistage_kl_frac: float = 0.1,
+        # Caching options
+        cache_n_epochs: int | None = 1,
         **loss_kwargs,
     ):
         super().__init__(
@@ -197,7 +197,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.log_class_distribution = log_class_distribution
         self.freeze_encoder_epoch = freeze_encoder_epoch
         self.encoder_freezed = False
-        self.use_contr_in_val = use_contr_in_val
+        self.use_contrastive_loader = use_contrastive_loader
         # Misc
         self.average = average                                                      # How to reduce the classification metrics
         self.top_k = top_k                                                          # How many top predictions to consider for metrics
@@ -209,8 +209,60 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.train_class_counts = []
         self.class_batch_counts = defaultdict(list)
         self.observed_classes = set()
-        # Cache
+        # ----- Cache -----
         self.cache = {}
+        # Cache for embeddings and metadata within epoch
+        self.epoch_cache = {
+            'train': defaultdict(list),
+            'val': defaultdict(list)
+        }
+        # Cache for historical data across epochs TODO: implement properly
+        self.history_cache = {
+            'train': defaultdict(list),
+            'val': defaultdict(list)
+        }
+        # Save n epochs in cache
+        self.cache_n_epochs = cache_n_epochs
+
+    def _cache_step_data(self, mode: str, batch: dict, inference_outputs: dict, loss_output: LossOutput):
+        """Cache data from a single step."""
+        # Only cache every n epoch
+        if self.full_val_log_every_n_epoch > 0 and self.current_epoch % self.full_val_log_every_n_epoch == 0:
+            self.epoch_cache[mode]['embeddings'].append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
+            self.epoch_cache[mode]['labels'].append(loss_output.true_labels.cpu())
+            self.epoch_cache[mode]['covs'].append(batch[REGISTRY_KEYS.BATCH_KEY].cpu())
+            if loss_output.logits is not None:
+                self.epoch_cache[mode]['predicted_labels'].append(torch.argmax(loss_output.logits, dim=-1).cpu())
+                self.epoch_cache[mode]['logits'].append(loss_output.logits.cpu())
+
+    def _process_epoch_cache(self, mode: str) -> dict[str, np.ndarray]:
+        """Process and clear the epoch cache, returning concatenated arrays."""
+        cache = self.epoch_cache[mode]
+        if not cache:
+            return {}
+            
+        # Concatenate all cached tensors
+        processed = {
+            'embeddings': torch.cat(cache['embeddings'], dim=0).numpy(),
+            'labels': torch.cat(cache['labels'], dim=0).numpy().squeeze(),
+            'covs': torch.cat(cache['covs'], dim=0).numpy().squeeze(),
+        }
+        
+        if cache.get('predicted_labels', []):
+            processed['predicted_labels'] = torch.cat(cache['predicted_labels'], dim=0).numpy().squeeze()
+            processed['logits'] = torch.cat(cache['logits'], dim=0).numpy().squeeze()
+        
+        # Add to historical cache
+        for k, v in processed.items():
+            self.history_cache[mode][k].append(v)
+            # Keep only last N epochs
+            if len(self.history_cache[mode][k]) > self.cache_n_epochs:
+                self.history_cache[mode][k].pop(0)
+        
+        # Clear epoch cache
+        self.epoch_cache[mode].clear()
+        
+        return processed
 
     def _get_stall_epochs(self) -> dict[str, int]:
         stalls = {'kl': 0}
@@ -484,7 +536,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.loss_kwargs.update({"kl_weight": self.kl_weight_multistage})
         # Compute CL warmup
         self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
-        if mode=='train' or self.use_contr_in_val:
+        if self.use_contrastive_loader in ['both', mode]:
             self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
         else:
             self.loss_kwargs.update({"contrastive_loss_weight": 0.0})
@@ -509,7 +561,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def training_step(self, batch, batch_idx):
         """Training step for supervised training."""
         # Perform full forward pass of model
-        _, _, loss_output = self.step(mode='train', batch=batch, batch_idx=batch_idx)
+        inference_outputs, _, loss_output = self.step(mode='train', batch=batch, batch_idx=batch_idx)
         loss = loss_output.loss
         self.log(
             "train_loss",
@@ -564,12 +616,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.class_batch_counts[u].append(c)
         # Save number of classes / batch
         self.train_class_counts.append(len(unique))
+        # Save in cache
+        with torch.no_grad():
+            self._cache_step_data('train', batch, inference_outputs, loss_output)
+        # Return final loss value
         return loss
 
     def validation_step(self, batch, batch_idx):
         """Validation step for supervised training."""
         # Perform full forward pass of model
-        _, _, loss_output = self.step(mode='val', batch=batch, batch_idx=batch_idx)
+        inference_outputs, _, loss_output = self.step(mode='val', batch=batch, batch_idx=batch_idx)
         loss = loss_output.loss
         self.log(
             "validation_loss",
@@ -579,16 +635,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             prog_bar=True,
         )
         self.compute_and_log_metrics(loss_output, self.val_metrics, "validation")
+        # Cache the data
+        with torch.no_grad():
+            self._cache_step_data('val', batch, inference_outputs, loss_output)
 
-    def on_train_epoch_start(self):
+    def on_train_epoch_start(self):        
+        # Freeze module encoder at a certain epoch if option is enabled
         if self.freeze_encoder_epoch is not None and self.current_epoch >= self.freeze_encoder_epoch and not self.encoder_frozen:
-            self.freeze_encoder()
-            self.encoder_frozen = True
-
-    def freeze_encoder(self):
-        self.module.z_encoder.eval()
-        for param in self.module.z_encoder.parameters():
-            param.requires_grad = False
+            self.module.freeze_module('z_encoder')
     
     def on_train_epoch_end(self):
         if self.log_class_distribution:
@@ -623,10 +677,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             plt.close(fig)
             # Reset for next epoch
             self.train_class_counts = []
-
+        # Plot umap
         if self.plot_umap in ['train', 'both'] and self.current_epoch % 10 == 0:
-            train_data = self._get_mode_data('train')
-            self._plt_umap('train', train_data)
+            train_data = self._process_epoch_cache('train')
+            if train_data:
+                self._plt_umap('train', train_data)
 
     # Calculate accuracy & f1 for entire validation set, not just per batch
     def on_validation_epoch_end(self):
@@ -635,15 +690,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             plt_umap = self.plot_umap in ['val', 'both']
             if plt_umap or self.log_full_val:
                 # Get data from forward pass
-                self.module.use_counter = True
-                val_data = self._get_mode_data('val')
-                self.module.use_counter = False
-                # Plot UMAP for validation set
-                if plt_umap:
-                    self._plt_umap('val', val_data)
-                # Calculate performance metrics over entire validation set, not just batch
-                if self.log_full_val and self.classification_ratio > 0:
-                    self._log_full_val_metrics(val_data)
+                val_data = self._process_epoch_cache('val')
+                if val_data:
+                    # Plot UMAP for validation set
+                    if plt_umap:
+                        self._plt_umap('val', val_data)
+                    # Calculate performance metrics over entire validation set, not just batch
+                    if self.log_full_val and self.classification_ratio > 0:
+                        self._log_full_val_metrics(val_data)
                     
     def _log_full_val_metrics(self, mode_data: dict[str, np.ndarray]) -> None:
         true_labels = torch.tensor(mode_data.get('labels'))
@@ -753,7 +807,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 # Compute CL warmup
                 self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
                 # Compute contrastive weight
-                self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight if self.use_contr_in_val else 0.0})
+                if self.use_contrastive_loader in ['both', mode]:
+                    contr_weight = self.contrastive_loss_weight
+                else:
+                    contr_weight = 0.0
+                self.loss_kwargs.update({"contrastive_loss_weight": contr_weight})
                 self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
                 self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == mode or self.use_posterior_mean == "both"})
                 self.loss_kwargs.update({"class_kl_temperature": self.class_kl_temperature})
@@ -791,9 +849,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             'covs': covs
         }
 
-    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray]):
-        import anndata as ad
-        import scanpy as sc
+    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray], use_history: bool = True):
+        """Plot umap of latent space in tensorboard logger"""
+        import umap
         # Extract data from forward pass
         embeddings = mode_data['embeddings']
         labels = mode_data['labels']
@@ -802,17 +860,43 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             labels = [self.loss_kwargs["_code_to_label"][l] for l in labels]
         labels = pd.Categorical(labels)
         covs = pd.Categorical(mode_data['covs'])
-        # Plot umap consistent with scanpy settings
-        obs = pd.DataFrame({'labels': labels, 'covs': covs})
-        x = ad.AnnData(X=embeddings, obs=obs)
-        sc.pp.neighbors(x, use_rep='X')
-        sc.tl.umap(x)
-        embeddings_2d = x.obsm['X_umap']
-
+        
+        # Create cache structure if it doesn't exist
+        if 'umap_cache' not in self.cache:
+            self.cache['umap_cache'] = {}
+        
+        # Check if we have a cached UMAP transformer for this mode
+        transformer_key = f'{mode}_umap_transformer'
+        embedding_key = f'{mode}_umap_reference'
+        
+        if transformer_key not in self.cache['umap_cache']:
+            # First time - fit UMAP and cache the transformer and reference embedding
+            self.cache['umap_cache'][transformer_key] = umap.UMAP(n_components=2)
+            embeddings_2d = self.cache['umap_cache'][transformer_key].fit_transform(embeddings)
+            self.cache['umap_cache'][embedding_key] = embeddings  # Store reference embedding
+        else:
+            # Check if embeddings have changed significantly
+            ref_embeddings = self.cache['umap_cache'][embedding_key]
+            if embeddings.shape == ref_embeddings.shape:
+                # Calculate relative difference
+                rel_diff = np.mean(np.abs(embeddings - ref_embeddings)) / (np.mean(np.abs(ref_embeddings)) + 1e-6)
+                if rel_diff > 0.1:  # Refit if embeddings have changed significantly (10% threshold)
+                    self.cache['umap_cache'][transformer_key] = umap.UMAP(n_components=2)
+                    embeddings_2d = self.cache['umap_cache'][transformer_key].fit_transform(embeddings)
+                    self.cache['umap_cache'][embedding_key] = embeddings
+                else:
+                    # Use cached transformer for similar embeddings
+                    embeddings_2d = self.cache['umap_cache'][transformer_key].transform(embeddings)
+            else:
+                # Refit if embedding dimensions have changed
+                self.cache['umap_cache'][transformer_key] = umap.UMAP(n_components=2)
+                embeddings_2d = self.cache['umap_cache'][transformer_key].fit_transform(embeddings)
+                self.cache['umap_cache'][embedding_key] = embeddings
+    
         """Plots a UMAP projection of Z latent space."""
         import matplotlib.pyplot as plt
         import seaborn as sns
-
+    
         fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150)
         # Plot classes
         sns.scatterplot(

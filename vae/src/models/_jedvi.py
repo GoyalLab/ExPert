@@ -1,7 +1,7 @@
 
 from copy import deepcopy
-from src.utils.common import to_tensor
 from src.utils.preprocess import scale_1d_array
+from src.utils._callbacks import DelayedEarlyStopping
 from src.modules._jedvae import JEDVAE
 from src.modules._splitter import ContrastiveDataSplitter
 from src.utils.constants import REGISTRY_KEYS
@@ -12,7 +12,6 @@ import torch
 from torch import Tensor
 from torch.distributions import Distribution
 import torch.nn.functional as F
-import warnings
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
@@ -29,15 +28,15 @@ from anndata import AnnData
 # scvi imports
 from scvi.model._utils import get_max_epochs_heuristic
 from scvi.train import TrainRunner, SaveCheckpoint
-from scvi.data._utils import get_anndata_attribute, _check_if_view
+from scvi.data._utils import _get_adata_minify_type, _check_if_view
 from scvi.utils import setup_anndata_dsp
 from scvi.utils._docstrings import devices_dsp
 from scvi.model.base import (
-    BaseModelClass,
     ArchesMixin,
     VAEMixin,
     RNASeqMixin,
-    UnsupervisedTrainingMixin
+    UnsupervisedTrainingMixin,
+    BaseMinifiedModeModelClass
 )
 from scvi.data.fields import (
     CategoricalJointObsField,
@@ -49,7 +48,6 @@ from scvi.data.fields import (
     NumericalObsField,
 )
 from scvi._types import AnnOrMuData
-from scvi.model._scvi import SCVI
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +56,8 @@ class JEDVI(
         RNASeqMixin, 
         VAEMixin,
         ArchesMixin, 
-        BaseModelClass,
         UnsupervisedTrainingMixin,
+        BaseMinifiedModeModelClass
     ):
     _module_cls = JEDVAE
     _training_plan_cls = ContrastiveSupervisedTrainingPlan
@@ -131,7 +129,7 @@ class JEDVI(
             cls_weights=cls_weights,
             **self._model_kwargs,
         )
-
+        # Fresh initialization, set params accordingly
         self.supervised_history_ = None
         self.init_params_ = self._get_init_params(locals())
         self.was_pretrained = False
@@ -296,91 +294,6 @@ class JEDVI(
             return self.cls_emb, self.cls_sim
         else:
             return self.train_cls_emb, self.train_cls_sim
-
-    @classmethod
-    def from_scvi_model(
-        cls,
-        scvi_model: SCVI,
-        labels_key: str | None = None,
-        adata: AnnData | None = None,
-        **model_kwargs,
-    ):
-        """Initialize jedVI model with weights from pretrained :class:`~scvi.model.SCVI` model.
-
-        Parameters
-        ----------
-        scvi_model
-            Pretrained scvi model
-        labels_key
-            key in `adata.obs` for label information. Label categories can not be different if
-            labels_key was used to setup the SCVI model. If None, uses the `labels_key` used to
-            setup the SCVI model. If that was None, and error is raised.
-        unlabeled_category
-            Value used for unlabeled cells in `labels_key` used to setup AnnData with scvi.
-        adata
-            AnnData object that has been registered via :meth:`~GEDVI.setup_anndata`.
-        model_kwargs
-            kwargs for gedvi model
-        """
-        from copy import deepcopy
-        from scvi import settings
-        from scvi.data._constants import (
-            _SETUP_ARGS_KEY,
-            ADATA_MINIFY_TYPE,
-        )
-        from scvi.data._utils import _is_minified
-
-        scvi_model._check_if_trained(message="Passed in scvi model hasn't been trained yet.")
-
-        model_kwargs = dict(model_kwargs)
-        init_params = scvi_model.init_params_
-        non_kwargs = init_params["non_kwargs"]
-        kwargs = init_params["kwargs"]
-        kwargs = {k: v for (i, j) in kwargs.items() for (k, v) in j.items()}
-        for k, v in {**non_kwargs, **kwargs}.items():
-            if k in model_kwargs.keys():
-                warnings.warn(
-                    f"Ignoring param '{k}' as it was already passed in to pretrained "
-                    f"SCVI model with value {v}.",
-                    UserWarning,
-                    stacklevel=settings.warnings_stacklevel,
-                )
-                del model_kwargs[k]
-
-        if scvi_model.minified_data_type == ADATA_MINIFY_TYPE.LATENT_POSTERIOR:
-            raise ValueError(
-                f"We cannot use the given scVI model to initialize {cls.__name__} because it has "
-                "minified adata. Keep counts when minifying model using "
-                "minified_data_type='latent_posterior_parameters_with_counts'."
-            )
-
-        if adata is None:
-            adata = scvi_model.adata
-        else:
-            if _is_minified(adata):
-                raise ValueError(f"Please provide a non-minified `adata` to initialize {cls.__name__}.")
-            # validate new anndata against old model
-            scvi_model._validate_anndata(adata)
-
-        scvi_setup_args = deepcopy(scvi_model.adata_manager.registry[_SETUP_ARGS_KEY])
-        scvi_labels_key = scvi_setup_args["labels_key"]
-        if labels_key is None and scvi_labels_key is None:
-            raise ValueError(
-                "A `labels_key` is necessary as the scVI model was initialized without one."
-            )
-        if scvi_labels_key is None:
-            scvi_setup_args.update({"labels_key": labels_key})
-        # Setup adata
-        cls.setup_anndata(
-            adata,
-            **scvi_setup_args,
-        )
-        model = cls(adata, **non_kwargs, **kwargs, **model_kwargs)
-        scvi_state_dict = scvi_model.module.state_dict()
-        model.module.load_state_dict(scvi_state_dict, strict=False)
-        model.was_pretrained = True
-
-        return model
     
     @classmethod
     def from_base_model(
@@ -390,27 +303,16 @@ class JEDVI(
         adata: AnnData | None = None,
         excl_setup_keys: list[str] = ['class_emb_uns_key'],
         excl_states: list[str] = ['learned_class_embeds'],
+        freeze_pretrained_base: bool = True,
         **model_kwargs,
     ):
         """Initialize jedVI model with weights from pretrained :class:`~scvi.model.JEDVI` model.
 
         Parameters
         ----------
-        pretrained_model
-            Pretrained scvi model
-        labels_key
-            key in `adata.obs` for label information. Label categories can not be different if
-            labels_key was used to setup the JEDVI model. If None, uses the `labels_key` used to
-            setup the JEDVI model. If that was None, and error is raised.
-        unlabeled_category
-            Value used for unlabeled cells in `labels_key` used to setup AnnData with scvi.
-        adata
-            AnnData object that has been registered via :meth:`~JEDVI.setup_anndata`.
-        model_kwargs
-            kwargs for JEDVI model
+        TODO: add parameter description
         """
         from copy import deepcopy
-        from scvi import settings
         from scvi.data._constants import (
             _SETUP_ARGS_KEY,
         )
@@ -422,7 +324,7 @@ class JEDVI(
         init_params = pretrained_model.init_params_
         non_kwargs = init_params["non_kwargs"]
         kwargs = init_params["kwargs"]
-        kwargs = {k: v for (i, j) in kwargs.items() for (k, v) in j.items()}
+        kwargs = {k: v for (_, j) in kwargs.items() for (k, v) in j.items()}
         for k, v in {**non_kwargs, **kwargs}.items():
             if k in model_kwargs.keys():
                 del model_kwargs[k]
@@ -463,7 +365,11 @@ class JEDVI(
         model.module.load_state_dict(pretrained_state_dict, strict=False)
         # Label model as pre-trained
         model.was_pretrained = True
-
+        # Freeze base vae module after pre-training
+        if freeze_pretrained_base:
+            logging.info('Freezing en- and decoder weights for fine-tuning.')
+            model.module.freeze_vae_base()
+        # Return loaded pre-trained model
         return model
     
     @torch.inference_mode()
@@ -695,52 +601,27 @@ class JEDVI(
         data_params: dict[str, Any]={}, 
         model_params: dict[str, Any]={}, 
         train_params: dict[str, Any]={},
-        return_runner: bool = False,
+        minify_adata: bool = True,
     ):
         """Train the model.
 
         Parameters
         ----------
-        max_epochs
-            Number of passes through the dataset for semisupervised training.
-        n_samples_per_label
-            Number of subsamples for each label class to sample per epoch. By default, there
-            is no label subsampling.
-        check_val_every_n_epoch
-            Frequency with which metrics are computed on the data for validation set for both
-            the unsupervised and semisupervised trainers. If you'd like a different frequency for
-            the semisupervised trainer, set check_val_every_n_epoch in semisupervised_train_kwargs.
-        train_size
-            Size of training set in the range [0.0, 1.0].
-        validation_size
-            Size of the test set. If `None`, defaults to 1 - `train_size`. If
-            `train_size + validation_size < 1`, the remaining cells belong to a test set.
-        shuffle_set_split
-            Whether to shuffle indices before splitting. If `False`, the val, train, and test set
-            are split in the sequential order of the data according to `validation_size` and
-            `train_size` percentages.
-        batch_size
-            Minibatch size to use during training.
-        %(param_accelerator)s
-        %(param_devices)s
-        datasplitter_kwargs
-            Additional keyword arguments passed into
-            :class:`~scvi.dataloaders.SemiSupervisedDataSplitter`.
-        plan_kwargs
-            Keyword args for :class:`~scvi.train.SemiSupervisedTrainingPlan`. Keyword arguments
-            passed to `train()` will overwrite values present in `plan_kwargs`, when appropriate.
-        **trainer_kwargs
-            Other keyword args for :class:`~scvi.train.Trainer`.
+        TODO: fill in parameteres
+        data_params: dict
+            **kwargs for src.modules._splitter.ContrastiveDataSplitter
         """
+        # Get max epochs specified in params
         epochs = train_params.get('max_epochs')
-        # determine number of epochs needed for complete training
+        # Determine number of epochs needed for complete training
         max_epochs = get_max_epochs_heuristic(self.adata.n_obs)
+        # Train for suggested number of epochs if no specification is give
         if epochs is None:
             if self.was_pretrained:
                 max_epochs = int(np.min([10, np.max([2, round(max_epochs / 3.0)])]))
             epochs = max_epochs
         logging.info(f'Epochs suggested: {max_epochs}, training for {epochs} epochs.')
-
+        # Get training split fraction
         train_size: int = data_params.pop('train_size', 0.9)
         if not train_size < 1.0 and train_size > 0:
             raise ValueError(f'Parameter train_size should be between 0 and 1, got {train_size}')
@@ -763,6 +644,8 @@ class JEDVI(
         )
         # Setup training plan
         plan_kwargs: dict = train_params.pop('plan_kwargs', {})
+        # Specify which splits use contrastive loading
+        plan_kwargs['use_contrastive_loader'] = data_splitter.use_contrastive_loader
 
         # Use contrastive loss in validation if that set uses the same splitter
         if data_params.get('use_contrastive_loader', None) in ['val', 'both']:
@@ -774,9 +657,24 @@ class JEDVI(
         # Check if tensorboard logger is given
         logger = train_params.get('logger')
         callbacks = []
+        # Manage early stopping callback
+        if train_params.get('early_stopping', False) and train_params.get('early_stopping_start_epoch') is not None:
+            # Disable scvi internal early stopping
+            train_params['early_stopping'] = False
+            # Create custom delayed early stopping using the start epoch parameter
+            early_stopping_start_epoch = train_params.pop('early_stopping_start_epoch')
+            early_stopping_callback = DelayedEarlyStopping(
+                start_epoch=early_stopping_start_epoch,
+                monitor=train_params.get('early_stopping_monitor', 'validation_loss'),
+                min_delta=train_params.get('early_stopping_min_delta', 0.0),
+                patience=train_params.get('early_stopping_patience', 0.0),
+                mode=train_params.get('early_stopping_mode', 0.0),
+            )
+            # Add to callbacks
+            callbacks.append(early_stopping_callback)
         # Manage checkpoint callback
         use_checkpoint = train_params.pop('checkpoint', False)
-        checkpoint_monitor = train_params.pop('checkpoint_monitor', 'f1_score_validation')
+        checkpoint_monitor = train_params.pop('checkpoint_monitor', 'validation_loss')
         checkpoint_mode = train_params.pop('checkpoint_mode', 'max')
         checkpoint_dir = None
         # Create checkpoint for max validation f1-score model
@@ -794,6 +692,9 @@ class JEDVI(
             callbacks.append(checkpoint_callback)
         # Add callbacks to Trainer kwargs
         train_params['callbacks'] = callbacks
+        # Check val every epoch if we have callbacks registered
+        if len(callbacks) > 0:
+            train_params['check_val_every_n_epoch'] = 1
      
         # Create training runner
         runner = TrainRunner(
@@ -825,10 +726,14 @@ class JEDVI(
         self._model_summary_string += f", use_full_cls_emb: {self.use_full_cls_emb}"
         self.__repr__()
         # Train model
-        if return_runner:
-            return runner
-        else:
-            return runner()
+        runner()
+        # Minify the model if enabled and adata is not already minified
+        if minify_adata and _get_adata_minify_type(self.adata) is None:
+            logging.info(f'Minifying adata with latent distribution')
+            qzm, qzv = self.get_latent_representation(return_dist=True)
+            self.adata.obsm[REGISTRY_KEYS.LATENT_QZM_KEY] = qzm
+            self.adata.obsm[REGISTRY_KEYS.LATENT_QZV_KEY] = qzv
+            self.minify_adata(use_latent_qzm_key=REGISTRY_KEYS.LATENT_QZM_KEY, use_latent_qzv_key=REGISTRY_KEYS.LATENT_QZV_KEY)
         
     def _validate_anndata(
         self, adata: AnnOrMuData | None = None, copy_if_view: bool = True, extend_categories: bool = True
@@ -951,6 +856,10 @@ class JEDVI(
             scaled_class_cert_key = f'{class_certainty_key}_scaled'
             adata.obs[scaled_class_cert_key] = scale_1d_array(adata.obs[class_certainty_key].astype(float).values)
             anndata_fields.append(NumericalObsField(REGISTRY_KEYS.CLS_CERT_KEY, scaled_class_cert_key, required=False))
+        # Register latent fields of adata is minified
+        adata_minify_type = _get_adata_minify_type(adata)
+        if adata_minify_type is not None:
+            anndata_fields += cls._get_fields_for_adata_minification(adata_minify_type)
         # Create AnnData manager
         adata_manager = EmbAnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(adata, **kwargs)
