@@ -23,6 +23,12 @@ class _REGISTRY_KEYS_NT(NamedTuple):
     LATENT_QZV_KEY: str = "latent_qzv"
     OBSERVED_LIB_SIZE: str = "observed_lib_size"
     GROUP_BASE_KEY: str = "group_"
+    SPLIT_KEY: str = "split"
+    PREDICTION_KEY: str = "cls_prediction"
+    SOFT_PREDICTION_KEY: str = "soft_prediction"
+    TOP_N_PREDICTION_KEY: str = "top_n_prediction"
+    REPORT_KEY: str = "cls_report"
+    SUMMARY_KEY: str = "cls_report_summary"
 
 
 class _MODULE_KEYS(NamedTuple):

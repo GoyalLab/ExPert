@@ -148,29 +148,12 @@ def _train(
         batch_key: str = 'dataset',
         verbose: bool = False,
         **train_kwargs
-    ) -> tuple[nn.Module, pd.DataFrame, ad.AnnData]:
+    ) -> JEDVI:
     logging.info(f'Reading training data from: {adata_p}')
     model_set = sc.read(adata_p)
     # Check if dataset is compatible
     assert cls_label in model_set.obs.columns and batch_key in model_set.obs.columns
-    
-    # Define all labels to classify on
-    if 'perturbation_direction' in model_set.obs.columns:
-        logging.info('Using perturbation direction to classify')
-        cls_labels = ['perturbation_direction', 'perturbation']
-    else:
-        cls_labels = ['celltype', 'perturbation_type', 'perturbation']
-    if verbose:
-        # Check number of unique perturbations to classify
-        logging.info(f'Initializing dataset with {model_set.obs.cls_label.nunique()} classes')
-        logging.info(f'{model_set.obs[cls_labels[1:]].drop_duplicates().shape[0]} unique perturbations')
-        logging.info(f'{model_set.obs[cls_labels[-1]].nunique()} unique gene-perturbations')
-        logging.info(f'{model_set.obs["celltype"].nunique()} unique cell types')
-        logging.info(f'{model_set.obs["dataset"].nunique()} datasets')
-        logging.info(f'Mean number of cells / perturbation {model_set.obs.cls_label.value_counts().mean()}')
-        logging.info(f'Class embedding shape: {model_set.uns["cls_embedding"].shape}')
-        logging.info(f'Adata shape: {model_set.shape}')
-
+  
     # Set precision
     torch.set_float32_matmul_precision('medium')
 
@@ -206,15 +189,7 @@ def _train(
         train_params=config[CONF_KEYS.TRAIN].copy(),
         **train_kwargs
     )
-    # Save results to lightning directory
-    results, latent = get_model_results(
-        model=model, 
-        cls_labels=cls_labels, 
-        log_dir=step_model_dir, 
-        plot=True, 
-        max_classes=100
-    )
-    return model, results, latent
+    return model
 
 def load_test_data(
         test_adata_p: str, 
@@ -709,6 +684,8 @@ def full_run(
         )
     else:
         model = train_output[TRAINING_KEYS.MODEL_KEY]
+    # Evaluate model
+    model.evaluate()
     # Do not test model
     if test_p is None or not os.path.exists(test_p):
         logging.info(f'Skipping model test since no valid test path is provided.')
@@ -758,20 +735,13 @@ def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.M
     # Init run output dir
     step_model_dir = get_ouptut_dir(config_p, output_base_dir=out_dir)
     # Train the model
-    model, results, latent = _train(
+    model: JEDVI = _train(
         adata_p=adata_p, 
         step_model_dir=step_model_dir, 
         config=config,
         **kwargs
     )
-    # Get latest lightning directory TODO: replace this by looking up the version via tensorboard logger object
-    version_dir = get_latest_tensor_dir(step_model_dir)
-    return {
-        TRAINING_KEYS.MODEL_KEY: model,
-        TRAINING_KEYS.RESULTS_KEY: results,
-        TRAINING_KEYS.LATENT_KEY: latent,
-        TRAINING_KEYS.OUTPUT_KEY: version_dir
-    }
+    return model
 
 if __name__ == '__main__':
     # Parse cmd line args

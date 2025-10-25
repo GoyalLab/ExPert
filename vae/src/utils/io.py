@@ -3,12 +3,29 @@ import glob
 import yaml
 import logging
 import numpy as np
+import pandas as pd
 import scanpy as sc
 import anndata as ad
+import scipy.sparse as sp
 
+import torch
 import torch.nn as nn
 
 from src.tune._statics import CONF_KEYS, NESTED_CONF_KEYS
+
+
+def to_tensor(m: sp.csr_matrix | torch.Tensor | np.ndarray | pd.DataFrame | None) -> torch.Tensor:
+    if m is None:
+        return None
+    if sp.issparse(m):
+        return torch.Tensor(m.toarray())
+    if isinstance(m, np.ndarray):
+        return torch.Tensor(m)
+    if isinstance(m, pd.DataFrame):
+        return torch.Tensor(m.values)
+    if isinstance(m, torch.Tensor):
+        return m
+    raise ValueError(f'{m.__class__} is not compatible. Should be either sp.csr_matrix, np.ndarray, or torch.Tensor.')
 
 
 # Recursive function to replace "nn.*" strings with actual torch.nn classes

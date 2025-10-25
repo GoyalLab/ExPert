@@ -10,7 +10,7 @@ from typing import Literal, Iterable, Optional
 from torch.distributions import Normal
 
 from src.utils.constants import REGISTRY_KEYS
-from src.utils.common import to_tensor
+from src.utils.io import to_tensor
 
 
 class MemoryQueue:

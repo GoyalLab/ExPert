@@ -1312,10 +1312,21 @@ class JEDVAE(VAE):
             _adv_loss = self.adversarial_context_loss(z, context_labels=b, lambda_adv=adversarial_context_lambda, reduction=self.non_elbo_reduction)
             total_loss = total_loss + _adv_loss
             extra_metrics['adversial_context_loss'] = _adv_loss
-                    
-        # Add extra metrics to loss output
+
+        # Calculate unweighted sum of all losses
+        unscaled_loss = reconst_loss.sum() / n_obs_minibatch + kl_divergence_z.sum() / n_obs_minibatch
+        
+        # Handle extra metrics if any are given
         if len(extra_metrics) > 0:
-            lo_kwargs['extra_metrics'] = extra_metrics
+            # Add all extra metrics to the loss
+            extra_loss_sum = sum(v.detach() for v in extra_metrics.values() if isinstance(v, torch.Tensor) and v.ndim<2)
+            unscaled_loss = unscaled_loss + extra_loss_sum
+        
+        # Add unscaled loss to metrics
+        extra_metrics['unscaled_loss'] = unscaled_loss
+        # Add to loss output
+        lo_kwargs['extra_metrics'] = extra_metrics
+ 
         # Set total loss
         lo_kwargs['loss'] = total_loss
         return LossOutput(**lo_kwargs)

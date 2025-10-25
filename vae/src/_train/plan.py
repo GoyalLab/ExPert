@@ -5,7 +5,7 @@ import torchmetrics.functional as tmf
 import torch.nn.functional as F
 
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
-from src.utils.common import to_tensor
+from src.utils.io import to_tensor
 from scvi.train import TrainingPlan
 from scvi.module.base import BaseModuleClass, LossOutput
 from scvi.train._metrics import ElboMetric

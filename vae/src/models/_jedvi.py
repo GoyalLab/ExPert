@@ -1,13 +1,16 @@
-
-from copy import deepcopy
+import os
+from src.utils.constants import REGISTRY_KEYS
+import src.utils.io as io
+import src.utils.performance as pf
 from src.utils.preprocess import scale_1d_array
 from src.utils._callbacks import DelayedEarlyStopping
+import src.utils.plotting as pl
 from src.modules._jedvae import JEDVAE
 from src.modules._splitter import ContrastiveDataSplitter
-from src.utils.constants import REGISTRY_KEYS
 from src._train.plan import ContrastiveSupervisedTrainingPlan
 from src.data._manager import EmbAnnDataManager
 
+from copy import deepcopy
 import torch
 from torch import Tensor
 from torch.distributions import Distribution
@@ -15,6 +18,7 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
+import anndata as ad
 import logging
 import numpy.typing as npt
 from sklearn.utils.class_weight import compute_class_weight
@@ -60,9 +64,12 @@ class JEDVI(
         BaseMinifiedModeModelClass
     ):
     _module_cls = JEDVAE
+    _name = __qualname__
     _training_plan_cls = ContrastiveSupervisedTrainingPlan
-    _LATENT_QZM_KEY = "jedvi_latent_qzm"
-    _LATENT_QZV_KEY = "jedvi_latent_qzv"
+    _LATENT_QZM_KEY = f"{__qualname__}_latent_qzm"
+    _LATENT_QZV_KEY = f"{__qualname__}_latent_qzv"
+    _LATENT_Z2C_KEY = f"{__qualname__}_latent_z2c"
+    _LATENT_C2Z_KEY = f"{__qualname__}_latent_c2z"
 
 
     def __init__(
@@ -133,6 +140,7 @@ class JEDVI(
         self.supervised_history_ = None
         self.init_params_ = self._get_init_params(locals())
         self.was_pretrained = False
+        self.is_evaluated = False
         self.use_ctrl_emb = False
         # Give model summary
         self.n_unseen_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_unseen_labels'] if REGISTRY_KEYS.CLS_EMB_INIT in adata.uns else None
@@ -179,6 +187,9 @@ class JEDVI(
             # Convert to tensor
             self.gene_emb = torch.Tensor(gene_emb).T
 
+        # Assign batch labels
+        batch_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY)
+        self.original_batch_key = batch_state_registry.original_key
         # Assign class embedding
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
@@ -186,25 +197,29 @@ class JEDVI(
         self.n_unseen_labels = None
         self._code_to_label = dict(enumerate(self._label_mapping))
         # Check if adata has a class embedding registered
-        if len(self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CLS_EMB_KEY, {})) > 0:
+        cls_emb_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CLS_EMB_KEY, {})
+        if len(cls_emb_registry) > 0:
+            # Get adata.uns key for embedding, fall back to attribute key if no original key is given
+            ext_cls_emb_key = cls_emb_registry.get('original_key')
+            cls_emb_key = cls_emb_registry['data_registry'].get('attr_key') if ext_cls_emb_key is None else ext_cls_emb_key
             # Check if adata has already been registered with this model class
-            if REGISTRY_KEYS.CLS_EMB_INIT in self.adata.uns and self.__class__ == self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['model']:
+            if REGISTRY_KEYS.CLS_EMB_INIT in self.adata.uns and self._name == self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['model']:
                 logging.info(f'Adata has already been initialized with {self.__class__}, loading model settings from adata.')
                 # Set to embeddings found in adata
-                self.cls_emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY]
-                self.cls_sim = self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY]
+                self.cls_emb = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
+                self.cls_sim = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
                 # Init train embeddings from adata
                 n_train = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_train_labels']
                 self.train_cls_emb = self.cls_emb[:n_train,:]
                 self.train_cls_sim = self.cls_sim[:n_train,:n_train]
                 # Set indices
-                self.idx_to_label = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels']
+                self.idx_to_label = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels'])
                 # Set control class index
                 self.ctrl_class = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['ctrl_class']
                 self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['ctrl_class_idx']
             else:
                 # Register adata's class embedding with this model
-                cls_emb: pd.DataFrame = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY]
+                cls_emb: pd.DataFrame = self.adata.uns[cls_emb_key]
                 if not isinstance(cls_emb, pd.DataFrame):
                     logging.warning(f'Class embedding has to be a dataframe with labels as index, got {cls_emb.__class__}. Falling back to internal embedding.')
                 else:
@@ -263,11 +278,11 @@ class JEDVI(
                     self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
                     self.train_cls_sim = self.train_cls_emb @ self.train_cls_emb.T
                     # Get full list of perturbations for embedding
-                    self.idx_to_label = cls_emb.index
+                    self.idx_to_label = cls_emb.index.values
                     # Save registration with this model
                     self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT] = {
-                        'model': self.__class__,
-                        'labels': cls_emb.index,
+                        'model': self._name,
+                        'labels': self.idx_to_label,
                         'n_train_labels': self.n_train_labels, 
                         'n_unseen_labels': self.n_unseen_labels,
                         'ctrl_class': self.ctrl_class,
@@ -333,7 +348,7 @@ class JEDVI(
             adata = pretrained_model.adata
         else:
             if _is_minified(adata):
-                raise ValueError(f"Please provide a non-minified `adata` to initialize {cls.__name__}.")
+                raise ValueError(f"Please provide a non-minified `adata` to initialize {cls.__qualname__}.")
             # validate new anndata against old model
             pretrained_model._validate_anndata(adata)
         # Use pretraining adata setup kwargs
@@ -425,10 +440,23 @@ class JEDVI(
 
         from scvi.module._constants import MODULE_KEYS
 
+        # Check if model has been trained
         self._check_if_trained(warn=False)
+        # Check if both adata and another dataloader are given
         if adata is not None and dataloader is not None:
             raise ValueError("Only one of `adata` or `dataloader` can be provided.")
 
+        # Check if model is minified TODO: only works if using model's minified adata
+        if self.is_minified and adata is None:
+            qzm = self.adata.obsm[self._LATENT_QZM_KEY]
+            qzv = self.adata.obsm[self._LATENT_QZV_KEY]
+            qz: Distribution = Normal(qzm, qzv.sqrt())
+            if return_dist:
+                return qzm, qzv
+            else:
+                return qz
+
+        # Adata is not minified
         if dataloader is None:
             adata = self._validate_anndata(adata, extend_categories=True)
             dataloader = self._make_data_loader(
@@ -498,6 +526,8 @@ class JEDVI(
             labels. Otherwise, uses a sample from the posterior distribution - this
             means that the predictions will be stochastic.
         """
+        # Check if model has been trained
+        self._check_if_trained(warn=False)
         # Log usage of gene embeddings
         if self.gene_emb is not None:
             logging.info(f'Using model gene embeddings ({self.gene_emb.shape})')
@@ -594,6 +624,10 @@ class JEDVI(
             gene_emb=self.gene_emb,
             **plan_kwargs
         )
+    
+    @property
+    def is_minified(self) -> bool:
+        return _get_adata_minify_type(self.adata) is not None
         
     @devices_dsp.dedent
     def train(
@@ -676,11 +710,13 @@ class JEDVI(
         use_checkpoint = train_params.pop('checkpoint', False)
         checkpoint_monitor = train_params.pop('checkpoint_monitor', 'validation_loss')
         checkpoint_mode = train_params.pop('checkpoint_mode', 'max')
+        # Save most recent log dir
+        self.model_log_dir = logger.log_dir if logger is not None else None
         checkpoint_dir = None
         # Create checkpoint for max validation f1-score model
         if logger is not None and use_checkpoint:
             # Create checkpoint instance, save only best model
-            checkpoint_dir = f"{logger.log_dir}/checkpoints"
+            checkpoint_dir = f"{self.model_log_dir}/checkpoints"
             checkpoint_callback = SaveCheckpoint(
                 dirpath=checkpoint_dir,  # match logger directory
                 monitor=checkpoint_monitor,
@@ -723,16 +759,20 @@ class JEDVI(
         self.training_plan = training_plan
         # Update model summary to include if it's trained on fixed or full class embedding
         self.use_full_cls_emb = bool(plan_kwargs.get('use_full_cls_emb'))
-        self._model_summary_string += f", use_full_cls_emb: {self.use_full_cls_emb}"
+        if not self.was_pretrained:
+            self._model_summary_string += f", use_full_cls_emb: {self.use_full_cls_emb}"
         self.__repr__()
+        # Save runner in model
+        self.last_runner = runner
         # Train model
         runner()
+        # Add latent representation to model
+        qzm, qzv = self.get_latent_representation(return_dist=True)
+        self.adata.obsm[REGISTRY_KEYS.LATENT_QZM_KEY] = qzm
+        self.adata.obsm[REGISTRY_KEYS.LATENT_QZV_KEY] = qzv
         # Minify the model if enabled and adata is not already minified
-        if minify_adata and _get_adata_minify_type(self.adata) is None:
+        if minify_adata and not self.is_minified:
             logging.info(f'Minifying adata with latent distribution')
-            qzm, qzv = self.get_latent_representation(return_dist=True)
-            self.adata.obsm[REGISTRY_KEYS.LATENT_QZM_KEY] = qzm
-            self.adata.obsm[REGISTRY_KEYS.LATENT_QZV_KEY] = qzv
             self.minify_adata(use_latent_qzm_key=REGISTRY_KEYS.LATENT_QZM_KEY, use_latent_qzv_key=REGISTRY_KEYS.LATENT_QZV_KEY)
         
     def _validate_anndata(
@@ -783,6 +823,283 @@ class JEDVI(
         # Sort .var to same order as observed in model's adata
         return adata[:,self.adata.var_names].copy()
     
+    def _get_available_splits(self) -> list[str]:
+        """Get list of available data splits in the model.
+        
+        Returns
+        -------
+        list[str]
+            List of available split names ('train', 'val', 'test')
+        """
+        return [
+            split for split, indices in {
+                'train': getattr(self, 'train_indices', None),
+                'val': getattr(self, 'validation_indices', None), 
+                'test': getattr(self, 'test_indices', None)
+            }.items() if indices is not None and len(indices) > 0
+        ]
+    
+    def _get_split_indices(self, split: str) -> np.ndarray:
+        """Get model split indices by split key (train, val/validation, test)"""
+        if split not in self._get_available_splits():
+            raise ValueError(f'Model does not have indices for split: {split}, has to be one of {self._get_available_splits()}')
+        if split == 'train':
+            return self.train_indices
+        if split in ['val', 'validation']:
+            return self.validation_indices
+        if split == 'test':
+            return self.test_indices
+        return None
+        
+    def _get_split_adata(self, split: str, ignore_ctrl: bool = True) -> ad.AnnData:
+        """Get AnnData subset for a specific split and optionally filter control cells.
+
+        Parameters
+        ----------
+        split : str
+            Data split to get ('train', 'val', 'test')
+        ignore_ctrl : bool
+            Whether to filter out control cells from the split
+
+        Returns
+        -------
+        ad.AnnData
+            AnnData subset for the specified split
+        """
+        # Return subset of self.adata based on mode indices
+        split_indices = self._get_split_indices(split)
+        # Get data for this split
+        adata = self.adata[split_indices]
+        # Ignore control cells if option is given and control class exists
+        if self.ctrl_class is not None and ignore_ctrl:
+            # Filter out control cells
+            adata = adata[adata.obs[self.original_label_key] != self.ctrl_class]
+        return adata
+    
+    def _get_model_classification_report(self, split: str, ignore_ctrl: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+        from sklearn.metrics import classification_report
+
+        # Check if internal predictions are available
+        if REGISTRY_KEYS.PREDICTION_KEY not in self.adata.obs:
+            raise ValueError('Run self.evaluate() before calculating statistics.')
+        # Get mode adata
+        mode_adata = self._get_split_adata(split, ignore_ctrl=ignore_ctrl)
+        # Generate a classification report for the relevant mode
+        report = classification_report(
+            mode_adata.obs[self.original_label_key],
+            mode_adata.obs[REGISTRY_KEYS.PREDICTION_KEY],
+            zero_division=np.nan,
+            output_dict=True
+        )
+        # Format output accordingly
+        report_df = pd.DataFrame(report).transpose()
+        summary = report_df[report_df.index.isin(['accuracy', 'macro avg', 'weighted avg'])].copy()
+        report_data = report_df[~report_df.index.isin(['accuracy', 'macro avg', 'weighted avg'])].copy()
+        report_data['log_count'] = np.log(report_data['support'])
+        # Add mode to results
+        report_data[REGISTRY_KEYS.SPLIT_KEY] = split
+        summary[REGISTRY_KEYS.SPLIT_KEY] = split
+        return summary, report_data
+    
+    def _register_classification_report(self, force: bool = False, ignore_ctrl: bool = True) -> None:
+        """Run classification report for all registered modes."""
+        # Check if already given
+        if self.is_evaluated and not force:
+            return
+        # Generate classification summaries and reports
+        summaries, reports = [], []
+        for split in self._get_available_splits():
+            summary, report = self._get_model_classification_report(split, ignore_ctrl=ignore_ctrl)
+            summaries.append(summary)
+            reports.append(report)
+        summaries = pd.concat(summaries, axis=0)
+        reports = pd.concat(reports, axis=0)
+        self.adata.uns[REGISTRY_KEYS.SUMMARY_KEY] = summaries
+        self.adata.uns[REGISTRY_KEYS.REPORT_KEY] = reports
+
+    def _register_top_n_predictions(self) -> None:
+        """Calculate performance metrics for each data split and optionally also for each context"""
+        top_n_predictions = pf.compute_top_n_predictions(
+            adata=self.adata,
+            split_key=REGISTRY_KEYS.SPLIT_KEY,
+            context_key=self.original_batch_key,
+            labels_key=self.original_label_key,
+            ctrl_key=self.ctrl_class,
+            predictions_key=REGISTRY_KEYS.SOFT_PREDICTION_KEY,
+        )
+        # Add data to model's adata
+        self.adata.uns[REGISTRY_KEYS.TOP_N_PREDICTION_KEY] = top_n_predictions
+
+    def _get_top_n_predictions(self) -> pd.DataFrame:
+        if REGISTRY_KEYS.TOP_N_PREDICTION_KEY not in self.adata.obsm:
+            raise KeyError('No model evaluation top prediction metrics available. Run model.evaluate()')
+        return self.adata.obsm[REGISTRY_KEYS.TOP_N_PREDICTION_KEY]
+
+    def _register_split_labels(self, force: bool = True) -> None:
+        """Add split label to self.adata.obs"""
+        # Check if these labels are already in adata and reassign if forced to
+        if REGISTRY_KEYS.SPLIT_KEY in self.adata.obs and not force:
+            return
+        # Create array of split labels matching adata size
+        split_labels = np.full(self.adata.n_obs, None, dtype=object)
+        # Fill in split labels based on indices
+        for split in self._get_available_splits():
+            split_indices = self._get_split_indices(split)
+            split_labels[split_indices] = split
+        # Add split labels to adata.obs
+        self.adata.obs[REGISTRY_KEYS.SPLIT_KEY] = split_labels
+    
+    def _register_model_predictions(self, force: bool = True) -> None:
+        """Add detailed model classification outputs to internal self.adata object"""
+        # Check if model has been trained
+        self._check_if_trained(warn=False)
+        # Predictions have not yet been made
+        if REGISTRY_KEYS.PREDICTION_KEY in self.adata.obs and not force:
+            return
+        # Add split information to self.adata
+        self._register_split_labels(force=force)
+        # Run classifier forward pass, return soft predictions and latent spaces
+        soft_pred, z2c, c2z = self.predict(soft=True, return_latent=True)
+        # Save predictions to model adata
+        self.adata.obs[REGISTRY_KEYS.PREDICTION_KEY] = soft_pred.columns[np.argmax(soft_pred, axis=-1)]     # (cells,)
+        self.adata.obsm[REGISTRY_KEYS.SOFT_PREDICTION_KEY] = soft_pred          # (cells, classes)
+        self.adata.obsm[self._LATENT_Z2C_KEY] = z2c     # z to class space projection latent (cells, shared dim)
+        self.adata.uns[self._LATENT_C2Z_KEY] = c2z      # class embedding space (classes, shared dim)
+        # Calculate top N predictions over model data
+        self._register_top_n_predictions()
+        # Set evaluation as completed
+        self.is_evaluated = True
+
+    def evaluate(
+            self,
+            plot: bool = True,
+            save_anndata: bool = False,
+            output_dir: str | None = None,
+            results_mode: Literal['return', 'save'] | None = 'save',
+            force: bool = True,
+            ignore_ctrl: bool = True,
+        ) -> dict[pd.DataFrame] | None:
+        """Run model evaluation for all available data splits registered with the model."""
+        if self.is_evaluated and not force:
+            logging.info('This model has already been evaluated, pass force=True to re-evaluate.')
+            return
+        # Run full prediction for all registered data
+        logging.info('Running model predictions on all data splits.')
+        self._register_model_predictions(force=force)
+        # Run classification report for all data splits
+        logging.info('Generating reports.')
+        self._register_classification_report(force=force, ignore_ctrl=ignore_ctrl)
+        # Save model to tensorboard logger directory if registered
+        if self.model_log_dir is not None:
+            base_output_dir = self.model_log_dir
+            model_output_dir = os.path.join(self.model_log_dir, 'model')
+        # Try to fall back to output_dir parameter and skip if not specified
+        else:
+            if output_dir is not None:
+                base_output_dir = output_dir
+                model_output_dir = os.path.join(output_dir, 'model')
+            else:
+                logging.warning('Could not find model tensorboard log directory or a specified "output_dir", skipping model saving.')
+                base_output_dir = None
+                model_output_dir = None
+        # Plot evalutation results if specified
+        logging.info('Plotting evaluation results.')
+        if plot:
+            self._plot_evalutation(output_dir=base_output_dir)
+        # Save model only if we have an output directory
+        if model_output_dir is not None:
+            # Always save anndata if its minified else fall back to parameter
+            save_anndata = True if self.is_minified else save_anndata
+            save_ad_txt = 'with' if save_anndata else 'without'
+            adata_txt = 'adata (minified)' if self.is_minified else 'adata'
+            logging.info(f'Saving model {save_ad_txt} {adata_txt} to: {model_output_dir}')
+            self.save(dir_path=model_output_dir, save_anndata=save_anndata, overwrite=True)
+        # Create evalutaion return object
+        return_obj = None
+        if results_mode is not None:
+            # Collect evaluation result metrics
+            eval_report = self.get_eval_report()
+            eval_summary = self.get_eval_summary()
+            # Return evaluation results as dictionary
+            if results_mode == 'return':
+                return_obj = {
+                    REGISTRY_KEYS.REPORT_KEY: eval_report,
+                    REGISTRY_KEYS.SUMMARY_KEY: eval_summary,
+                }
+            # Save reports as seperate files in output directory
+            elif results_mode == 'save':
+                logging.info(f'Saving evaluation metrics to: {base_output_dir}')
+                sum_o = os.path.join(base_output_dir, f'{self._name}_eval_summary.csv')
+                rep_o = os.path.join(base_output_dir, f'{self._name}_eval_report.csv')
+                eval_summary.to_csv(sum_o)
+                eval_report.to_csv(rep_o)
+        logging.info(f'Evaluation done.')
+        # Return 
+        return return_obj
+    
+    def get_eval_summary(self) -> pd.DataFrame | None:
+        if REGISTRY_KEYS.SUMMARY_KEY not in self.adata.uns:
+            logging.warning('No model evaluation summary available.')
+            return None
+        return self.adata.uns[REGISTRY_KEYS.SUMMARY_KEY]
+    
+    def get_eval_report(self) -> pd.DataFrame | None:
+        if REGISTRY_KEYS.REPORT_KEY not in self.adata.uns:
+            logging.warning('No model evaluation report available.')
+            return None
+        return self.adata.uns[REGISTRY_KEYS.REPORT_KEY]
+    
+    def _plot_eval_split(self, split: str, plt_dir: str) -> None:
+        """Plot confusion matrix per split."""
+        # Get split data without control cells
+        adata = self._get_split_adata(split, ignore_ctrl=True)
+        # Get actual and predicted class labels
+        y = adata.obs[self.original_label_key].values.astype(str)
+        y_hat = adata.obs[REGISTRY_KEYS.PREDICTION_KEY].values.astype(str)
+        # Create output file path
+        o = os.path.join(plt_dir, f'cm_{split}.png')
+        pl.plot_confusion(y, y_hat, plt_file=o)
+
+    def _plot_eval_splits(self, plt_dir: str) -> None:
+        """Generate all split-specific plots."""
+        for split in self._get_available_splits():
+            self._plot_eval_split(split, plt_dir=plt_dir)
+    
+    def _plot_evalutation(self, output_dir: str | None, metric: str = 'f1-score') -> None:
+        """Save plots associated to model evaluation."""
+        if output_dir is None:
+            logging.warning('Evalutaion output directory is not available. Skipping plots.')
+            return
+        # Set plotting directory and create if needed
+        plt_dir = os.path.join(output_dir, 'plots')
+        os.makedirs(plt_dir, exist_ok=True)
+        # Calculate UMAP for latent space based on latent mean
+        umap_slot_key = f'{REGISTRY_KEYS.LATENT_QZM_KEY}_umap'
+        pl.calc_umap(self.adata, rep=REGISTRY_KEYS.LATENT_QZM_KEY, slot_key=umap_slot_key)
+        # Plot full UMAP colored by data split
+        umap_split_o = os.path.join(plt_dir, f'full_umap_{REGISTRY_KEYS.SPLIT_KEY}.png')
+        pl.plot_umap(self.adata, slot=umap_slot_key, hue=REGISTRY_KEYS.SPLIT_KEY, output_file=umap_split_o)
+        # Plot full UMAP colored by batch label
+        umap_batch_o = os.path.join(plt_dir, f'full_umap_{self.original_batch_key}.png')
+        pl.plot_umap(self.adata, slot=umap_slot_key, hue=self.original_batch_key, output_file=umap_batch_o)
+        # Plot full UMAP colored by batch label
+        umap_label_o = os.path.join(plt_dir, f'full_umap_{self.original_label_key}.png')
+        pl.plot_umap(self.adata, slot=umap_slot_key, hue=self.original_label_key, output_file=umap_label_o)
+        # Plot performance - support correlations
+        support_corr_o = os.path.join(plt_dir, f'support_correlations.png')
+        pl.plot_performance_support_corr(self.adata.uns[REGISTRY_KEYS.REPORT_KEY], o=support_corr_o, hue=REGISTRY_KEYS.SPLIT_KEY)
+        # Plot performance metric over top N predictions in all splits
+        top_n_o = os.path.join(plt_dir, f'top_n_{metric}.png')
+        pl.plot_top_n_performance(
+            self.adata.uns[REGISTRY_KEYS.TOP_N_PREDICTION_KEY],
+            output_file=top_n_o,
+            metric=metric,
+            mean_split='val'
+        )
+        # Plot individual splits
+        self._plot_eval_splits(plt_dir)
+        return
+
     @classmethod
     def load_checkpoint(
         cls,
@@ -807,7 +1124,22 @@ class JEDVI(
         logging.info(f'Could not find model checkpoint(s). Using default "{default_dirname}" directory.')    
         model_state_dir = os.path.join(model_dir, default_dirname)
         return super().load(model_state_dir, adata=adata)
-
+    
+    def save(self, keep_emb: bool = True, *args, **kwargs) -> None:
+        """Save wrapper to handle external model embeddings"""
+        # Handle external model embeddings
+        if self.cls_emb is not None:
+            # Convert embeddings to numpy arrays
+            if keep_emb:
+                self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
+                self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
+            # Remove embeddings completely
+            else:
+                self.adata.uns.pop(REGISTRY_KEYS.CLS_EMB_KEY, None)
+                self.adata.uns.pop(REGISTRY_KEYS.CLS_SIM_KEY, None)
+        # Save model as you would normally
+        super().save(*args, **kwargs)
+    
     @classmethod
     @setup_anndata_dsp.dedent
     def setup_anndata(
