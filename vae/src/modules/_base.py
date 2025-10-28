@@ -1274,7 +1274,7 @@ class EmbeddingAligner(nn.Module):
             if skip_projection and n_in == n_out:
                 return nn.Identity()
             # Add funnel layer projections
-            if n_layers > 0:
+            if n_layers > 0 and n_hidden > 0:
                 layer_cls = FunnelFCLayers if funnel else FCLayers
                 return layer_cls(
                     n_in=n_in,

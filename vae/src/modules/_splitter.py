@@ -261,6 +261,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         use_contrastive_loader: Literal['train', 'val', 'both'] | None = 'train',
         use_control: Literal['train', 'val', 'both'] | None = 'train',
         external_indexing: list[np.array, np.array, np.array] | None = None,
+        cache_indices: dict[str, np.array] | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -304,48 +305,58 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         self.batches = batches
         self.pin_memory = pin_memory
         self.external_indexing = external_indexing
+        # Register training and validation indices from pre-training
+        self.cache_indices = cache_indices
 
     def setup(self, stage: str | None = None):
         """Split indices in train/test/val sets."""
-        # Only split non-control cells into train and validation
-        ctrl_mask = self.labels == self.ctrl_class
-        # Split control cells beforehand
-        if ctrl_mask.sum() > 0:
-            class_indices = self.indices[~ctrl_mask]
-            class_labels = self.labels[~ctrl_mask]
-            ctrl_indices = np.array(self.indices[ctrl_mask])
+        # Split indices into sets if no cache is provided
+        if self.cache_indices is None:
+            # Only split non-control cells into train and validation
+            ctrl_mask = self.labels == self.ctrl_class
+            # Split control cells beforehand
+            if ctrl_mask.sum() > 0:
+                class_indices = self.indices[~ctrl_mask]
+                class_labels = self.labels[~ctrl_mask]
+                ctrl_indices = np.array(self.indices[ctrl_mask])
+            else:
+                # Use all available indices if no control cells are given
+                class_indices = self.indices
+                class_labels = self.labels
+                ctrl_indices = None
+            # Split dataset into train and validation set
+            train_idx, val_idx = train_test_split(
+                class_indices,
+                train_size=self.train_size,
+                stratify=class_labels,           # Preserve class distribution
+                shuffle=self.shuffle_set_split,
+                random_state=settings.seed
+            )
+            
+            # Split indices are stratified, TODO: add test split logic
+            indices_train = np.array(train_idx)
+            indices_val = np.array(val_idx)
+            indices_test = np.array([])
+
+            # Add control indices to train pool
+            if ctrl_indices is not None:
+                indices_train = np.concatenate((indices_train, ctrl_indices))
+
+            # Don't validate on control cells if we have any registered
+            if self.ctrl_class is not None and self.use_control not in ['val', 'both']:
+                # Only keep non-control validation indices
+                indices_val = np.setdiff1d(indices_val, ctrl_indices, assume_unique=True)
         else:
-            # Use all available indices if no control cells are given
-            class_indices = self.indices
-            class_labels = self.labels
-            ctrl_indices = None
-        # Split dataset into train and validation set
-        train_idx, val_idx = train_test_split(
-            class_indices,
-            train_size=self.train_size,
-            stratify=class_labels,           # Preserve class distribution
-            shuffle=self.shuffle_set_split,
-            random_state=settings.seed
-        )
+            # Cache indices from pre-training
+            indices_train = np.array(self.cache_indices.get('train'))
+            indices_val = np.array(self.cache_indices.get('val'))
+            indices_test = np.array(self.cache_indices.get('test'))
         
-        # Split indices are stratified, TODO: add test split logic
-        indices_train = np.array(train_idx)
-        indices_val = np.array(val_idx)
-        indices_test = np.array([])
-
-        # Add control indices to train pool
-        if ctrl_indices is not None:
-            indices_train = np.concatenate((indices_train, ctrl_indices))
-
-        # Don't validate on control cells if we have any registered
-        if self.ctrl_class is not None and self.use_control not in ['val', 'both']:
-            # Only keep non-control validation indices
-            indices_val = np.setdiff1d(indices_val, ctrl_indices, assume_unique=True)
-
+        # Set data splitting indices
         self.train_idx = indices_train.astype(int)
         self.val_idx = indices_val.astype(int)
         self.test_idx = indices_test.astype(int)
-
+        # Set split labels
         self.train_labels = self.labels[self.train_idx]
         self.train_batches = self.batches[self.train_idx]
         self.val_labels = self.labels[self.val_idx]

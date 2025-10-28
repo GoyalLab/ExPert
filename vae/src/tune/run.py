@@ -131,7 +131,7 @@ def full_run(
     test_out = os.path.join(output_dir, 'test')
     os.makedirs(test_out, exist_ok=True)
     # Test model with specified test set
-    top_n_predictions = model.test(
+    test_output = model.test(
         test_adata_p=test_p,
         output_dir=test_out,
         incl_unseen=False,
@@ -140,7 +140,11 @@ def full_run(
         cls_label=cls_label,
         batch_label=batch_label,
         ctrl_key=ctrl_key,
-    ).uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY]
+    )
+    # Unpack output
+    top_n_predictions = test_output.uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY]
+    # TODO save summary
+    summary = test_output.uns[PREDICTION_KEYS.SUMMARY_KEY]
     top_n_predictions['incl_unseen'] = False
     # Test model with unseen perturbations if option is given
     if test_unseen:

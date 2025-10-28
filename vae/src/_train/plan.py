@@ -598,7 +598,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Log classifier temperature
         if self.module.use_learnable_temperature:
             # Check classifier temperature
-            cls_temp = getattr(self.module.classifier, 'temperature')
+            cls_temp = getattr(self.module.classifier, 'temperature', None)
             if cls_temp:
                 self.log(
                     "T_classifier_logit",

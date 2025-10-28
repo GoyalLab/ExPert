@@ -1,11 +1,20 @@
+import os
+import glob
+import yaml
 import numpy as np
 import pandas as pd
 import anndata as ad
 import gseapy as gp
-
-from typing import Any
-
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.linear_model import RidgeCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import precision_recall_fscore_support
+from sklearn.decomposition import PCA
+
+from tqdm import tqdm
 
 
 def performance_metric(actual, pred, labels, lib=None, mode='test'):
@@ -238,3 +247,168 @@ def compute_top_n_predictions(
     random_mask = top_n_predictions['mode']=='random'
     top_n_predictions.loc[random_mask,split_key] = 'random'
     return top_n_predictions
+
+def collect_runs(base_dir: str):
+    runs = []
+    for root, dirs, files in os.walk(base_dir):
+        summary_ps = glob.glob(f'{root}/**/JEDVI_eval_summary.csv', recursive=True)
+        if "config.yaml" in files and len(summary_ps) > 0:
+            cfg_path = os.path.join(root, "config.yaml")
+            summ_path = summary_ps[0]
+            runs.append((cfg_path, summ_path))
+    print(f"Found {len(runs)} runs.")
+    return runs
+
+def parse_run(cfg_path, summ_path):
+    # Parse config.yaml
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    # Flatten nested dicts
+    def flatten_dict(d, parent_key="", sep="."):
+        items = []
+        for k, v in d.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else k
+            if isinstance(v, dict):
+                items.extend(flatten_dict(v, new_key, sep=sep).items())
+            else:
+                items.append((new_key, v))
+        return dict(items)
+
+    flat_cfg = flatten_dict(cfg)
+
+    # Parse summary.csv
+    df = pd.read_csv(summ_path)
+    # Select validation F1-score
+    val_row = df[(df["split"] == "val") & (df.index == 4)]  # macro avg row (index may vary)
+    # safer alternative:
+    val_row = df[(df["split"] == "val") & (df.iloc[:,0].astype(str).str.contains("macro avg", case=False))]
+    f1_val = float(val_row["f1-score"].values[0]) if not val_row.empty else np.nan
+
+    flat_cfg["f1_val"] = f1_val
+    return flat_cfg
+
+def build_dataframe(base_dir: str):
+    data = []
+    idx = []
+    for cfg_path, summ_path in tqdm(collect_runs(base_dir)):
+        try:
+            row = parse_run(cfg_path, summ_path)
+            data.append(row)
+            idx.extend([os.path.basename(os.path.dirname(cfg_path))])
+        except Exception as e:
+            print(f"Error parsing {cfg_path}: {e}")
+    df = pd.DataFrame(data, index=idx)
+    df = df.dropna(subset=["f1_val"])
+    print(f"Final dataset shape: {df.shape}")
+    return df
+
+def prepare_features(df, target="f1_val"):
+    # Separate features and target
+    X = df.drop(columns=[target])
+    y = df[target]
+
+    # --- Step 1: Normalize data types ---
+    def serialize_value(v):
+        """Convert any value to a hashable string or numeric form."""
+        if isinstance(v, (list, dict)):
+            return str(v)           # e.g. "[64, 128]" → "64_128"
+        elif isinstance(v, bool):
+            return int(v)           # True/False → 1/0
+        elif v is None:
+            return "None"
+        else:
+            return v
+
+    X = X.applymap(serialize_value)
+
+    # --- Step 2: Separate numeric and categorical columns ---
+    cat_cols, num_cols = [], []
+    for col in X.columns:
+        try:
+            X[col] = pd.to_numeric(X[col])
+            num_cols.append(col)
+        except (ValueError, TypeError):
+            cat_cols.append(col)
+
+    # --- Step 3: Encode ---
+    encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+    scaler = StandardScaler()
+
+    X_cat = encoder.fit_transform(X[cat_cols]) if cat_cols else np.empty((len(X), 0))
+    X_num = scaler.fit_transform(X[num_cols]) if num_cols else np.empty((len(X), 0))
+
+    X_combined = np.hstack([X_num, X_cat])
+    feature_names = (
+        list(num_cols) +
+        list(encoder.get_feature_names_out(cat_cols)) if cat_cols else num_cols
+    )
+
+    print(f"Encoded {len(num_cols)} numeric and {len(cat_cols)} categorical features.")
+    return X_combined, y, feature_names
+
+def ridge_importance(X, y, feature_names):
+    model = RidgeCV(alphas=np.logspace(-3, 3, 10)).fit(X, y)
+    coefs = pd.Series(model.coef_, index=feature_names).sort_values(key=abs, ascending=False)
+    print("Top linear effects:")
+    print(coefs.head(10))
+    sns.barplot(x=coefs.head(15).values, y=coefs.head(15).index)
+    plt.title("Ridge Coefficients (Top 15)")
+    plt.tight_layout()
+    plt.show()
+
+
+def rf_importance(X, y, feature_names):
+    rf = RandomForestRegressor(n_estimators=300, random_state=42)
+    rf.fit(X, y)
+
+    # --- 1. Built-in feature importance ---
+    fi = pd.Series(rf.feature_importances_, index=feature_names).sort_values(ascending=False)
+
+    plt.figure(figsize=(6, 6))
+    sns.barplot(x=fi.values[:15], y=fi.index[:15])
+    plt.title("Random Forest Feature Importances (Top 15)")
+    plt.tight_layout()
+    plt.show()
+
+    # --- 2. Permutation importance (more robust) ---
+    result = permutation_importance(rf, X, y, n_repeats=10, random_state=42, n_jobs=-1)
+    perm_importances = pd.Series(result.importances_mean, index=feature_names).sort_values(ascending=False)
+
+    plt.figure(figsize=(6, 6))
+    sns.barplot(x=perm_importances.values[:15], y=perm_importances.index[:15])
+    plt.title("Permutation Importances (Top 15)")
+    plt.tight_layout()
+    plt.show()
+
+    return rf
+
+def pca_plot(X, y):
+    pca = PCA(n_components=2)
+    X_pca = pca.fit_transform(X)
+    plt.scatter(X_pca[:, 0], X_pca[:, 1], c=y, cmap="viridis", s=30)
+    plt.xlabel("PCA 1")
+    plt.ylabel("PCA 2")
+    plt.colorbar(label="Validation F1")
+    plt.title("Hyperparameter Landscape (PCA projection)")
+    plt.tight_layout()
+    plt.show()
+
+def analyse_grid_run(run_dir: str, pca: bool = False) -> dict:
+    """Analyse main performance drivers in grid runs."""
+    df = build_dataframe(run_dir)
+    X, y, feature_names = prepare_features(df)
+    # Sort by performance
+    df.sort_values("f1_val", ascending=False, inplace=True)
+
+    # correlation screening
+    corr = pd.DataFrame({"feature": feature_names, "corr": [np.corrcoef(X[:,i], y)[0,1] for i in range(X.shape[1])]})
+    corr["abs_corr"] = corr["corr"].abs()
+
+    ridge_importance(X, y, feature_names)
+    rf = rf_importance(X, y, feature_names)
+    if pca:
+        pca_plot(X, y)
+    return {
+        'df': df, 'corr': corr, 'rf': rf
+    }

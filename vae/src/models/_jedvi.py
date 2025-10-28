@@ -25,6 +25,7 @@ from sklearn.utils.class_weight import compute_class_weight
 
 
 from collections.abc import Sequence
+from collections import OrderedDict
 from typing import Literal, Any, Iterator
 
 from anndata import AnnData
@@ -99,6 +100,8 @@ class JEDVI(
         self.n_labels = self.summary_stats.n_labels
         # Whether to use the full class embedding
         self.use_full_cls_emb = use_full_cls_emb
+        # Create placeholder for log directory
+        self.model_log_dir = None
 
         # Initialize indices and labels for this VAE
         self._setup()
@@ -321,8 +324,9 @@ class JEDVI(
         labels_key: str | None = None,
         adata: AnnData | None = None,
         excl_setup_keys: list[str] = ['class_emb_uns_key'],
-        excl_states: list[str] = ['learned_class_embeds'],
+        excl_states: list[str] | None = None,
         freeze_modules: list[str] | None = ['z_encoder', 'decoder'],
+        check_model_kwargs: bool = True,
         **model_kwargs,
     ):
         """Initialize jedVI model with weights from pretrained :class:`~src.models.JEDVI` model.
@@ -331,7 +335,7 @@ class JEDVI(
         ----------
         TODO: add parameter description
         """
-        from copy import deepcopy
+        import re
         from scvi.data._constants import (
             _SETUP_ARGS_KEY,
         )
@@ -343,9 +347,16 @@ class JEDVI(
         non_kwargs = init_params["non_kwargs"]
         kwargs = init_params["kwargs"]
         kwargs = {k: v for (_, j) in kwargs.items() for (k, v) in j.items()}
-        for k, v in {**non_kwargs, **kwargs}.items():
-            if k in model_kwargs.keys():
-                del model_kwargs[k]
+        # Collect all params for model init
+        model_params = non_kwargs
+        model_params.update(kwargs)
+        # Check if model kwargs options diverged between pre-trained model and these configs
+        if check_model_kwargs:
+            for k, _ in {**non_kwargs, **kwargs}.items():
+                if k in model_kwargs.keys():
+                    logging.warning(f'Duplicate model config key detected, removing: {k}')
+                    del model_kwargs[k]
+        model_params.update(model_kwargs)
         # Fall back to pre-training data if no new traiing data is provided
         if adata is None:
             adata = pretrained_model.adata
@@ -373,17 +384,34 @@ class JEDVI(
             **pretrained_setup_args,
         )
         # Create fine-tune model
-        model = cls(adata, **non_kwargs, **kwargs, **model_kwargs)
+        model = cls(adata, **model_params)
         # Load pre-trained model weights
-        pretrained_state_dict = pretrained_model.module.state_dict()
-        # Remove weights that should be excluded
-        pretrained_states = pd.Series(pretrained_state_dict.keys(), dtype=str)
-        pretrained_state_mask = ~pretrained_states.isin(excl_states)
-        pretrained_state_dict = {k: v for k in pretrained_state_dict.items() if k in pretrained_states[pretrained_state_mask]}
+        pretrained_states = pd.Series(pretrained_model.module.state_dict().keys(), dtype=str)
+
+        if excl_states is not None and len(excl_states) > 0:
+            # Build a single regex pattern that matches any excluded state
+            # (escapes special chars and joins with '|')
+            pattern = "|".join(map(re.escape, excl_states))
+
+            # Create a boolean mask: True = keep, False = exclude
+            mask = ~pretrained_states.str.contains(pattern)
+
+            # Filter state dict
+            filtered_keys = pretrained_states[mask].tolist()
+            pretrained_state_dict = OrderedDict({
+                k: v for k, v in pretrained_model.module.state_dict().items() if k in filtered_keys
+            })
+        else:
+            # Include all states
+            pretrained_state_dict = pretrained_model.module.state_dict()
         # Load pre-trained weights
         model.module.load_state_dict(pretrained_state_dict, strict=False)
         # Label model as pre-trained
         model.was_pretrained = True
+        # Transfer data splitter indices to new model
+        model.train_indices = pretrained_model.train_indices
+        model.validation_indices = pretrained_model.validation_indices
+        model.test_indices = pretrained_model.test_indices
         # Freeze pre-trained models for next stage
         if freeze_modules is not None and isinstance(freeze_modules, list):
             for module in freeze_modules:
@@ -690,6 +718,7 @@ class JEDVI(
         self,
         config: dict[str, Any], 
         minify_adata: bool = False,
+        cache_data_splitter: bool = True,
     ):
         """Train the model.
 
@@ -728,6 +757,17 @@ class JEDVI(
             data_params["batch_size"] = batch_size
         # Add control class index to data params
         data_params['ctrl_class'] = self.ctrl_class
+
+        # Cache indices if model was pre-trained
+        if self.was_pretrained and cache_data_splitter:
+            logging.info(f'Re-using pre-training data split.')
+            cache_indices = {
+                'train': self.train_indices,
+                'val': self.validation_indices,
+                'test': getattr(self, 'test_indices', np.array([]))
+            }
+            # Add to splitter params
+            data_params['cache_indices'] = cache_indices
 
         # Create data splitter
         data_splitter = ContrastiveDataSplitter(
@@ -771,7 +811,7 @@ class JEDVI(
         use_checkpoint = train_params.pop('checkpoint', False)
         checkpoint_monitor = train_params.pop('checkpoint_monitor', 'validation_loss')
         checkpoint_mode = train_params.pop('checkpoint_mode', 'max')
-        # Save most recent log dir
+        # Save most recent log dir TODO: ensure model_log_dir is saved with model
         self.model_log_dir = logger.log_dir if logger is not None else None
         checkpoint_dir = None
         # Create checkpoint for max validation f1-score model
@@ -828,9 +868,7 @@ class JEDVI(
         # Train model
         runner()
         # Add latent representation to model
-        qzm, qzv = self.get_latent_representation(return_dist=True)
-        self.adata.obsm[self._LATENT_QZM_KEY] = qzm
-        self.adata.obsm[self._LATENT_QZV_KEY] = qzv
+        self._register_latent_variables()
         # Minify the model if enabled and adata is not already minified
         if minify_adata and not self.is_minified:
             logging.info(f'Minifying adata with latent distribution')
@@ -968,6 +1006,16 @@ class JEDVI(
         if PREDICTION_KEYS.TOP_N_PREDICTION_KEY not in self.adata.obsm:
             raise KeyError('No model evaluation top prediction metrics available. Run model.evaluate()')
         return self.adata.obsm[PREDICTION_KEYS.TOP_N_PREDICTION_KEY]
+    
+    def _register_latent_variables(self, force: bool = True) -> None:
+        """Register latent space with self.adata.obsm"""
+        # Check if it is already present, recalculate if forced
+        if self._LATENT_QZM_KEY in self.adata.obsm and not force:
+            return
+        # Run inference and assign it to model adata
+        qzm, qzv = self.get_latent_representation(return_dist=True)
+        self.adata.obsm[self._LATENT_QZM_KEY] = qzm
+        self.adata.obsm[self._LATENT_QZV_KEY] = qzv
 
     def _register_split_labels(self, force: bool = True) -> None:
         """Add split label to self.adata.obs"""
@@ -1022,7 +1070,7 @@ class JEDVI(
             plot: bool = True,
             save_anndata: bool = False,
             output_dir: str | None = None,
-            results_mode: Literal['return', 'save'] | None = 'save',
+            results_mode: Literal['return', 'save'] | None | list[str] = 'save',
             force: bool = True,
             ignore_ctrl: bool = True,
         ) -> dict[pd.DataFrame] | None:
@@ -1030,6 +1078,8 @@ class JEDVI(
         if self.is_evaluated and not force:
             logging.info('This model has already been evaluated, pass force=True to re-evaluate.')
             return
+        # Refactor results mode to always be a list of options or None
+        results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
         # Run full prediction for all registered data
         logging.info('Running model predictions on all data splits.')
         self._register_model_predictions(force=force)
@@ -1037,7 +1087,7 @@ class JEDVI(
         logging.info('Generating reports.')
         self._register_classification_report(force=force, ignore_ctrl=ignore_ctrl)
         # Save model to tensorboard logger directory if registered
-        if self.model_log_dir is not None:
+        if getattr(self, 'model_log_dir', None) is not None:
             base_output_dir = self.model_log_dir
             model_output_dir = os.path.join(self.model_log_dir, 'model')
         # Try to fall back to output_dir parameter and skip if not specified
@@ -1068,13 +1118,13 @@ class JEDVI(
             eval_report = self.get_eval_report()
             eval_summary = self.get_eval_summary()
             # Return evaluation results as dictionary
-            if results_mode == 'return':
+            if 'return' in results_mode:
                 return_obj = {
                     PREDICTION_KEYS.REPORT_KEY: eval_report,
                     PREDICTION_KEYS.SUMMARY_KEY: eval_summary,
                 }
             # Save reports as seperate files in output directory
-            elif results_mode == 'save':
+            if 'save' in results_mode:
                 logging.info(f'Saving evaluation metrics to: {base_output_dir}')
                 sum_o = os.path.join(base_output_dir, f'{self._name}_eval_summary.csv')
                 rep_o = os.path.join(base_output_dir, f'{self._name}_eval_report.csv')
@@ -1126,6 +1176,8 @@ class JEDVI(
         # Set plotting directory and create if needed
         plt_dir = os.path.join(output_dir, 'plots')
         os.makedirs(plt_dir, exist_ok=True)
+        # Save latent space to model adata if not already calculated
+        self._register_latent_variables(force=False)
         # Calculate UMAP for latent space based on latent mean
         pl.calc_umap(self.adata, rep=self._LATENT_QZM_KEY, slot_key=self._LATENT_UMAP)
         # Plot full UMAP colored by data split
@@ -1194,17 +1246,19 @@ class JEDVI(
         incl_unseen: bool = False,
         use_fixed_dataset_label: bool = True,
         plot: bool = True,
-        results_mode: Literal['return', 'save'] | None = 'save',
+        results_mode: Literal['return', 'save'] | None | list[str] = 'save',
         min_cells_per_class: int = 10,
         top_n: int = 10,
         ctrl_key: str | None = None,
-        minify: bool = True,
+        minify: bool = False,
         seed: int = 42,
     ) -> None:
         """Function to evaluate model on unseen data."""
+        # Refactor results mode to always be a list of options or None
+        results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
         # TODO: all this only works for labelled data, inplement option to handle unlabelled data
         # TODO: actually pretty easy, just set prediction column to unknown for all cells duh
-        # TODO: make this better
+        # TODO: make this more modular
         # Read test adata and filter columns
         logging.info(f'Testing model with: {test_adata_p}')
         test_ad = io.read_adata(test_adata_p, cls_label=cls_label, min_cells_per_class=min_cells_per_class)
@@ -1248,6 +1302,7 @@ class JEDVI(
         test_ad.obsm[self._LATENT_QZV_KEY] = qzv
         # Minify test data
         if minify:
+            logging.info('Minifying test data.')
             self.minify_query(test_ad)
         # Get model predictions for test data
         use_full = None if not incl_unseen else True
@@ -1270,7 +1325,7 @@ class JEDVI(
         test_ad.obs[PREDICTION_KEYS.PREDICTION_KEY] = predictions
         test_ad.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = soft_predictions
         # Evaluate test results
-        if output_dir is None and self.model_log_dir is None:
+        if output_dir is None and getattr(self, 'model_log_dir', None) is None:
             logging.warning(f'No output location provided. Please specify an output directory.')
             return
         # Create output directory, fall back to model's tensorboard directory
@@ -1312,10 +1367,10 @@ class JEDVI(
         # Determine result object
         return_obj = None
         if results_mode is not None:
-            if results_mode == 'return':
+            if 'return' in results_mode:
                 # Return merged data adata
                 return_obj = test_ad
-            elif results_mode == 'save':
+            if 'save' in results_mode:
                 # Save results adata to disk
                 test_ad_o = os.path.join(output_dir, f'full.h5ad')
                 test_ad.write_h5ad(test_ad_o)
