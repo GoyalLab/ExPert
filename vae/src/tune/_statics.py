@@ -9,6 +9,7 @@ class _HP_KEYS(NamedTuple):
 class _ConfKeys(NamedTuple):
     DATA: str = 'data'
     CLS: str = 'cls'
+    ALIGNER: str = 'aligner'
     ENCODER: str = 'encoder'
     DECODER: str = 'decoder'
     SCHEDULES: str = 'schedules'
@@ -23,6 +24,7 @@ class _NestedConfKeys(NamedTuple):
     ENCODER_KEY: str = 'extra_encoder_kwargs'
     DECODER_KEY: str = 'extra_decoder_kwargs'
     CLS_KEY: str = 'classifier_parameters'
+    ALIGN_KEY : str = 'aligner_parameters'
 
 CONF_KEYS = _ConfKeys()
 NESTED_CONF_KEYS = _NestedConfKeys()

@@ -38,6 +38,9 @@ def zscore(x: torch.Tensor, dim: int = -1, eps: float = 1e-8):
     sd = x.std(dim=dim, keepdim=True).clamp_min(eps)
     return (x - mu) / sd
 
+def batchmean(x: torch.Tensor) -> torch.Tensor:
+    return x.sum(-1) / x.shape[0]
+
 def pearson(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8, dim: int = -1):
     """
     Compute Pearson correlation

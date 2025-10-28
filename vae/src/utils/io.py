@@ -1,5 +1,4 @@
 import os
-import glob
 import yaml
 import logging
 import numpy as np
@@ -7,6 +6,9 @@ import pandas as pd
 import scanpy as sc
 import anndata as ad
 import scipy.sparse as sp
+
+import itertools, random
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -27,7 +29,6 @@ def to_tensor(m: sp.csr_matrix | torch.Tensor | np.ndarray | pd.DataFrame | None
         return m
     raise ValueError(f'{m.__class__} is not compatible. Should be either sp.csr_matrix, np.ndarray, or torch.Tensor.')
 
-
 # Recursive function to replace "nn.*" strings with actual torch.nn classes
 def replace_nn_modules(d):
     if isinstance(d, dict):
@@ -42,6 +43,84 @@ def replace_nn_modules(d):
     else:
         return d
     
+def generate_random_configs(space: dict, n_samples: int | None = None, fixed_weights: bool = True, seed: int | None = None):
+    if seed is not None:
+        random.seed(seed)
+
+    def valid_schedule(schedule):
+        if 'min_weight' in schedule and 'max_weight' in schedule:
+            if fixed_weights and schedule['max_weight'] != schedule['min_weight']:
+                return False
+            if schedule['max_weight'] < schedule['min_weight']:
+                return False
+        return True
+
+    def sample_from_space(subspace):
+        if isinstance(subspace, dict):
+            return {k: sample_from_space(v) for k, v in subspace.items()}
+        if isinstance(subspace, list):
+            return random.choice(subspace)
+        return subspace
+
+    def random_config():
+        config = {k: sample_from_space(v) for k, v in space.items()}
+        
+        # Special handling for schedules to ensure validity
+        if CONF_KEYS.SCHEDULES in config:
+            schedules = {}
+            for name, _ in config[CONF_KEYS.SCHEDULES].items():
+                max_iter = 0
+                while True and max_iter < 100:
+                    schedule = sample_from_space(space[CONF_KEYS.SCHEDULES][name])
+                    if valid_schedule(schedule):
+                        schedules[name] = schedule
+                        break
+                    max_iter += 1
+            config[CONF_KEYS.SCHEDULES] = schedules
+        
+        return config
+
+    count = 0
+    while n_samples is None or count < n_samples:
+        yield random_config()
+        count += 1
+
+def recursive_update(d: dict, u: dict) -> dict:
+    """Recursively update dict d with values from u."""
+    for k, v in u.items():
+        if isinstance(v, dict) and isinstance(d.get(k), dict):
+            d[k] = recursive_update(d.get(k, {}), v)
+        else:
+            d[k] = v
+    return d
+
+def sample_configs(space: dict, src_config: dict, N: int = 10, base_dir: str | None = None, verbose: bool = False, **kwargs):
+    # Sample configs
+    space_configs, config_paths = [], []
+    for i, sample in enumerate(generate_random_configs(space, n_samples=N, seed=42, **kwargs)):
+        # Merge sample into a deep copy of src_config
+        merged_config = recursive_update(deepcopy(src_config), sample)
+        space_configs.append(merged_config)
+
+        if base_dir is None:
+            continue
+        
+        # Create run directory & save merged config
+        run_dir = os.path.join(base_dir, f'run_{str(i)}')
+        os.makedirs(run_dir, exist_ok=True)
+        conf_out = os.path.join(run_dir, 'config.yaml')
+        config_paths.append(conf_out)
+        if verbose:
+            logging.info(f'Saving run config to {conf_out}')
+        with open(conf_out, 'w') as f:
+            yaml.dump(merged_config, f, sort_keys=False)
+
+    # Return configs or configs + saved paths
+    if base_dir is None:
+        return space_configs
+    else:
+        return space_configs, pd.DataFrame({'config_path': config_paths})
+    
 def setup_config(config: dict) -> None:
     # Add schedule params to plan
     config[CONF_KEYS.PLAN][NESTED_CONF_KEYS.SCHEDULES_KEY] = config[CONF_KEYS.SCHEDULES]
@@ -52,6 +131,8 @@ def setup_config(config: dict) -> None:
     config[CONF_KEYS.MODEL][NESTED_CONF_KEYS.DECODER_KEY] = config[CONF_KEYS.DECODER]
     # Add classifier args to model
     config[CONF_KEYS.MODEL][NESTED_CONF_KEYS.CLS_KEY] = config[CONF_KEYS.CLS]
+    # Add aligner args to model
+    config[CONF_KEYS.MODEL][NESTED_CONF_KEYS.ALIGN_KEY] = config[CONF_KEYS.ALIGNER]
 
 def read_config(config_p: str, setup: bool = True) -> dict:
     """Read hyperparameter yaml file"""
@@ -90,10 +171,59 @@ def ens_to_symbol(adata: ad.AnnData, gene_symbol_keys: list[str] = ['gene_symbol
         adata = adata[:,idx]
     return adata
 
-def read_adata(adata_p: str, check_gene_names: bool = True) -> ad.AnnData:
-    adata = sc.read(adata_p)
+
+def filter_min_cells_per_class(adata: ad.AnnData, cls_label: str, min_cells: int = 10) -> None:
+    """Filter adata for minimum number of cells in .obs group"""
+    if cls_label not in adata.obs:
+        logging.warning(f'{cls_label} not in adata.obs. Could not filter for cells per class.')
+        return
+    # Calculate number of cells per class
+    cpc = adata.obs[cls_label].value_counts()
+    # Save number of classes before filtering
+    nc = cpc.shape[0]
+    # Calculate class labels with min. number of samples
+    valid = cpc[cpc >= min_cells].index
+    # Create mask and subset
+    cls_mask = adata.obs[cls_label].isin(valid)
+    adata._inplace_subset_obs(cls_mask)
+    # Save number of classes after filtering
+    nc_post_filter = valid.shape[0]
+    logging.info(f'Filtered adata.obs.{cls_label} for min. {min_cells} cells. Got {nc_post_filter}/{nc} classes.')
+
+def filter_efficiency_score(adata: ad.AnnData, min_score: float = 2.0, col: str = 'mixscale_score') -> None:
+    """Filter adata for minimum mixscale score."""
+    if col not in adata.obs:
+        logging.warning(f'{col} not in adata.obs. Could not filter for mixscale score.')
+        return
+    # Filter for perturbation efficiency score (mixscale or similar)
+    efficiency_mask = adata.obs[col] >= min_score
+    nc = adata.shape[0]
+    adata._inplace_subset_obs(efficiency_mask)
+    nc_post_filter = adata.shape[0]
+    logging.info(f'Filtered adata.obs.{col} >= {min_score}. Got {nc_post_filter}/{nc} cells.')
+
+def read_adata(
+        adata_p: str, 
+        check_gene_names: bool = True,
+        cls_label: str | None = 'cls_label',
+        min_cells_per_class: int | None = 10,
+        min_efficiency_score: float | None = 2.0,
+        efficiency_col: str | None = 'mixscale_score',
+        **kwargs
+    ) -> ad.AnnData:
+    """Wrapper for sc.read()"""
+    if adata_p is None or not os.path.exists(adata_p):
+        raise FileNotFoundError(f'Cannot find file {adata_p}.')
+    # Read adata using scanpy
+    adata = sc.read(adata_p, **kwargs)
     # Convert gene names if needed
     if check_gene_names and adata.var_names.str.lower().str.startswith('ens').all():
         logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
         adata = ens_to_symbol(adata).copy()
+    # Filter for perturbation efficiency if score is given
+    if efficiency_col is not None and min_efficiency_score is not None:
+        filter_efficiency_score(adata, min_score=min_efficiency_score, col=efficiency_col)
+    # Filter classes if specified
+    if cls_label is not None and min_cells_per_class is not None:
+        filter_min_cells_per_class(adata, cls_label=cls_label, min_cells=min_cells_per_class)
     return adata

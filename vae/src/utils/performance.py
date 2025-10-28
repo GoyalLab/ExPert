@@ -30,14 +30,22 @@ def performance_metric(actual, pred, labels, lib=None, mode='test'):
 
 def get_classification_report(
         adata: ad.AnnData, 
-        y_test: Any, 
-        y_train: Any, 
-        cls_label: str
+        cls_label: str,
+        pred_label: str,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
     from sklearn.metrics import classification_report
 
     class_names = adata.obs[cls_label].unique()
-    report = classification_report(y_test, y_train, target_names=class_names, output_dict=True, zero_division=0)
+    y = adata.obs[cls_label].values.astype(str)
+    y_test = adata.obs[pred_label].values.astype(str)
+    report = classification_report(
+        y_true=y_test, 
+        y_pred=y,
+        labels=y,
+        target_names=class_names, 
+        output_dict=True, 
+        zero_division=0
+    )
     report_df = pd.DataFrame(report).transpose()
     actual_support_map = adata.obs[cls_label].value_counts().reset_index()
     summary = report_df[report_df.index.isin(['accuracy', 'macro avg', 'weighted avg'])]
@@ -168,7 +176,7 @@ def calculate_metrics_for_group(
 
 def compute_top_n_predictions(
         adata: ad.AnnData, 
-        split_key: str | None = None,
+        split_key: str = 'split',
         context_key: str = 'dataset',
         labels_key: str = 'cls_label',
         ctrl_key: str | None = None,
@@ -201,13 +209,19 @@ def compute_top_n_predictions(
         split_ad = _adata[split_mask]
         # Process each context individually
         for ct in split_ad.obs[context_key].unique():
-            group_mask = (split_ad.obs[context_key] == ct)
+            context_mask = (split_ad.obs[context_key] == ct)
             # Calculate metrics for each top N prediction to consider
-            group_y = split_ad.obs[labels_key].map(label_to_idx).values
+            split_y = split_ad.obs[labels_key].map(label_to_idx).values
             for top_n in np.arange(n) + 1:
                 metrics = calculate_metrics_for_group(
-                    split_ad, group_mask, group_y, max_idx[split_mask], 
-                    random_max_idx[split_mask], predictions, top_n, lib
+                    adata=split_ad, 
+                    tmp_mask=context_mask, 
+                    y=split_y,
+                    max_idx=max_idx[split_mask], 
+                    random_max_idx=random_max_idx[split_mask], 
+                    predictions=predictions, 
+                    top_n=top_n,
+                    lib=lib
                 )
                 metrics['top_n'] = top_n
                 metrics[context_key] = ct
@@ -220,5 +234,7 @@ def compute_top_n_predictions(
     # Add informations about zero-shot predictions
     if train_perturbations is not None:
         top_n_predictions['is_training_perturbation'] = top_n_predictions.label.isin(train_perturbations)
-    
+    # Overwrite split labels as random
+    random_mask = top_n_predictions['mode']=='random'
+    top_n_predictions.loc[random_mask,split_key] = 'random'
     return top_n_predictions

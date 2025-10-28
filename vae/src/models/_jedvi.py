@@ -1,5 +1,5 @@
 import os
-from src.utils.constants import REGISTRY_KEYS
+from src.utils.constants import REGISTRY_KEYS, EXT_CLS_EMB_INIT, PREDICTION_KEYS, MODULE_KEYS
 import src.utils.io as io
 import src.utils.performance as pf
 from src.utils.preprocess import scale_1d_array
@@ -32,7 +32,7 @@ from anndata import AnnData
 # scvi imports
 from scvi.model._utils import get_max_epochs_heuristic
 from scvi.train import TrainRunner, SaveCheckpoint
-from scvi.data._utils import _get_adata_minify_type, _check_if_view
+from scvi.data._utils import _get_adata_minify_type, _check_if_view, _is_minified
 from scvi.utils import setup_anndata_dsp
 from scvi.utils._docstrings import devices_dsp
 from scvi.model.base import (
@@ -68,8 +68,11 @@ class JEDVI(
     _training_plan_cls = ContrastiveSupervisedTrainingPlan
     _LATENT_QZM_KEY = f"{__qualname__}_latent_qzm"
     _LATENT_QZV_KEY = f"{__qualname__}_latent_qzv"
+    _LATENT_ZC_KEY = f"{__qualname__}_latent_zc"
+    _LATENT_CW_KEY = f"{__qualname__}_latent_cw"
     _LATENT_Z2C_KEY = f"{__qualname__}_latent_z2c"
     _LATENT_C2Z_KEY = f"{__qualname__}_latent_c2z"
+    _LATENT_UMAP = f"{__qualname__}_latent_umap"
 
 
     def __init__(
@@ -125,8 +128,7 @@ class JEDVI(
             cls_sim=cls_sim,
             dropout_rate_encoder=dropout_rate,
             dropout_rate_decoder=dropout_rate_decoder,
-            class_embed_dim=self.n_dims_emb,
-            use_embedding_classifier=self.use_embedding_classifier,
+            ext_class_embed_dim=self.ext_class_embed_dim,
             ctrl_class_idx=self.ctrl_class_idx,
             n_continuous_cov=self.summary_stats.get('n_extra_continuous_covs', 0),
             n_cats_per_cov=n_cats_per_cov,
@@ -150,7 +152,8 @@ class JEDVI(
             f"n_unseen_classes: {self.n_unseen_labels}, "
             f"use_gene_emb: {self.use_gene_emb}"
         )
-        if self.ctrl_class is not None:
+        # Include control class information
+        if self.ctrl_class is not None and self.ctrl_class_idx is not None:
             self._model_summary_string += f"\nctrl_class: {self.ctrl_class}"
             self._model_summary_string += f"\nuse_learnable_control_emb: {self.module.use_learnable_control_emb}"
 
@@ -190,33 +193,34 @@ class JEDVI(
         # Assign batch labels
         batch_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY)
         self.original_batch_key = batch_state_registry.original_key
+        self._batch_mapping = batch_state_registry.categorical_mapping
         # Assign class embedding
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
         self._label_mapping = labels_state_registry.categorical_mapping
         self.n_unseen_labels = None
         self._code_to_label = dict(enumerate(self._label_mapping))
-        # Check if adata has a class embedding registered
+        # Check if adata has an external class embedding registered
         cls_emb_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CLS_EMB_KEY, {})
         if len(cls_emb_registry) > 0:
             # Get adata.uns key for embedding, fall back to attribute key if no original key is given
             ext_cls_emb_key = cls_emb_registry.get('original_key')
             cls_emb_key = cls_emb_registry['data_registry'].get('attr_key') if ext_cls_emb_key is None else ext_cls_emb_key
             # Check if adata has already been registered with this model class
-            if REGISTRY_KEYS.CLS_EMB_INIT in self.adata.uns and self._name == self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['model']:
+            if REGISTRY_KEYS.CLS_EMB_INIT in self.adata.uns and self._name == self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.MODEL_KEY]:
                 logging.info(f'Adata has already been initialized with {self.__class__}, loading model settings from adata.')
                 # Set to embeddings found in adata
                 self.cls_emb = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
                 self.cls_sim = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
                 # Init train embeddings from adata
-                n_train = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_train_labels']
-                self.train_cls_emb = self.cls_emb[:n_train,:]
-                self.train_cls_sim = self.cls_sim[:n_train,:n_train]
+                self.n_train_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY]
+                self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
+                self.train_cls_sim = self.cls_sim[:self.n_train_labels,:self.n_train_labels]
                 # Set indices
-                self.idx_to_label = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['labels'])
+                self.idx_to_label = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.LABELS_KEY])
                 # Set control class index
-                self.ctrl_class = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['ctrl_class']
-                self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['ctrl_class_idx']
+                self.ctrl_class = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.CTRL_CLASS_KEY]
+                self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY]
             else:
                 # Register adata's class embedding with this model
                 cls_emb: pd.DataFrame = self.adata.uns[cls_emb_key]
@@ -238,7 +242,7 @@ class JEDVI(
                         self.ctrl_class_idx = ctrl_class_idx_matches[0]
                         # Create empty embedding for control
                         if self.ctrl_class not in _shared_labels:
-                            logging.info(f'Adding empty control class embedding, will be learned by model.')
+                            logging.info(f'Adding empty control external class embedding, will be learned by model.')
                             # Create empty embedding at last slot
                             dummy_emb = pd.DataFrame(np.zeros((1, cls_emb.shape[-1])), index=[self.ctrl_class], columns=cls_emb.columns)
                             # Add dummy embedding as 
@@ -250,7 +254,7 @@ class JEDVI(
                                 np.array(_shared_labels), np.array([self.ctrl_class])
                             ))
                         else:
-                            logging.info(f'Overwriting existing control class embedding, will be learned by model.')
+                            logging.info(f'Overwriting existing external control class embedding, will be learned by model.')
                         # Reset label overlap
                         _label_overlap = _label_series.isin(_shared_labels)
                     else:
@@ -260,11 +264,11 @@ class JEDVI(
                     self.n_unseen_labels = _unseen_labels.shape[0]
                     n_missing = _label_overlap.shape[0] - _label_overlap.sum()
                     if n_missing > 0:
-                        raise ValueError(f'Found {n_missing} missing labels in cls embedding: {_label_series[~_label_overlap]}')
+                        raise ValueError(f'Found {n_missing} missing labels in external class embedding: {_label_series[~_label_overlap]}')
                     # Re-order embedding: first training labels then rest
                     cls_emb = pd.concat([cls_emb.loc[_shared_labels], cls_emb.loc[_unseen_labels]], axis=0)
                     # Include class similarity as pre-calculated matrix
-                    logging.info(f'Calculating class similarities')
+                    logging.info(f'Calculating external class similarities')
                     # Set gene embedding as class parameter
                     self.cls_emb = torch.tensor(cls_emb.values, dtype=torch.float32)
                     # Normalize embedding before calculating similarities
@@ -281,23 +285,23 @@ class JEDVI(
                     self.idx_to_label = cls_emb.index.values
                     # Save registration with this model
                     self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT] = {
-                        'model': self._name,
-                        'labels': self.idx_to_label,
-                        'n_train_labels': self.n_train_labels, 
-                        'n_unseen_labels': self.n_unseen_labels,
-                        'ctrl_class': self.ctrl_class,
-                        'ctrl_class_idx': self.ctrl_class_idx,
+                        EXT_CLS_EMB_INIT.MODEL_KEY: self._name,
+                        EXT_CLS_EMB_INIT.LABELS_KEY: self.idx_to_label,
+                        EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY: self.n_train_labels, 
+                        EXT_CLS_EMB_INIT.N_UNSEEN_LABELS_KEY: self.n_unseen_labels,
+                        EXT_CLS_EMB_INIT.CTRL_CLASS_KEY: self.ctrl_class,
+                        EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY: self.ctrl_class_idx,
                     }
             # Set embedding dimension
-            self.n_dims_emb = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
+            self.ext_class_embed_dim = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
             # Use class embedding classifier
-            self.use_embedding_classifier = True
+            self.has_ext_emb = True
         else:
-            logging.info(f'No class embedding found in adata, falling back to internal embeddings with dimension 128. You can change this by specifying `n_dims_emb`.')
-            self.n_dims_emb = self._model_kwargs.get('n_dims_emb', 128)
+            self.idx_to_label = np.array(self._code_to_label.values())
+            self.ext_class_embed_dim = None
             self.ctrl_class_idx = None
             # Use base classifier
-            self.use_embedding_classifier = False
+            self.has_ext_emb = False
 
     def get_cls_emb(self, use_full_cls_emb: bool | None = None) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Helper getter to return either training or full class embedding"""
@@ -318,10 +322,10 @@ class JEDVI(
         adata: AnnData | None = None,
         excl_setup_keys: list[str] = ['class_emb_uns_key'],
         excl_states: list[str] = ['learned_class_embeds'],
-        freeze_pretrained_base: bool = True,
+        freeze_modules: list[str] | None = ['z_encoder', 'decoder'],
         **model_kwargs,
     ):
-        """Initialize jedVI model with weights from pretrained :class:`~scvi.model.JEDVI` model.
+        """Initialize jedVI model with weights from pretrained :class:`~src.models.JEDVI` model.
 
         Parameters
         ----------
@@ -331,9 +335,8 @@ class JEDVI(
         from scvi.data._constants import (
             _SETUP_ARGS_KEY,
         )
-        from scvi.data._utils import _is_minified
 
-        pretrained_model._check_if_trained(message="Passed in scvi model hasn't been trained yet.")
+        pretrained_model._check_if_trained(message="Passed in model hasn't been trained yet.")
 
         model_kwargs = dict(model_kwargs)
         init_params = pretrained_model.init_params_
@@ -356,8 +359,9 @@ class JEDVI(
         pretrained_labels_key = pretrained_setup_args["labels_key"]
         # Set labels for classification if not already specified in pre-training
         if labels_key is None and pretrained_labels_key is None:
+            # Actually this can never be the case lol
             raise ValueError(
-                "A `labels_key` is necessary as the scVI model was initialized without one."
+                "A `labels_key` is necessary because the pre-trained model did not have one."
             )
         if pretrained_labels_key is None:
             pretrained_setup_args.update({"labels_key": labels_key})
@@ -380,10 +384,10 @@ class JEDVI(
         model.module.load_state_dict(pretrained_state_dict, strict=False)
         # Label model as pre-trained
         model.was_pretrained = True
-        # Freeze base vae module after pre-training
-        if freeze_pretrained_base:
-            logging.info('Freezing en- and decoder weights for fine-tuning.')
-            model.module.freeze_vae_base()
+        # Freeze pre-trained models for next stage
+        if freeze_modules is not None and isinstance(freeze_modules, list):
+            for module in freeze_modules:
+                model.module.freeze_module(module)
         # Return loaded pre-trained model
         return model
     
@@ -466,33 +470,34 @@ class JEDVI(
         zs: list[Tensor] = []
         qz_means: list[Tensor] = []
         qz_vars: list[Tensor] = []
-        for tensors in dataloader:
-            tensors[REGISTRY_KEYS.GENE_EMB_KEY] = self.gene_emb
-            outputs: dict[str, Tensor | Distribution | None] = self.module.inference(
-                **self.module._get_inference_input(tensors)
-            )
+        with torch.no_grad():
+            for tensors in dataloader:
+                tensors[REGISTRY_KEYS.GENE_EMB_KEY] = self.gene_emb
+                outputs: dict[str, Tensor | Distribution | None] = self.module.inference(
+                    **self.module._get_inference_input(tensors)
+                )
 
-            if MODULE_KEYS.QZ_KEY in outputs:
-                qz: Distribution = outputs.get(MODULE_KEYS.QZ_KEY)
-                qzm: Tensor = qz.loc
-                qzv: Tensor = qz.scale.square()
-            else:
-                qzm: Tensor = outputs.get(MODULE_KEYS.QZM_KEY)
-                qzv: Tensor = outputs.get(MODULE_KEYS.QZV_KEY)
-                qz: Distribution = Normal(qzm, qzv.sqrt())
+                if MODULE_KEYS.QZ_KEY in outputs:
+                    qz: Distribution = outputs.get(MODULE_KEYS.QZ_KEY)
+                    qzm: Tensor = qz.loc
+                    qzv: Tensor = qz.scale.square()
+                else:
+                    qzm: Tensor = outputs.get(MODULE_KEYS.QZM_KEY)
+                    qzv: Tensor = outputs.get(MODULE_KEYS.QZV_KEY)
+                    qz: Distribution = Normal(qzm, qzv.sqrt())
 
-            if return_dist:
-                qz_means.append(qzm.cpu())
-                qz_vars.append(qzv.cpu())
-                continue
+                if return_dist:
+                    qz_means.append(qzm.cpu())
+                    qz_vars.append(qzv.cpu())
+                    continue
 
-            z: Tensor = qzm if give_mean else outputs.get(MODULE_KEYS.Z_KEY)
+                z: Tensor = qzm if give_mean else outputs.get(MODULE_KEYS.Z_KEY)
 
-            if give_mean and getattr(self.module, "latent_distribution", None) == "ln":
-                samples = qz.sample([mc_samples])
-                z = softmax(samples, dim=-1).mean(dim=0)
+                if give_mean and getattr(self.module, "latent_distribution", None) == "ln":
+                    samples = qz.sample([mc_samples])
+                    z = softmax(samples, dim=-1).mean(dim=0)
 
-            zs.append(z.cpu())
+                zs.append(z.cpu())
 
         if return_dist:
             return torch.cat(qz_means).numpy(), torch.cat(qz_vars).numpy()
@@ -503,12 +508,11 @@ class JEDVI(
         self,
         adata: AnnData | None = None,
         indices: Sequence[int] | None = None,
-        soft: bool = False,
         batch_size: int | None = None,
-        return_latent: bool = True,
         use_full_cls_emb: bool | None = None,
+        use_posterior_mean: bool = True,
         **kwargs
-    ) -> tuple[np.ndarray | pd.DataFrame, np.ndarray] | np.ndarray | pd.DataFrame:
+    ) -> dict[str, pd.DataFrame | np.ndarray]:
         """Return cell label predictions.
 
         Parameters
@@ -517,8 +521,6 @@ class JEDVI(
             AnnData object that has been registered via :meth:`~JEDVI.setup_anndata`.
         indices
             Return probabilities for each class label.
-        soft
-            If True, returns per class probabilities
         batch_size
             Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
         use_posterior_mean
@@ -540,11 +542,11 @@ class JEDVI(
         scdl = self._make_data_loader(
             adata=adata,
             indices=indices,
-            batch_size=batch_size,
+            batch_size=batch_size
         )
         # Get class embeddings from model
         if use_full_cls_emb is None or not use_full_cls_emb:
-            cls_emb, _ = self.module.class_embedding(device=self.device)
+            cls_emb = self.module.class_embedding(device=self.device)
         # Fall back to full model embeddings
         else:
             cls_emb = self.cls_emb
@@ -552,70 +554,124 @@ class JEDVI(
         if cls_emb is not None:
             logging.info(f'Using class embedding: {cls_emb.shape}')
         
+        # Regular predictions
         y_pred = []
-        y_cz = []
-        y_ez = []
-        for _, tensors in enumerate(scdl):
-            x = tensors[REGISTRY_KEYS.X_KEY]
-            batch = tensors[REGISTRY_KEYS.BATCH_KEY]
-
-            cont_key = REGISTRY_KEYS.CONT_COVS_KEY
-            cont_covs = tensors[cont_key] if cont_key in tensors.keys() else None
-
-            cat_key = REGISTRY_KEYS.CAT_COVS_KEY
-            cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
-            # Run classification process
-            cls_output = self.module.classify(
-                x,
-                batch_index=batch,
-                g=self.gene_emb,
-                cat_covs=cat_covs,
-                cont_covs=cont_covs,
-                class_embeds=cls_emb
-            )
-            # Handle output based on classifier used
-            if self.module.use_embedding_classifier:
-                # Unpack embedding projections
-                pred, cz, ez = cls_output
-                y_cz.append(cz.detach().cpu())
-                y_ez.append(ez.detach().cpu())
-            else:
-                # Set embeddings to z, TODO: set to None or empty tensors?
-                pred = cls_output
-            if not soft:
-                pred = pred.argmax(dim=1)
-            y_pred.append(pred.detach().cpu())
-        # Concatenate batch results
-        y_pred = torch.cat(y_pred).numpy()
-        if self.module.use_embedding_classifier:
-            y_cz = torch.cat(y_cz).numpy()
-            # Calculate mean embedding projections
-            y_ez = torch.stack(y_ez, dim=0).mean(dim=0).numpy()
-        else:
-            y_cz, y_ez = None, None
-        if not soft:
-            predictions = []
-            for p in y_pred:
-                if self.cls_emb is None:
-                    label = self._code_to_label[p]
+        # Arc-specific predictions
+        zs = []
+        Ws = []
+        # Aligned predictions
+        y_aligned_pred = []
+        z2cs = []
+        c2zs = []
+        ls = []
+        with torch.no_grad():
+            for _, tensors in enumerate(scdl):
+                # Unpack batch tensor
+                x = tensors.get(REGISTRY_KEYS.X_KEY)
+                l = tensors[REGISTRY_KEYS.LABELS_KEY].squeeze(-1)
+                batch = tensors[REGISTRY_KEYS.BATCH_KEY]
+                # Get continous covariates
+                cont_key = REGISTRY_KEYS.CONT_COVS_KEY
+                cont_covs = tensors[cont_key] if cont_key in tensors.keys() else None
+                # Get categorical covariates
+                cat_key = REGISTRY_KEYS.CAT_COVS_KEY
+                cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
+                # TODO: cachce inference if adata is minified
+                if _is_minified(adata):
+                    inference_outputs = {
+                        MODULE_KEYS.QZM_KEY: tensors[REGISTRY_KEYS.LATENT_QZM_KEY],
+                        MODULE_KEYS.QZV_KEY: tensors[REGISTRY_KEYS.LATENT_QZV_KEY], 
+                    }
                 else:
-                    label = self.idx_to_label[p]
-                predictions.append(label)
+                    inference_outputs = None
+                # Run classification process
+                cls_output = self.module.classify(
+                    x,
+                    batch_index=batch,
+                    g=self.gene_emb,
+                    cat_covs=cat_covs,
+                    cont_covs=cont_covs,
+                    use_posterior_mean=use_posterior_mean,
+                    labels=l,
+                    inference_outputs=inference_outputs
+                )
+                # Handle output based on classifier used
+                if self.module.has_classifier_latent():
+                    # Unpack embedding projections
+                    pred, z, W = cls_output
+                    zs.append(z.detach().cpu())
+                    Ws.append(W.detach().cpu())
+                else:
+                    # Set embeddings to z, TODO: set to None or empty tensors?
+                    pred = cls_output        
+                # Add batch predictions to overall predictions
+                y_pred.append(pred.detach().cpu())
 
-            pred = np.array(predictions)
-        else:
-            n_labels = len(pred[0])
-            pred = pd.DataFrame(
+                # Get aligned predictions and latent spaces
+                if self.module.has_align_cls:
+                    aligned_logits, z2c, c2z = self.module.align(
+                        x,
+                        batch_index=batch,
+                        g=self.gene_emb,
+                        cat_covs=cat_covs,
+                        cont_covs=cont_covs,
+                        use_posterior_mean=use_posterior_mean,
+                        class_embeds=cls_emb,
+                    )
+                    # Get aligned predictions
+                    y_aligned_pred.append(aligned_logits.detach().cpu())
+                    z2cs.append(z2c.detach().cpu())
+                    c2zs.append(c2z.detach().cpu())
+                # Log labels
+                ls.append(l.detach().cpu())
+        
+        # Concatenate batch results
+        ls = torch.cat(ls).numpy()
+        y_pred = torch.cat(y_pred).numpy()
+        # Get actual class labels for predictions
+        n_labels = len(pred[0])
+        soft_predictions = pd.DataFrame(
+            y_pred,
+            columns=self._label_mapping[:n_labels] if self.cls_emb is None else self.idx_to_label[:n_labels],
+            index=adata.obs_names[indices],
+        )
+        # Take top prediction labels
+        predictions = soft_predictions.columns[np.argmax(soft_predictions, axis=-1)]
+        # Create base result object
+        results = {
+            PREDICTION_KEYS.PREDICTION_KEY: predictions,
+            PREDICTION_KEYS.SOFT_PREDICTION_KEY: soft_predictions,
+            'labels': ls,
+        }
+        # Check classifier latents
+        if len(zs) > 0 and len(Ws) > 0:
+            # Add classifier latents
+            results.update({
+                PREDICTION_KEYS.ZS_KEY: torch.cat(zs).numpy(),
+                PREDICTION_KEYS.WS_KEY: torch.stack(Ws, dim=0).mean(dim=0).numpy()
+            })
+            
+        # Check aligned latents
+        if len(y_aligned_pred) > 0 and len(z2cs) > 0 and len(c2zs) > 0:
+            # Add aligned latents
+            y_aligned_pred = torch.cat(y_aligned_pred).numpy()
+            # Get actual class labels for predictions
+            n_algined_labels = len(aligned_logits[0])
+            aligned_soft_predictions = pd.DataFrame(
                 y_pred,
-                columns=self._label_mapping[:n_labels] if self.cls_emb is None else self.idx_to_label[:n_labels],
+                columns=self._label_mapping[:n_algined_labels] if self.cls_emb is None else self.idx_to_label[:n_algined_labels],
                 index=adata.obs_names[indices],
             )
-        # Return latent projections if they are available
-        if return_latent and y_cz is not None and y_ez is not None:
-            return pred, y_cz, y_ez
-        # Return predictions only
-        else:
-            return pred
+            # Take top prediction labels
+            aligned_predictions = aligned_soft_predictions.columns[np.argmax(aligned_soft_predictions, axis=-1)]
+            results.update({
+                PREDICTION_KEYS.ALIGN_PREDICTION_KEY: aligned_predictions,
+                PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY: aligned_soft_predictions,
+                PREDICTION_KEYS.ZS_KEY: torch.cat(z2cs).numpy(),
+                PREDICTION_KEYS.WS_KEY: torch.stack(c2zs, dim=0).mean(dim=0).numpy()
+            })
+        # Return predictions
+        return results
         
     def get_training_plan(self, **plan_kwargs):
         return self._training_plan_cls(
@@ -632,10 +688,8 @@ class JEDVI(
     @devices_dsp.dedent
     def train(
         self,
-        data_params: dict[str, Any]={}, 
-        model_params: dict[str, Any]={}, 
-        train_params: dict[str, Any]={},
-        minify_adata: bool = True,
+        config: dict[str, Any], 
+        minify_adata: bool = False,
     ):
         """Train the model.
 
@@ -645,6 +699,11 @@ class JEDVI(
         data_params: dict
             **kwargs for src.modules._splitter.ContrastiveDataSplitter
         """
+        from src.tune._statics import CONF_KEYS
+        # Unpack run config dictionary
+        data_params: dict[str, Any] = config.get(CONF_KEYS.DATA, {})
+        model_params: dict[str, Any] = config.get(CONF_KEYS.MODEL, {})
+        train_params: dict[str, Any] = config.get(CONF_KEYS.TRAIN, {})
         # Get max epochs specified in params
         epochs = train_params.get('max_epochs')
         # Determine number of epochs needed for complete training
@@ -686,17 +745,19 @@ class JEDVI(
             plan_kwargs['use_contr_in_val'] = True
         # Share code to label mapping with training plan
         plan_kwargs['_code_to_label'] = self._code_to_label.copy()
+        # Share batch labels with training plan
+        plan_kwargs['batch_labels'] = self._batch_mapping.copy()
         # Create training plan
         training_plan = self.get_training_plan(**plan_kwargs)
         # Check if tensorboard logger is given
         logger = train_params.get('logger')
         callbacks = []
         # Manage early stopping callback
-        if train_params.get('early_stopping', False) and train_params.get('early_stopping_start_epoch') is not None:
+        early_stopping_start_epoch = train_params.pop('early_stopping_start_epoch')
+        if train_params.get('early_stopping', False) and early_stopping_start_epoch is not None:
             # Disable scvi internal early stopping
             train_params['early_stopping'] = False
             # Create custom delayed early stopping using the start epoch parameter
-            early_stopping_start_epoch = train_params.pop('early_stopping_start_epoch')
             early_stopping_callback = DelayedEarlyStopping(
                 start_epoch=early_stopping_start_epoch,
                 monitor=train_params.get('early_stopping_monitor', 'validation_loss'),
@@ -768,12 +829,12 @@ class JEDVI(
         runner()
         # Add latent representation to model
         qzm, qzv = self.get_latent_representation(return_dist=True)
-        self.adata.obsm[REGISTRY_KEYS.LATENT_QZM_KEY] = qzm
-        self.adata.obsm[REGISTRY_KEYS.LATENT_QZV_KEY] = qzv
+        self.adata.obsm[self._LATENT_QZM_KEY] = qzm
+        self.adata.obsm[self._LATENT_QZV_KEY] = qzv
         # Minify the model if enabled and adata is not already minified
         if minify_adata and not self.is_minified:
             logging.info(f'Minifying adata with latent distribution')
-            self.minify_adata(use_latent_qzm_key=REGISTRY_KEYS.LATENT_QZM_KEY, use_latent_qzv_key=REGISTRY_KEYS.LATENT_QZV_KEY)
+            self.minify_adata(use_latent_qzm_key=self._LATENT_QZM_KEY, use_latent_qzv_key=self._LATENT_QZV_KEY)
         
     def _validate_anndata(
         self, adata: AnnOrMuData | None = None, copy_if_view: bool = True, extend_categories: bool = True
@@ -795,33 +856,6 @@ class JEDVI(
             # Case where correct AnnDataManager is found, replay registration as necessary.
             adata_manager.validate()
         return adata
-    
-    def create_test_data(self, adata: AnnData) -> AnnData:
-        import anndata as ad
-        # Subset test data features to the features the model has been trained on
-        model_genes = self.adata.var_names
-        v_mask = adata.var_names.isin(model_genes)
-        adata._inplace_subset_var(v_mask)
-        # Pad missing features with 0 vectors
-        missing_genes = model_genes.difference(adata.var_names)
-        n_missing = len(missing_genes)
-        if n_missing > 0:
-            logging.info(f'Found {n_missing} missing features in test data. Setting them to 0.')
-            # Copy .var info from model's adata
-            missing_var = self.adata[:,missing_genes].var
-            # Retain cell-specfic information
-            missing_obs = adata.obs.copy()
-            # Create empty expression for missing genes for all cells
-            missing_X = np.zeros((adata.shape[0], missing_genes.shape[0]))
-            missing_X = sp.csr_matrix(missing_X)
-            # Create padded adata object
-            missing_adata = AnnData(X=missing_X, obs=missing_obs, var=missing_var)
-            uns = deepcopy(adata.uns)
-            adata = ad.concat([adata, missing_adata], axis=1)
-            adata.obs = missing_obs
-            adata.uns = uns
-        # Sort .var to same order as observed in model's adata
-        return adata[:,self.adata.var_names].copy()
     
     def _get_available_splits(self) -> list[str]:
         """Get list of available data splits in the model.
@@ -880,14 +914,14 @@ class JEDVI(
         from sklearn.metrics import classification_report
 
         # Check if internal predictions are available
-        if REGISTRY_KEYS.PREDICTION_KEY not in self.adata.obs:
+        if PREDICTION_KEYS.PREDICTION_KEY not in self.adata.obs:
             raise ValueError('Run self.evaluate() before calculating statistics.')
         # Get mode adata
         mode_adata = self._get_split_adata(split, ignore_ctrl=ignore_ctrl)
         # Generate a classification report for the relevant mode
         report = classification_report(
             mode_adata.obs[self.original_label_key],
-            mode_adata.obs[REGISTRY_KEYS.PREDICTION_KEY],
+            mode_adata.obs[PREDICTION_KEYS.PREDICTION_KEY],
             zero_division=np.nan,
             output_dict=True
         )
@@ -914,8 +948,8 @@ class JEDVI(
             reports.append(report)
         summaries = pd.concat(summaries, axis=0)
         reports = pd.concat(reports, axis=0)
-        self.adata.uns[REGISTRY_KEYS.SUMMARY_KEY] = summaries
-        self.adata.uns[REGISTRY_KEYS.REPORT_KEY] = reports
+        self.adata.uns[PREDICTION_KEYS.SUMMARY_KEY] = summaries
+        self.adata.uns[PREDICTION_KEYS.REPORT_KEY] = reports
 
     def _register_top_n_predictions(self) -> None:
         """Calculate performance metrics for each data split and optionally also for each context"""
@@ -925,15 +959,15 @@ class JEDVI(
             context_key=self.original_batch_key,
             labels_key=self.original_label_key,
             ctrl_key=self.ctrl_class,
-            predictions_key=REGISTRY_KEYS.SOFT_PREDICTION_KEY,
+            predictions_key=PREDICTION_KEYS.SOFT_PREDICTION_KEY,
         )
         # Add data to model's adata
-        self.adata.uns[REGISTRY_KEYS.TOP_N_PREDICTION_KEY] = top_n_predictions
+        self.adata.uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY] = top_n_predictions
 
     def _get_top_n_predictions(self) -> pd.DataFrame:
-        if REGISTRY_KEYS.TOP_N_PREDICTION_KEY not in self.adata.obsm:
+        if PREDICTION_KEYS.TOP_N_PREDICTION_KEY not in self.adata.obsm:
             raise KeyError('No model evaluation top prediction metrics available. Run model.evaluate()')
-        return self.adata.obsm[REGISTRY_KEYS.TOP_N_PREDICTION_KEY]
+        return self.adata.obsm[PREDICTION_KEYS.TOP_N_PREDICTION_KEY]
 
     def _register_split_labels(self, force: bool = True) -> None:
         """Add split label to self.adata.obs"""
@@ -954,17 +988,30 @@ class JEDVI(
         # Check if model has been trained
         self._check_if_trained(warn=False)
         # Predictions have not yet been made
-        if REGISTRY_KEYS.PREDICTION_KEY in self.adata.obs and not force:
+        if PREDICTION_KEYS.PREDICTION_KEY in self.adata.obs and not force:
             return
         # Add split information to self.adata
         self._register_split_labels(force=force)
         # Run classifier forward pass, return soft predictions and latent spaces
-        soft_pred, z2c, c2z = self.predict(soft=True, return_latent=True)
-        # Save predictions to model adata
-        self.adata.obs[REGISTRY_KEYS.PREDICTION_KEY] = soft_pred.columns[np.argmax(soft_pred, axis=-1)]     # (cells,)
-        self.adata.obsm[REGISTRY_KEYS.SOFT_PREDICTION_KEY] = soft_pred          # (cells, classes)
-        self.adata.obsm[self._LATENT_Z2C_KEY] = z2c     # z to class space projection latent (cells, shared dim)
-        self.adata.uns[self._LATENT_C2Z_KEY] = c2z      # class embedding space (classes, shared dim)
+        po = self.predict()
+        # Save regular classification predictions to model adata
+        self.adata.obs[PREDICTION_KEYS.PREDICTION_KEY] = po[PREDICTION_KEYS.PREDICTION_KEY]
+        self.adata.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.SOFT_PREDICTION_KEY]          # (cells, classes)
+        # Save aligned predictions and latent spaces to model
+        aligned_pred = po.get(PREDICTION_KEYS.ALIGN_PREDICTION_KEY)
+        if aligned_pred:
+            self.adata.obs[PREDICTION_KEYS.ALIGN_PREDICTION_KEY] = aligned_pred
+        # Add aligned soft prediction
+        aligned_soft_pred = po.get(PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY)
+        if aligned_soft_pred:
+            self.adata.obs[PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY] = aligned_soft_pred
+        # Save aligned latent spaces
+        z2c = po.get(PREDICTION_KEYS.Z2C_KEY)
+        if z2c:
+            self.adata.obsm[self._LATENT_Z2C_KEY] = z2c     # z to class space projection latent (cells, shared dim)
+        c2z = po.get(PREDICTION_KEYS.C2Z_KEY)
+        if c2z:
+            self.adata.uns[self._LATENT_C2Z_KEY] = c2z      # class embedding space (classes, shared dim)
         # Calculate top N predictions over model data
         self._register_top_n_predictions()
         # Set evaluation as completed
@@ -1023,8 +1070,8 @@ class JEDVI(
             # Return evaluation results as dictionary
             if results_mode == 'return':
                 return_obj = {
-                    REGISTRY_KEYS.REPORT_KEY: eval_report,
-                    REGISTRY_KEYS.SUMMARY_KEY: eval_summary,
+                    PREDICTION_KEYS.REPORT_KEY: eval_report,
+                    PREDICTION_KEYS.SUMMARY_KEY: eval_summary,
                 }
             # Save reports as seperate files in output directory
             elif results_mode == 'save':
@@ -1038,27 +1085,33 @@ class JEDVI(
         return return_obj
     
     def get_eval_summary(self) -> pd.DataFrame | None:
-        if REGISTRY_KEYS.SUMMARY_KEY not in self.adata.uns:
+        if PREDICTION_KEYS.SUMMARY_KEY not in self.adata.uns:
             logging.warning('No model evaluation summary available.')
             return None
-        return self.adata.uns[REGISTRY_KEYS.SUMMARY_KEY]
+        return self.adata.uns[PREDICTION_KEYS.SUMMARY_KEY]
     
     def get_eval_report(self) -> pd.DataFrame | None:
-        if REGISTRY_KEYS.REPORT_KEY not in self.adata.uns:
+        if PREDICTION_KEYS.REPORT_KEY not in self.adata.uns:
             logging.warning('No model evaluation report available.')
             return None
-        return self.adata.uns[REGISTRY_KEYS.REPORT_KEY]
+        return self.adata.uns[PREDICTION_KEYS.REPORT_KEY]
     
     def _plot_eval_split(self, split: str, plt_dir: str) -> None:
         """Plot confusion matrix per split."""
         # Get split data without control cells
-        adata = self._get_split_adata(split, ignore_ctrl=True)
+        adata = self._get_split_adata(split, ignore_ctrl=False)
         # Get actual and predicted class labels
         y = adata.obs[self.original_label_key].values.astype(str)
-        y_hat = adata.obs[REGISTRY_KEYS.PREDICTION_KEY].values.astype(str)
+        y_hat = adata.obs[PREDICTION_KEYS.PREDICTION_KEY].values.astype(str)
         # Create output file path
         o = os.path.join(plt_dir, f'cm_{split}.png')
         pl.plot_confusion(y, y_hat, plt_file=o)
+        # Plot mode umap using combined projection
+        groups = [self.original_batch_key, self.original_label_key]
+        for group in groups:
+            # Plot a umap projection for every group
+            o = os.path.join(plt_dir, f'umap_{split}_{group}.png')
+            pl.plot_umap(adata, slot=self._LATENT_UMAP, hue=group, output_file=o)
 
     def _plot_eval_splits(self, plt_dir: str) -> None:
         """Generate all split-specific plots."""
@@ -1074,24 +1127,23 @@ class JEDVI(
         plt_dir = os.path.join(output_dir, 'plots')
         os.makedirs(plt_dir, exist_ok=True)
         # Calculate UMAP for latent space based on latent mean
-        umap_slot_key = f'{REGISTRY_KEYS.LATENT_QZM_KEY}_umap'
-        pl.calc_umap(self.adata, rep=REGISTRY_KEYS.LATENT_QZM_KEY, slot_key=umap_slot_key)
+        pl.calc_umap(self.adata, rep=self._LATENT_QZM_KEY, slot_key=self._LATENT_UMAP)
         # Plot full UMAP colored by data split
         umap_split_o = os.path.join(plt_dir, f'full_umap_{REGISTRY_KEYS.SPLIT_KEY}.png')
-        pl.plot_umap(self.adata, slot=umap_slot_key, hue=REGISTRY_KEYS.SPLIT_KEY, output_file=umap_split_o)
+        pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=REGISTRY_KEYS.SPLIT_KEY, output_file=umap_split_o)
         # Plot full UMAP colored by batch label
         umap_batch_o = os.path.join(plt_dir, f'full_umap_{self.original_batch_key}.png')
-        pl.plot_umap(self.adata, slot=umap_slot_key, hue=self.original_batch_key, output_file=umap_batch_o)
+        pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=self.original_batch_key, output_file=umap_batch_o)
         # Plot full UMAP colored by batch label
         umap_label_o = os.path.join(plt_dir, f'full_umap_{self.original_label_key}.png')
-        pl.plot_umap(self.adata, slot=umap_slot_key, hue=self.original_label_key, output_file=umap_label_o)
+        pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=self.original_label_key, output_file=umap_label_o)
         # Plot performance - support correlations
         support_corr_o = os.path.join(plt_dir, f'support_correlations.png')
-        pl.plot_performance_support_corr(self.adata.uns[REGISTRY_KEYS.REPORT_KEY], o=support_corr_o, hue=REGISTRY_KEYS.SPLIT_KEY)
+        pl.plot_performance_support_corr(self.adata.uns[PREDICTION_KEYS.REPORT_KEY], o=support_corr_o, hue=REGISTRY_KEYS.SPLIT_KEY)
         # Plot performance metric over top N predictions in all splits
         top_n_o = os.path.join(plt_dir, f'top_n_{metric}.png')
         pl.plot_top_n_performance(
-            self.adata.uns[REGISTRY_KEYS.TOP_N_PREDICTION_KEY],
+            self.adata.uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY],
             output_file=top_n_o,
             metric=metric,
             mean_split='val'
@@ -1099,12 +1151,206 @@ class JEDVI(
         # Plot individual splits
         self._plot_eval_splits(plt_dir)
         return
+    
+    def align_model_features(self, adata: AnnData) -> AnnData:
+        # Subset test data features to the features the model has been trained on
+        model_genes = self.adata.var_names
+        v_mask = adata.var_names.isin(model_genes)
+        adata._inplace_subset_var(v_mask)
+        # Pad missing features with 0 vectors
+        missing_genes = model_genes.difference(adata.var_names)
+        n_missing = len(missing_genes)
+        if n_missing > 0:
+            logging.info(f'Found {n_missing} missing features in test data.')
+            # Copy .var info from model's adata
+            missing_var = self.adata[:,missing_genes].var
+            # Retain cell-specfic information
+            missing_obs = adata.obs.copy()
+            # Create empty expression for missing genes for all cells
+            missing_X = np.zeros((adata.shape[0], missing_genes.shape[0]))
+            missing_X = sp.csr_matrix(missing_X)
+            # Create padded adata object
+            missing_adata = AnnData(X=missing_X, obs=missing_obs, var=missing_var)
+            uns = deepcopy(adata.uns)
+            adata = ad.concat([adata, missing_adata], axis=1)
+            adata.obs = missing_obs
+            adata.uns = uns
+        # Sort .var to same order as observed in model's adata
+        return adata[:,self.adata.var_names].copy()
+    
+    def minify_query(self, adata: ad.AnnData) -> None:
+        """Minify query test data."""
+        if self._LATENT_QZM_KEY not in adata.obsm or self._LATENT_QZV_KEY not in adata.obsm:
+            raise KeyError(f'Query data does not have latent representation. Run JEDVI.test() first.')
+        # Set .X to dense matrix of zeros
+        adata.X = sp.csr_matrix(np.zeros(adata.X.shape))
+    
+    def test(
+        self,
+        test_adata_p: str,
+        cls_label: str = 'cls_label',
+        batch_label: str = 'dataset',
+        output_dir: str | None = None,
+        incl_unseen: bool = False,
+        use_fixed_dataset_label: bool = True,
+        plot: bool = True,
+        results_mode: Literal['return', 'save'] | None = 'save',
+        min_cells_per_class: int = 10,
+        top_n: int = 10,
+        ctrl_key: str | None = None,
+        minify: bool = True,
+        seed: int = 42,
+    ) -> None:
+        """Function to evaluate model on unseen data."""
+        # TODO: all this only works for labelled data, inplement option to handle unlabelled data
+        # TODO: actually pretty easy, just set prediction column to unknown for all cells duh
+        # TODO: make this better
+        # Read test adata and filter columns
+        logging.info(f'Testing model with: {test_adata_p}')
+        test_ad = io.read_adata(test_adata_p, cls_label=cls_label, min_cells_per_class=min_cells_per_class)
+        # Filter test adata for trained classes
+        train_cls = set(self.get_training_classes())
+        test_cls = set(test_ad.obs[cls_label].unique())
+        available_cls = set(self.idx_to_label)
+        # Look for shared classes between testing set and trained data
+        shared_cls = test_cls.intersection(train_cls)
+        unseen_cls = test_cls.difference(train_cls)
+        test_cls = test_cls.intersection(available_cls)
+        # Check if any labels overlap
+        if len(test_cls) == 0:
+            raise ValueError(f'No overlapping class labels between model and test set.')
+        # Include unseen classes in testing or fall back to shared classes only
+        filter_cls = test_cls if incl_unseen else shared_cls
+        test_ad._inplace_subset_obs(test_ad.obs[cls_label].isin(filter_cls))
+        logging.info(f'Testing on {len(filter_cls)}/{len(test_cls)} classes.')
+        # Use a fixed dataset label for testing
+        ds_name = os.path.basename(test_adata_p).split('.h5ad')[0]
+        # Save original batch keys in adata
+        orig_batch_key = f'orig_{batch_label}'
+        test_ad.obs[orig_batch_key] = test_ad.obs[batch_label].values
+        # Set dataset labels for classification
+        if not use_fixed_dataset_label:
+            logging.info('Randomly drawing dataset labels from training data.')
+            training_datasets = self.adata.obs[self.original_batch_key].unique()
+            np.random.seed(seed)
+            ds_names = np.random.choice(training_datasets, test_ad.shape[0])
+            test_ad.obs[batch_label] = pd.Categorical(ds_names)
+        else:
+            logging.info(f'Added {ds_name} as dataset key.')
+            test_ad.obs[batch_label] = ds_name
+        # Register new testing data with model
+        self.setup_anndata(test_ad, labels_key=cls_label, batch_key=batch_label)
+        # Make sure test adata's features are consistent with model
+        self.align_model_features(test_ad)
+        # Get latent representation of model
+        qzm, qzv = self.get_latent_representation(adata=test_ad, return_dist=True)
+        test_ad.obsm[self._LATENT_QZM_KEY] = qzm
+        test_ad.obsm[self._LATENT_QZV_KEY] = qzv
+        # Minify test data
+        if minify:
+            self.minify_query(test_ad)
+        # Get model predictions for test data
+        use_full = None if not incl_unseen else True
+        prediction_output = self.predict(adata=test_ad, use_full_cls_emb=use_full)
+        # Select aligned output if available
+        if PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY in prediction_output:
+            # Set aligned predictions as final predictions
+            soft_pred_key = prediction_output[PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY]
+            pred_key = prediction_output[PREDICTION_KEYS.ALIGN_PREDICTION_KEY]
+        # Fall back to standard classification
+        else:
+            if incl_unseen:
+                logging.warning(f'Unseen classes are included. Default classification output cannot zero-shot.')
+            soft_pred_key = PREDICTION_KEYS.SOFT_PREDICTION_KEY
+            pred_key = PREDICTION_KEYS.PREDICTION_KEY
+        # Get predictions from model output
+        soft_predictions = prediction_output[soft_pred_key]
+        predictions = prediction_output[pred_key]
+        # Save predictions to test adata
+        test_ad.obs[PREDICTION_KEYS.PREDICTION_KEY] = predictions
+        test_ad.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = soft_predictions
+        # Evaluate test results
+        if output_dir is None and self.model_log_dir is None:
+            logging.warning(f'No output location provided. Please specify an output directory.')
+            return
+        # Create output directory, fall back to model's tensorboard directory
+        if output_dir is None:
+            output_dir = os.path.join(self.model_log_dir, 'test', ds_name)
+        os.makedirs(output_dir, exist_ok=True)
+        logging.info(f'Evaluating results for test set. Test output dir: {output_dir}')
+        summary, report = pf.get_classification_report(
+            test_ad,
+            cls_label=cls_label,
+            pred_label=PREDICTION_KEYS.PREDICTION_KEY
+        )
+        # Save results to test adata
+        test_ad.uns[PREDICTION_KEYS.SUMMARY_KEY] = summary
+        test_ad.uns[PREDICTION_KEYS.REPORT_KEY] = report
+        # Add split information to test data
+        test_ad.obs[REGISTRY_KEYS.SPLIT_KEY] = 'test'
+        # Calculate top n predictions
+        top_n_predictions = pf.compute_top_n_predictions(
+            test_ad,
+            split_key=REGISTRY_KEYS.SPLIT_KEY,
+            context_key=batch_label,
+            labels_key=cls_label,
+            ctrl_key=ctrl_key,
+            train_perturbations=list(train_cls)
+        )
+        # Save top n predictions to test adata
+        test_ad.uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY] = top_n_predictions
+        
+        # Ensure batch and class keys are consistent
+        test_ad.obs[self.original_batch_key] = test_ad.obs[batch_label].values
+        test_ad.obs[self.original_label_key] = test_ad.obs[cls_label].values
+        # Merge latent spaces and re-calculte a shared umap
+        test_uns = deepcopy(test_ad.uns)
+        test_ad = ad.concat((self.adata, test_ad))
+        test_ad.uns = test_uns
+        # Always re-calculate umap
+        pl.calc_umap(test_ad, rep=self._LATENT_QZM_KEY, slot_key=self._LATENT_UMAP, force=True)
+        # Determine result object
+        return_obj = None
+        if results_mode is not None:
+            if results_mode == 'return':
+                # Return merged data adata
+                return_obj = test_ad
+            elif results_mode == 'save':
+                # Save results adata to disk
+                test_ad_o = os.path.join(output_dir, f'full.h5ad')
+                test_ad.write_h5ad(test_ad_o)
+        # Plot results
+        if plot:
+            # Create plot output directory
+            plt_dir = os.path.join(output_dir, 'plots')
+            os.makedirs(plt_dir, exist_ok=True)
+            # Plot top n metrics
+            top_n_o = os.path.join(plt_dir, f'top_n_predictions_split.svg')
+            pl.plot_top_n_performance(
+                top_n_predictions=top_n_predictions,
+                output_file=top_n_o,
+                top_n=top_n,
+                mean_split='test'
+            )
+            # Plot merged latent space for different labels
+            hues = [REGISTRY_KEYS.SPLIT_KEY, self.original_batch_key, self.original_label_key]
+            pl.plot_umaps(
+                test_ad,
+                slot=self._LATENT_UMAP,
+                hue=hues,
+                output_dir=plt_dir
+            )
+        return return_obj
+
+    def get_training_classes(self) -> np.ndarray:
+        """Get trained class label names. Class labels are sorted by observed and unobserved."""
+        return self.idx_to_label[:self.n_train_labels]
 
     @classmethod
     def load_checkpoint(
         cls,
         model_dir: str,
-        adata: AnnData | None,
+        adata: AnnData | None = None,
         n: int = 0,
         checkpoint_dirname: str = 'checkpoints',
         model_name: str = 'model.pt',
@@ -1125,12 +1371,12 @@ class JEDVI(
         model_state_dir = os.path.join(model_dir, default_dirname)
         return super().load(model_state_dir, adata=adata)
     
-    def save(self, keep_emb: bool = True, *args, **kwargs) -> None:
+    def save(self, *args, **kwargs) -> None:
         """Save wrapper to handle external model embeddings"""
-        # Handle external model embeddings
-        if self.cls_emb is not None:
+        # Handle external model embeddings if anndata is saved with model
+        if self.cls_emb is not None and bool(kwargs.get('save_anndata')):
             # Convert embeddings to numpy arrays
-            if keep_emb:
+            if bool(kwargs.get('keep_emb')):
                 self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
                 self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
             # Remove embeddings completely
@@ -1176,15 +1422,15 @@ class JEDVI(
         ]
         # Add class embedding matrix with shape (n_labels, class_emb_dim)
         if class_emb_uns_key is not None and class_emb_uns_key in adata.uns:
-            logging.info(f'Adding class embedding from adata.uns[{class_emb_uns_key}] to model')
+            logging.info(f'Registered class embedding from adata.uns[{class_emb_uns_key}].')
             anndata_fields.append(StringUnsField(REGISTRY_KEYS.CLS_EMB_KEY, class_emb_uns_key))
         # Add gene embedding matrix with shape (n_vars, emb_dim)
         if gene_emb_varm_key is not None and gene_emb_varm_key in adata.varm:
-            logging.info(f'Adding gene embedding from adata.varm[{gene_emb_varm_key}] to model')
+            logging.info(f'Registered gene embedding from adata.varm[{gene_emb_varm_key}].')
             anndata_fields.append(VarmField(REGISTRY_KEYS.GENE_EMB_KEY, gene_emb_varm_key))
         # Add class score per cell, ensure its scaled [0, 1]
         if class_certainty_key is not None:
-            logging.info(f'Adding class certainty score from adata.obs[{class_certainty_key}] to model')
+            logging.info(f'Registered class certainty score from adata.obs[{class_certainty_key}].')
             scaled_class_cert_key = f'{class_certainty_key}_scaled'
             adata.obs[scaled_class_cert_key] = scale_1d_array(adata.obs[class_certainty_key].astype(float).values)
             anndata_fields.append(NumericalObsField(REGISTRY_KEYS.CLS_CERT_KEY, scaled_class_cert_key, required=False))

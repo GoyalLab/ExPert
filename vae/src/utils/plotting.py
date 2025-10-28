@@ -17,6 +17,7 @@ from scanpy.plotting import palettes
 from src.utils.constants import REGISTRY_KEYS
 
 
+
 def get_pal(n: int, seed: int | None = None) -> list:
     """Return a list of n colors, using sensible defaults for small/medium sizes
     and falling back to evenly spaced hues for large n.
@@ -37,7 +38,7 @@ def get_pal(n: int, seed: int | None = None) -> list:
     # Large: generate evenly spaced hues (HLS) for arbitrary n
     return sns.color_palette('hls', n)
 
-def calc_umap(adata: ad.AnnData, rep: str = 'X_pca', slot_key: str | None = None, force: bool = False) -> None:
+def calc_umap(adata: ad.AnnData, rep: str = 'X_pca', slot_key: str | None = None, force: bool = False, return_umap: bool = False) -> None | umap.UMAP:
     # Create default slot name if none is given, else use the specified key
     slot_key = f'{rep}_umap' if slot_key is None else slot_key
     # Cache umap generation
@@ -50,6 +51,7 @@ def calc_umap(adata: ad.AnnData, rep: str = 'X_pca', slot_key: str | None = None
         raise ValueError(f'Could not find {rep} slot in adata.obsm.')
     # Save embeddings to adata
     adata.obsm[slot_key] = _umap.fit_transform(adata.obsm[rep])
+    return _umap if return_umap else None
 
 def plot_umap(
         adata: ad.AnnData, 
@@ -57,6 +59,7 @@ def plot_umap(
         hue: str, 
         output_file: str | None,
         title: str = '',
+        show_spines: bool = True,
         **scatter_kwargs,
     ) -> None:
     # Check if adata.obsm slot exists
@@ -81,16 +84,17 @@ def plot_umap(
         scatter_kwargs['legend'] = True
     # Create plot
     plt.figure(dpi=300)
-    default_scatter_kwargs = {'s': 10, 'alpha': 0.7}
+    default_scatter_kwargs = {'s': 4, 'alpha': 0.5}
     default_scatter_kwargs.update(scatter_kwargs)
     ax = sns.scatterplot(
         embedding, x='UMAP1', y='UMAP2', 
         hue=hue,
         **default_scatter_kwargs
     )
-    # Disable spines
-    for spine in ax.spines.values():
-        spine.set_visible(False)
+    # Toggle spines
+    if not show_spines:
+        for spine in ax.spines.values():
+            spine.set_visible(False)
     # Set axes labels
     ax.set_xticks([])
     ax.set_yticks([])
@@ -117,6 +121,25 @@ def plot_umap(
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
     # Close the plot in any case
     plt.close()
+
+def plot_umaps(
+        adata: ad.AnnData,
+        slot: str = 'X_umap',
+        hue: list[str] | str = 'cls_label',
+        output_dir: str | None = None,
+        **kwargs
+    ) -> None:
+    """Function to plot multiple umaps."""
+    # Ensure hue is always a list
+    hue = [hue] if not isinstance(hue, list) else hue
+    for h in hue:
+        o = os.path.join(output_dir, f'umap_{h}.png') if output_dir is not None else None
+        plot_umap(
+            adata=adata, 
+            slot=slot, 
+            hue=h, 
+            output_file=o
+        )
 
 def calc_umap_scanpy(adata: ad.AnnData, rep: str = 'X') -> None:
     if rep == 'X' and adata.X.shape[1] > 512:
@@ -217,14 +240,23 @@ def plot_performance_support_corr(report: pd.DataFrame, o: str, hue: str | None 
 def plot_top_n_performance(
         top_n_predictions: pd.DataFrame,
         output_file: str | None,
+        hue: str = 'split',
         metric: Literal['f1-score', 'accuracy', 'precision', 'recall'] = 'f1-score',
-        title: str = '',
+        show_random: bool = True,
+        title: str | None = None,
         top_n: int = 10,
         mean_split: Literal['train', 'val', 'test'] | None = 'test',
         **kwargs
     ) -> None:
+    # Replace title with number of classes
+    n_classes = top_n_predictions.label.nunique()
+    title = f'Top N predictions (N={n_classes})'
     # Subset data to only show up to top_n predictions
     data = top_n_predictions[top_n_predictions.top_n <= top_n].copy()
+    # Show random or not
+    if show_random:
+        # Replace all values of hue with random if 'mode' is random
+        data.loc[data['mode']=='random',hue] = 'random'
     # Calculate mean values for a specified split if given
     if mean_split is not None and mean_split in top_n_predictions[REGISTRY_KEYS.SPLIT_KEY].unique():
         top_split = data[data[REGISTRY_KEYS.SPLIT_KEY]==mean_split]
@@ -241,12 +273,12 @@ def plot_top_n_performance(
         data,
         x='top_n',
         y=metric,
-        hue='split',
+        hue=hue,
         **kwargs
     )
     # Put legend outside of main plot
     plt.legend(
-        title='split',
+        title=hue,
         bbox_to_anchor=(1.05, 1),
         loc='upper left',
         borderaxespad=0
@@ -254,7 +286,7 @@ def plot_top_n_performance(
     # Rename axis labels
     plt.xlabel('Top N predictions')
     plt.ylabel(metric.capitalize())
-    plt.title(title)
+    plt.title(title, pad=20)
     # Set y axis limits to 0-1
     plt.ylim((0, 1))
     # Display means on top of boxes if not none

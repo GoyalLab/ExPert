@@ -64,6 +64,42 @@ class MemoryQueue:
             return None, None
         n = self.size if self.filled else self.ptr
         return self.queue_z[:n].clone(), self.queue_y[:n].clone()
+    
+
+class ContextEmbedding(nn.Module):
+    """Wrapper for context embeddings with optional unseen-context buffer."""
+    def __init__(
+        self,
+        n_contexts: int,
+        emb_dim: int = 5,
+        add_unseen_buffer: bool = True,
+        set_buffer_to_mean: bool = True,
+    ):
+        super().__init__()
+        self.add_unseen_buffer = add_unseen_buffer
+        self.set_buffer_to_mean = set_buffer_to_mean
+
+        n_total = n_contexts + (1 if add_unseen_buffer else 0)
+        self.embedding = nn.Embedding(n_total, emb_dim)
+
+        # Optionally initialize unseen buffer to mean of others
+        if set_buffer_to_mean and add_unseen_buffer:
+            with torch.no_grad():
+                mean_vec = self.embedding.weight[:-1].mean(0, keepdim=True)
+                self.embedding.weight[-1] = mean_vec
+
+    def forward(self, context_idx: torch.Tensor):
+        return self.embedding(context_idx)
+
+    @property
+    def unseen_index(self):
+        """Index of the unseen context embedding."""
+        return self.embedding.num_embeddings - 1
+    
+    @property
+    def weight(self):
+        """Return embedding weight"""
+        return self.embedding.weight
 
 
 class ExternalClassEmbedding(nn.Module):
@@ -110,18 +146,15 @@ class ExternalClassEmbedding(nn.Module):
             # Disable control embedding
             self.use_control_emb = False
 
-    def forward(self, labels: torch.Tensor | None = None, n_negatives: int | None = None, device: int | str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, labels: torch.Tensor | None = None, n_negatives: int | None = None, device: int | str | None = None) -> torch.Tensor:
         # Determine output device
         _device = device if device is not None else self.device
         # Update control embedding and class similarities
         if self.use_control_emb:
             # Return static embedding + learnable control embedding
             self.cls_emb[self.ctrl_class_idx] = self.control_emb.squeeze(0)
-            # Recalculate class similarities every time since control is changing
-            self.cls_sim = self.cls_emb @ self.cls_emb.T
         # Create local output parameters
         cls_emb = self.cls_emb.to(device=_device)
-        cls_sim = self.cls_sim.to(device=_device)
         # Subset to observed classes only
         if labels is not None:
             # Remove all class indices that are not observed during training
@@ -141,10 +174,9 @@ class ExternalClassEmbedding(nn.Module):
             # Mask all other classes with zeros
             cls_emb = F.normalize(cls_emb, dim=-1)
             cls_emb = cls_emb * (is_observed_mask).float().unsqueeze(-1)
-            cls_sim = cls_sim * is_observed_mask.float().unsqueeze(0) * is_observed_mask.float().unsqueeze(1)
 
         # Move to device and return
-        return cls_emb, cls_sim
+        return cls_emb
         
     @property
     def shape(self) -> tuple[int, int]:
@@ -1003,41 +1035,21 @@ class MultiHeadAttentionMM(nn.Module):
             return out, self.last_attn_weights if self.last_attn_weights.numel() else attn.view(B, H, L, L)
         return out
 
+class FiLM(nn.Module):
+    """Feature-wise Linear Modulation layer."""
+    def __init__(self, feature_dim: int, context_dim: int):
+        super().__init__()
+        self.gamma = nn.Linear(context_dim, feature_dim)
+        self.beta = nn.Linear(context_dim, feature_dim)
+
+    def forward(self, z: torch.Tensor, context_emb: torch.Tensor) -> torch.Tensor:
+        gamma = self.gamma(context_emb)
+        beta = self.beta(context_emb)
+        return gamma * z + beta  # FiLM modulation
+
 # Encoder
 class Encoder(nn.Module):
-    """Encode data of ``n_input`` dimensions into a latent space of ``n_output`` dimensions.
-
-    Uses a fully-connected neural network of ``n_hidden`` layers.
-
-    Parameters
-    ----------
-    n_input
-        The dimensionality of the input (data space)
-    n_output
-        The dimensionality of the output (latent space)
-    n_cat_list
-        A list containing the number of categories
-        for each category of interest. Each category will be
-        included using a one-hot encoding
-    n_layers
-        The number of fully-connected hidden layers
-    n_hidden
-        The number of nodes per hidden layer
-    dropout_rate
-        Dropout rate to apply to each of the hidden layers
-    distribution
-        Distribution of z
-    var_eps
-        Minimum value for the variance;
-        used for numerical stability
-    var_activation
-        Callable used to ensure positivity of the variance.
-        Defaults to :meth:`torch.exp`.
-    return_dist
-        Return directly the distribution of z instead of its parameters.
-    **kwargs
-        Keyword args for :class:`~scvi.nn.FCLayers`
-    """
+    """Encode data into latent space, optionally conditioned on context via concatenation or FiLM."""
 
     def __init__(
         self,
@@ -1046,6 +1058,7 @@ class Encoder(nn.Module):
         n_hidden: int,
         n_cat_list: Iterable[int] = None,
         n_layers: int = 1,
+        n_dim_context_emb: int | None = None,
         dropout_rate: float = 0.1,
         distribution: str = "normal",
         var_eps: float = 1e-4,
@@ -1053,27 +1066,38 @@ class Encoder(nn.Module):
         return_dist: bool = False,
         use_feature_mask: bool = False,
         drop_prob: float = 0.25,
-        encoder_type: Literal['funnel', 'fc', 'transformer'] = 'funnel',
+        encoder_type: Literal["funnel", "fc", "transformer"] = "funnel",
+        use_film: bool = False,
         **kwargs,
     ):
         super().__init__()
 
-        # Choose encoder type
-        if encoder_type == 'funnel':
+        # Choose encoder class
+        if encoder_type == "funnel":
             self.fclayers_class = FunnelFCLayers
-        elif encoder_type == 'fc':
+        elif encoder_type == "fc":
             self.fclayers_class = FCLayers
-        elif encoder_type == 'transformer':
+        elif encoder_type == "transformer":
             self.fclayers_class = AttentionLayers
+        else:
+            raise ValueError(f"Unknown encoder_type: {encoder_type}")
 
         self.encoder_type = encoder_type
         self.distribution = distribution
         self.var_eps = var_eps
         self.n_input = n_input
-        # Setup encoder layers
+        self.n_dim_context_emb = n_dim_context_emb or 0
+        self.use_feature_mask = use_feature_mask
+        self.drop_prob = drop_prob
+        self.return_dist = return_dist
+        self.use_film = use_film
+
         funnel_out_dim = 2 * n_output
+        encoder_input_dim = n_input if use_film else n_input + self.n_dim_context_emb
+
+        # Base encoder layers
         self.encoder = self.fclayers_class(
-            n_in=n_input,
+            n_in=encoder_input_dim,
             n_out=funnel_out_dim,
             n_hidden=n_hidden,
             n_cat_list=n_cat_list,
@@ -1081,95 +1105,45 @@ class Encoder(nn.Module):
             dropout_rate=dropout_rate,
             **kwargs,
         )
+
+        if use_film and self.n_dim_context_emb > 0:
+            self.film = FiLM(feature_dim=funnel_out_dim, context_dim=self.n_dim_context_emb)
+
         self.mean_encoder = nn.Linear(funnel_out_dim, n_output)
         self.var_encoder = nn.Linear(funnel_out_dim, n_output)
-        self.return_dist = return_dist
-        self.use_feature_mask = use_feature_mask
-        self.drop_prob = drop_prob
-
-        if distribution == "ln":
-            self.z_transformation = nn.Softmax(dim=-1)
-        else:
-            self.z_transformation = _identity
         self.var_activation = torch.exp if var_activation is None else var_activation
+        self.z_transformation = nn.Softmax(dim=-1) if distribution == "ln" else _identity
 
-    def forward(self, x: torch.Tensor, *cat_list: int, g: torch.Tensor | None = None):
-        r"""The forward computation for a single sample.
-
-         #. Encodes the data into latent space using the encoder network
-         #. Generates a mean \\( q_m \\) and variance \\( q_v \\)
-         #. Samples a new value from an i.i.d. multivariate normal
-            \\( \\sim Ne(q_m, \\mathbf{I}q_v) \\)
-
-        Parameters
-        ----------
-        x
-            tensor with shape (n_input,)
-        cat_list
-            list of category membership(s) for this sample
-
-        Returns
-        -------
-        3-tuple of :py:class:`torch.Tensor`
-            tensors of shape ``(n_latent,)`` for mean and var, and sample
-
-        """
-        feature_mask = None
+    def forward(self, x: torch.Tensor, *cat_list: int, g: torch.Tensor | None = None, context_emb: torch.Tensor | None = None):
+        # Optional feature masking
         if self.training and self.use_feature_mask and self.drop_prob > 0:
-            # Sample mask: 1 for keep, 0 for drop
-            feature_mask = torch.bernoulli(torch.full((self.n_input,), 1 - self.drop_prob))  # shape: (num_features,)
-            feature_mask = feature_mask.view(1, -1)  # shape: (1, num_features)
-            feature_mask = feature_mask.expand(x.shape[0], -1)  # broadcast to full batch
-            feature_mask = feature_mask.to(x.device)
-            x = x * feature_mask
-        # Parameters for latent distribution
-        if self.encoder_type == 'transformer':
-            q = self.encoder(x, *cat_list, gene_embedding=g)
+            mask = torch.bernoulli(torch.full((self.n_input,), 1 - self.drop_prob, device=x.device)).view(1, -1)
+            x = x * mask.expand(x.shape[0], -1)
+
+        # Concatenate or modulate by context
+        if self.n_dim_context_emb > 0 and context_emb is not None:
+            if self.use_film:
+                # Film modulation inside encoder
+                q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
+                q = self.film(q, context_emb)
+            else:
+                # Simple concatenation
+                x = torch.cat([x, context_emb], dim=-1)
+                q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
         else:
-            q = self.encoder(x, *cat_list)
-        # Project to mean and variance
+            q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
+
+        # Latent heads
         q_m = self.mean_encoder(q)
         q_v = self.var_activation(self.var_encoder(q)) + self.var_eps
-        # Create Normal distribution and sample a latent
         dist = Normal(q_m, q_v.sqrt())
         latent = self.z_transformation(dist.rsample())
-        if self.return_dist:
-            return dist, latent
-        return q_m, q_v, latent
+        return (dist, latent) if self.return_dist else (q_m, q_v, latent)
+
 
 # Decoder
 class DecoderSCVI(nn.Module):
-    """Decodes data from latent space of ``n_input`` dimensions into ``n_output`` dimensions.
-
-    Uses a fully-connected neural network of ``n_hidden`` layers.
-
-    Parameters
-    ----------
-    n_input
-        The dimensionality of the input (latent space)
-    n_output
-        The dimensionality of the output (data space)
-    n_cat_list
-        A list containing the number of categories
-        for each category of interest. Each category will be
-        included using a one-hot encoding
-    n_layers
-        The number of fully-connected hidden layers
-    n_hidden
-        The number of nodes per hidden layer
-    dropout_rate
-        Dropout rate to apply to each of the hidden layers
-    inject_covariates
-        Whether to inject covariates in each layer, or just the first (default).
-    use_batch_norm
-        Whether to use batch norm in layers
-    use_layer_norm
-        Whether to use layer norm in layers
-    scale_activation
-        Activation layer to use for px_scale_decoder
-    **kwargs
-        Keyword args for :class:`~scvi.nn.FCLayers`.
-    """
+    """Decodes latent variables, optionally conditioned on context via concatenation or FiLM."""
 
     def __init__(
         self,
@@ -1182,32 +1156,35 @@ class DecoderSCVI(nn.Module):
         use_batch_norm: bool = False,
         use_layer_norm: bool = False,
         scale_activation: Literal["softmax", "softplus"] = "softmax",
-        use_funnel: bool = False,    
+        use_funnel: bool = False,
         linear_decoder: bool = False,
+        n_dim_context_emb: int | None = None,
+        use_film: bool = False,
         **kwargs,
     ):
         super().__init__()
+        self.n_dim_context_emb = n_dim_context_emb or 0
+        self.use_film = use_film
+
+        decoder_input_dim = n_input if use_film else n_input + self.n_dim_context_emb
         funnel_out_dim = n_output // 2
-        # Initialize px decoder
+
         if linear_decoder:
-            # Create linear decoder
             self.px_decoder = FCLayers(
-                n_in=n_input, 
-                n_out=funnel_out_dim, 
-                n_cat_list=n_cat_list, 
+                n_in=decoder_input_dim,
+                n_out=funnel_out_dim,
+                n_cat_list=n_cat_list,
                 dropout_rate=0,
                 inject_covariates=inject_covariates,
                 use_batch_norm=use_batch_norm,
                 use_layer_norm=use_layer_norm,
                 inverted=True,
-                linear=True
+                linear=True,
             )
         else:
-            # Create non-linear decoder, either funneled or transformer-like
             fc_layer_class = FunnelFCLayers if use_funnel else FCLayers
-            
             self.px_decoder = fc_layer_class(
-                n_in=n_input,
+                n_in=decoder_input_dim,
                 n_out=funnel_out_dim,
                 n_hidden=n_hidden,
                 n_cat_list=n_cat_list,
@@ -1220,68 +1197,41 @@ class DecoderSCVI(nn.Module):
                 **kwargs,
             )
 
-        # mean gamma
+        if use_film and self.n_dim_context_emb > 0:
+            self.film = FiLM(feature_dim=funnel_out_dim, context_dim=self.n_dim_context_emb)
+
         if scale_activation == "softmax":
             px_scale_activation = nn.Softmax(dim=-1)
         elif scale_activation == "softplus":
             px_scale_activation = nn.Softplus()
-        self.px_scale_decoder = nn.Sequential(
-            nn.Linear(funnel_out_dim, n_output),
-            px_scale_activation,
-        )
+        else:
+            raise ValueError(f"Unknown scale_activation: {scale_activation}")
 
-        # dispersion: here we only deal with gene-cell dispersion case
+        self.px_scale_decoder = nn.Sequential(nn.Linear(funnel_out_dim, n_output), px_scale_activation)
         self.px_r_decoder = nn.Linear(funnel_out_dim, n_output)
-
-        # dropout
         self.px_dropout_decoder = nn.Linear(funnel_out_dim, n_output)
 
-    def forward(
-        self,
-        dispersion: str,
-        z: torch.Tensor,
-        library: torch.Tensor,
-        *cat_list: int,
-    ):
-        """The forward computation for a single sample.
+    def forward(self, dispersion: str, z: torch.Tensor, library: torch.Tensor, *cat_list: int, context_emb: torch.Tensor | None = None):
+        # Concatenate or modulate by context
+        if self.n_dim_context_emb > 0 and context_emb is not None:
+            if self.use_film:
+                px = self.px_decoder(z, *cat_list)
+                px = self.film(px, context_emb)
+            else:
+                z = torch.cat([z, context_emb], dim=-1)
+                px = self.px_decoder(z, *cat_list)
+        else:
+            px = self.px_decoder(z, *cat_list)
 
-         #. Decodes the data from the latent space using the decoder network
-         #. Returns parameters for the ZINB distribution of expression
-         #. If ``dispersion != 'gene-cell'`` then value for that param will be ``None``
-
-        Parameters
-        ----------
-        dispersion
-            One of the following
-
-            * ``'gene'`` - dispersion parameter of NB is constant per gene across cells
-            * ``'gene-batch'`` - dispersion can differ between different batches
-            * ``'gene-label'`` - dispersion can differ between different labels
-            * ``'gene-cell'`` - dispersion can differ for every gene in every cell
-        z :
-            tensor with shape ``(n_input,)``
-        library_size
-            library size
-        cat_list
-            list of category membership(s) for this sample
-
-        Returns
-        -------
-        4-tuple of :py:class:`torch.Tensor`
-            parameters for the ZINB distribution of expression
-
-        """
-        # The decoder returns values for the parameters of the ZINB distribution
-        px = self.px_decoder(z, *cat_list)
+        # Output heads
         px_scale = self.px_scale_decoder(px)
         px_dropout = self.px_dropout_decoder(px)
-        # Clamp to high value: exp(12) ~ 160000 to avoid nans (computational stability)
-        px_rate = torch.exp(library) * px_scale  # torch.clamp( , max=12)
+        px_rate = torch.exp(library) * px_scale
         px_r = self.px_r_decoder(px) if dispersion == "gene-cell" else None
         return px_scale, px_r, px_rate, px_dropout
 
 
-class EmbeddingClassifier(nn.Module):
+class EmbeddingAligner(nn.Module):
     """Classifier where latent attends to class embeddings, optionally externally provided,
     using dot product or cosine similarity. Compatible with external CE loss logic.
     """
@@ -1289,11 +1239,11 @@ class EmbeddingClassifier(nn.Module):
     def __init__(
         self,
         n_input: int,
-        n_hidden: int = 128,
-        n_labels: int = 5,
         n_layers: int = 1,
+        n_hidden: int = 128,
         dropout_rate: float = 0.1,
         logits: bool = True,
+        funnel: bool = True,
         use_batch_norm: bool = False,
         use_layer_norm: bool = True,
         activation_fn: nn.Module = nn.LeakyReLU,
@@ -1301,7 +1251,6 @@ class EmbeddingClassifier(nn.Module):
         shared_projection_dim: int | None = None,
         skip_projection: bool = False,
         return_latents: bool = True,
-        cos_angular_margin: float | None = 0.1,
         temperature: float = 0.1,
         use_learnable_temperature: bool = True,
         mode: Literal["latent_to_class", "class_to_latent", "shared"] = "latent_to_class",
@@ -1310,11 +1259,10 @@ class EmbeddingClassifier(nn.Module):
         super().__init__()
         self.logits = logits
         self.class_embed_dim = class_embed_dim
-        self.n_labels = n_labels
         self.dropout_rate = dropout_rate
+        self.funnel = funnel
         self.return_latents = return_latents
         self.mode = mode
-        self.cos_angular_margin = cos_angular_margin
         self._temperature = temperature
         self.use_learnable_temperature = use_learnable_temperature
         # Create a learnable temperature scaling
@@ -1326,10 +1274,12 @@ class EmbeddingClassifier(nn.Module):
             if skip_projection and n_in == n_out:
                 return nn.Identity()
             # Add funnel layer projections
-            if n_hidden > 0 and n_layers > 0:
-                return FunnelFCLayers(
+            if n_layers > 0:
+                layer_cls = FunnelFCLayers if funnel else FCLayers
+                return layer_cls(
                     n_in=n_in,
                     n_out=n_out,
+                    n_hidden=n_hidden,
                     n_layers=n_layers,
                     dropout_rate=dropout_rate,
                     use_batch_norm=use_batch_norm,
@@ -1369,18 +1319,15 @@ class EmbeddingClassifier(nn.Module):
         # ---- Dropout ---- #
         self.dropout = nn.Dropout(p=dropout_rate)
 
-        # ---- Learnable class embeddings ---- #
-        self.learned_class_embeds = nn.Parameter(torch.randn(n_labels, class_embed_dim))
-
     @property
     def temperature(self) -> torch.Tensor:
         if self.use_learnable_temperature:
             # Calculate logit scale
-            return 1.0 / self._temperature.clamp(0, 4.6).exp()
+            return 1.0 / self._temperature.clamp(1e-6, 4.6).exp()
         else:
             return self._temperature
     
-    def forward(self, x: torch.Tensor, class_embeds: torch.Tensor | None = None, labels: torch.Tensor | None = None, noise_sigma: float | None = None, **kwargs):
+    def forward(self, x: torch.Tensor, class_embeds: torch.Tensor, noise_sigma: float | None = None):
         """
         Parameters
         ----------
@@ -1389,9 +1336,7 @@ class EmbeddingClassifier(nn.Module):
         labels : Optional[Tensor], shape (batch,)
         """
         # Get class embeddings
-        class_embeds = (
-            self.learned_class_embeds if class_embeds is None else class_embeds.to(x.device)
-        )
+        class_embeds = class_embeds.to(x.device)
 
         # Apply projections
         z = self.latent_projection(x)               # (batch, d)
@@ -1405,18 +1350,132 @@ class EmbeddingClassifier(nn.Module):
         # Compute logits
         z_norm = F.normalize(z, dim=-1)
         c_norm = F.normalize(c, dim=-1)
-        logits = torch.matmul(z_norm, c_norm.T)
+        logits = torch.matmul(z_norm, c_norm.T).clamp(-1, 1)
 
-        # Scale by temperature and optionally enforce angular seperation
-        if labels is not None and self.cos_angular_margin is not None and self.cos_angular_margin > 0:
-            one_hot = F.one_hot(labels, num_classes=c.shape[0]).float()
-            logits = (logits - one_hot * self.cos_angular_margin) / self.temperature
-        else:
-            logits = logits / self.temperature
+        # Scale by temperature
+        logits = logits / self.temperature
         # Optionally return softmax
-        output = logits if self.logits else F.softmax(logits, dim=-1)
+        logits = logits if self.logits else F.softmax(logits, dim=-1)
         # Return logits only or tuple of logits and latent spaces
-        return (output, z_norm, c_norm) if self.return_latents else output
+        return (logits, z_norm, c_norm) if self.return_latents else logits
+    
+
+class ArcClassifier(nn.Module):
+    """
+    ArcFace-style classifier for angular-margin learning.
+
+    Parameters
+    ----------
+    n_input : int
+        Input feature dimension (e.g., encoder output).
+    n_hidden : int
+        Hidden dimension for optional intermediate layer (set 0 to disable).
+    n_labels : int
+        Number of class labels.
+    n_layers : int
+        Number of hidden layers before ArcFace head.
+    dropout_rate : float
+        Dropout probability.
+    margin : float
+        Additive angular margin (m).
+    scale : float
+        Feature scale (s).
+    use_batch_norm : bool
+        Apply batch normalization in hidden layers.
+    use_layer_norm : bool
+        Apply layer normalization in hidden layers.
+    activation_fn : nn.Module
+        Activation function.
+    temperature: float
+        Temperature scaling for logits
+    use_learnable_temperature: bool
+        Learn a temperature scaling from the static base temperature
+    """
+
+    def __init__(
+        self,
+        n_input: int,
+        n_labels: int,
+        n_hidden: int = 128,
+        n_layers: int = 1,
+        dropout_rate: float = 0.1,
+        margin: float = 0.3,
+        use_batch_norm: bool = True,
+        use_layer_norm: bool = False,
+        activation_fn: nn.Module = nn.ReLU,
+        temperature: float = 1.0,
+        use_learnable_temperature: bool = True,
+        return_latents: bool = True,
+        **kwargs,
+    ):
+        super().__init__()
+        self.margin = margin
+        self.n_labels = n_labels
+        self.use_learnable_temperature = use_learnable_temperature
+        self.return_latents = return_latents
+
+        # Create a learnable temperature scaling
+        if use_learnable_temperature:
+            self._temperature = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
+        # Fall back to static default temperature
+        else:
+            self._temperature = temperature
+
+        # Optional hidden layers
+        if n_hidden > 0 and n_layers > 0:
+            self.backbone = FCLayers(
+                n_in=n_input,
+                n_out=n_hidden,
+                n_layers=n_layers,
+                n_hidden=n_hidden,
+                dropout_rate=dropout_rate,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                activation_fn=activation_fn,
+                **kwargs,
+            )
+            feat_dim = n_hidden
+        else:
+            self.backbone = nn.Identity()
+            feat_dim = n_input
+
+        # ArcFace class weight matrix
+        self.W = nn.Parameter(torch.randn(n_labels, feat_dim))
+        nn.init.xavier_uniform_(self.W)
+
+    @property
+    def temperature(self) -> torch.Tensor:
+        if self.use_learnable_temperature:
+            # Calculate logit scale
+            return 1.0 / self._temperature.clamp(-1, 4.6).exp()
+        else:
+            return self._temperature
+
+    def forward(self, x: torch.Tensor, labels: torch.Tensor | None = None):
+        """
+        Forward pass.
+        If y is provided, apply the angular margin and scaling (training mode).
+        If y is None, return raw cosine logits (inference mode).
+        """
+        x = self.backbone(x)
+        x = F.normalize(x, dim=-1)
+        W = F.normalize(self.W, dim=-1)
+
+        # Cosine similarity between features and class weights
+        cosine = torch.matmul(x, W.T).clamp(-1, 1)
+
+        if labels is not None:
+            # Compute θ and apply margin to true classes
+            theta = torch.acos(cosine)
+            target_logits = torch.cos(theta + self.margin)
+            one_hot = F.one_hot(labels, num_classes=self.n_labels).bool()
+            # Apply margin only to true class positions
+            logits = torch.where(one_hot, target_logits, cosine)
+        else:
+            logits = cosine
+        # Scale logits by temperature
+        logits = logits / self.temperature
+        return logits, x, W if self.return_latents else logits
 
 
 class Classifier(nn.Module):
@@ -1455,10 +1514,12 @@ class Classifier(nn.Module):
         n_labels: int = 5,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
-        logits: bool = False,
+        logits: bool = True,
         use_batch_norm: bool = True,
         use_layer_norm: bool = False,
         activation_fn: nn.Module = nn.ReLU,
+        temperature: float = 1.0,
+        use_learnable_temperature: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -1491,6 +1552,22 @@ class Classifier(nn.Module):
         # Number of output dimensions
         self.n_output = n_labels
 
-    def forward(self, x, *args, **kwargs):
-        """Forward computation."""
-        return self.classifier(x)
+        # Create a learnable temperature scaling
+        self.use_learnable_temperature = use_learnable_temperature
+        if use_learnable_temperature:
+            self._temperature = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
+        # Fall back to static default temperature
+        else:
+            self._temperature = temperature
+
+    @property
+    def temperature(self) -> torch.Tensor:
+        if self.use_learnable_temperature:
+            # Calculate logit scale
+            return 1.0 / self._temperature.clamp(-1, 4.6).exp()
+        else:
+            return self._temperature
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Forward computation. Ignore additional parameters passed to other classes."""
+        return self.classifier(x) / self.temperature

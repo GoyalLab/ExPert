@@ -160,6 +160,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         full_val_log_every_n_epoch: int = 10,
         use_contrastive_loader: Literal["train", "val", "both"] | None = "train",
         multistage_kl_frac: float = 0.1,
+        multistage_kl_min: float = 1e-2,
+        use_local_stage_warmup: bool = False,
+        batch_labels: np.ndarray | None = None,
         # Caching options
         cache_n_epochs: int | None = 1,
         **loss_kwargs,
@@ -184,8 +187,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.n_epochs_warmup = n_epochs_warmup
         self.n_steps_warmup = n_steps_warmup
         self.multistage_kl_frac = multistage_kl_frac
+        self.multistage_kl_min = multistage_kl_min
         self.kl_reset_epochs = self._get_stall_epochs()
         self.reset_kl_at = np.array(sorted(self.kl_reset_epochs.values()))
+        self.kl_kwargs = self.anneal_schedules.get('kl_weight', {'min_weight': 0.0, 'max_weight': 1.0})
+        self.use_local_stage_warmup = use_local_stage_warmup
         # CLS params
         self.n_classes = n_classes
         self.use_posterior_mean = use_posterior_mean
@@ -203,8 +209,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.top_k = top_k                                                          # How many top predictions to consider for metrics
         self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
         self.plot_umap = self.loss_kwargs.pop("plot_umap", None)
+        self.plot_kl_distribution = self.loss_kwargs.pop("plot_kl_distribution", False)
+        self.plot_context_emb = self.loss_kwargs.pop("plot_context_emb", False)
         self.log_full_val = log_full_val
         self.full_val_log_every_n_epoch = full_val_log_every_n_epoch
+        self.batch_labels = batch_labels
         # Save classes that have been seen during training
         self.train_class_counts = []
         self.class_batch_counts = defaultdict(list)
@@ -300,40 +309,49 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def kl_weight_multistage(self):
         """KL weight for forward process. Resets every time a new loss objective activates."""
         # Get extra kl args from 
-        kwargs = self.anneal_schedules.get('kl_weight', {'min_weight': 0.0, 'max_weight': 1.0})
+        kwargs = self.kl_kwargs
         # Determine reset params
         reset_at = self.reset_kl_at
+        n_epochs_stall = 0
+        n_epochs_warmup = self.n_epochs_warmup
         # Handle stall schedules
         if reset_at.shape[0] > 1:
+            # Check in which state we currently are
             idx = (self.current_epoch > reset_at).sum() - 1
+            # Get next stage starting epoch
             n_epochs_stall = reset_at[idx]
-            n_epochs_warmup = reset_at[idx+1] if idx+1 < len(reset_at) else self.n_epochs_warmup
-            # No new loss
-            if n_epochs_stall < 1:
-                min_weight = kwargs['min_weight']
-            # New loss
+            
+            # KL goes from min to max within each stage
+            if self.use_local_stage_warmup:
+                n_epochs_warmup = reset_at[idx+1] if idx+1 < len(reset_at) else self.n_epochs_warmup
+                min_weight = kwargs['min_weight'] if n_epochs_stall < 1 else kwargs['max_weight'] * self.multistage_kl_frac
+                n_epochs_warmup = n_epochs_warmup - n_epochs_stall
+            # Global behavior - KL resets to minimum and warms up continuously
             else:
-                min_weight = kwargs['max_weight'] * self.multistage_kl_frac if self.multistage_kl_frac > 0 else kwargs['min_weight']
+                # Get starting KL weight
+                min_weight = kwargs['min_weight']
+                # Extend warmup period
+                n_epochs_warmup = n_epochs_warmup + n_epochs_stall
+                # Reset KL to multistage minimum at new stage
+                if n_epochs_stall > 0:
+                    min_weight = self.multistage_kl_min
+                
             # Update min weight
             kwargs['min_weight'] = min_weight
-        # No stall schedules
-        else:
-            n_epochs_stall = 0
-            n_epochs_warmup = self.n_epochs_warmup
 
-        # Update warmup, and stall epochs
+        # Update warmup and stall epochs
         kwargs['n_epochs_warmup'] = n_epochs_warmup
         kwargs['n_steps_warmup'] = None
         kwargs['n_epochs_stall'] = n_epochs_stall
-        # Set KL weight to restart at multistage min (0.1) for every new loss that gets activated
+        
+        # Calculate final KL weight
         klw = _compute_weight(
             self.current_epoch,
             self.global_step,
             **kwargs
         )
-        return (
-            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
-        )
+        
+        return klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
 
     @property
     def classification_ratio(self):
@@ -399,6 +417,71 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
+    
+    def _plot_context_embedding_heatmap(self) -> None:
+        """Plot context embedding"""
+        if self.module.use_context_emb:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+
+            # Get embedding weights and convert to numpy array for plotting 
+            weights = self.module.context_emb.weight.clone().detach().cpu().numpy()
+            # Get context labels
+            batch_labels = self.batch_labels
+            
+            # Create heatmap
+            fig, ax = plt.subplots(figsize=(12, 8))
+            sns.heatmap(weights, cmap='viridis', ax=ax, annot=True, fmt=".3f")
+            ax.set_title(f'Context Embedding Weights @ Epoch {self.current_epoch}')
+            ax.set_xlabel('Embedding Dimension')
+            ax.set_ylabel('Context Index')
+
+            # Add context labels if available
+            if batch_labels is not None:
+                ax.set_yticks(np.arange(len(batch_labels)) + 0.5)
+                ax.set_yticklabels(batch_labels, rotation=0)
+            # Add tight layout to fit everything into the plot
+            plt.tight_layout()
+
+            # Log to tensorboard
+            self.logger.experiment.add_figure('context_embedding_heatmap', fig, self.current_epoch)
+            plt.close(fig)
+    
+    def _plot_kl_distribution_over_latents(self, kl_tensor: torch.Tensor, metric: str) -> None:
+        """Plot distribution of KL divergence over latent dimensions."""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        # Convert to numpy for plotting
+        kl_values = kl_tensor.detach().cpu().numpy()
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(8, 4))
+        
+        # Plot density of KL values
+        sns.kdeplot(data=kl_values.flatten(), ax=ax, fill=True)
+
+        # Set y lim to 0-latent dims
+        plt.ylim((0, kl_values.shape[0]))
+        # Set x lim to 2 std 
+        plt.xlim((-2, 2))
+        
+        # Calculate mean
+        mean_kl = np.mean(kl_values)
+        
+        # Add vertical line for mean
+        ax.axvline(mean_kl, color='red', linestyle=':', label=f'Mean: {mean_kl:.2f}')
+        
+        # Add text annotation for mean
+        ax.text(mean_kl + 0.5, kl_values.shape[0]*0.9, f'Mean KL: {mean_kl:.2f}', 
+            rotation=0, verticalalignment='top')
+        
+        ax.set_xlabel('KL Divergence')
+        ax.set_ylabel('Density')
+        ax.set_title(f'Distribution of KL Divergence over Latents (Epoch {self.current_epoch}) N latent = {kl_values.shape[0]}')
+        # Log to tensorboard
+        self.logger.experiment.add_figure(f"{metric}_distribution", fig, self.current_epoch)
+        plt.close(fig)
 
     def compute_and_log_metrics(
         self, loss_output: LossOutput, metrics: dict[str, ElboMetric], mode: str
@@ -415,15 +498,26 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                     prog_bar=True,
                 )
         # Log individual kl local losses if there are multiple
-        if isinstance(loss_output.kl_local, dict) and len(loss_output.kl_local.keys()) > 1:
+        if isinstance(loss_output.kl_local, dict) and len(loss_output.kl_local) > 1:
             for k, kl in loss_output.kl_local.items():
+                is_tensor = isinstance(kl, torch.Tensor)
+                metric_name = f"{mode}_{k}"
                 self.log(
-                    f"{mode}_{k}",
-                    kl.mean() if isinstance(kl, torch.Tensor) else kl,
+                    metric_name,
+                    kl.mean() if is_tensor else kl,
                     on_epoch=True,
                     batch_size=loss_output.n_obs_minibatch,
-                    prog_bar=True,
+                    prog_bar=False,
                 )
+        # Only log kl distribtion every n epochs on validation
+        kl_per_latent = loss_output.extra_metrics.pop(MODULE_KEYS.KL_Z_PER_LATENT_KEY)
+        if (
+            self.plot_kl_distribution
+            and mode != 'train'
+            and self.full_val_log_every_n_epoch is not None 
+            and self.current_epoch % self.full_val_log_every_n_epoch == 0
+        ):
+            self._plot_kl_distribution_over_latents(kl_tensor=kl_per_latent, metric=MODULE_KEYS.KL_Z_PER_LATENT_KEY)
         # Initialize default classification metrics
         metrics_dict = {
             METRIC_KEYS.CLASSIFICATION_LOSS_KEY: np.inf,
@@ -438,8 +532,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             # Take argmax of logits to get highest predicted label
             predicted_labels = torch.argmax(logits, dim=-1).squeeze(-1)
             n_classes = self.n_classes
-            # Exclude control class for multiclass metrics
-            if not self.module.use_classification_control:
+
+            # Exclude control class for multiclass metrics if its actually in the data
+            if not self.module.use_classification_control and self.module.ctrl_class_idx is not None:
                 n_classes -= 1
             # Check if any classes are outside of training classes, i.e
             unknown_mask = (predicted_labels >= n_classes)
@@ -503,10 +598,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Log classifier temperature
         if self.module.use_learnable_temperature:
             # Check classifier temperature
-            if getattr(self.module, 'use_embedding_classifier', False):
+            cls_temp = getattr(self.module.classifier, 'temperature')
+            if cls_temp:
                 self.log(
                     "T_classifier_logit",
-                    self.module.classifier.temperature,
+                    cls_temp,
                     on_epoch=True,
                     batch_size=batch_size,
                     prog_bar=False,
@@ -522,6 +618,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.log(
                 "T_clip_z",
                 self.module.clip_temp,
+                on_epoch=True,
+                batch_size=batch_size,
+                prog_bar=False,
+            )
+            self.log(
+                "T_proxy_z",
+                self.module.proxy_temp,
                 on_epoch=True,
                 batch_size=batch_size,
                 prog_bar=False,
@@ -698,13 +801,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                     # Calculate performance metrics over entire validation set, not just batch
                     if self.log_full_val and self.classification_ratio > 0:
                         self._log_full_val_metrics(val_data)
+            # Plot context embedding
+            if self.plot_context_emb:
+                self._plot_context_embedding_heatmap()
                     
     def _log_full_val_metrics(self, mode_data: dict[str, np.ndarray]) -> None:
         true_labels = torch.tensor(mode_data.get('labels'))
         predicted_labels = torch.tensor(mode_data.get('predicted_labels')).squeeze(-1)
         n_classes = self.n_classes
-        # Exclude control class for multiclass metrics
-        if not self.module.use_classification_control:
+        # Exclude control class for multiclass metrics if it exists in data
+        if not self.module.use_classification_control and self.module.ctrl_class_idx is not None:
             n_classes -= 1
         # Check if any classes are outside of training classes, i.e
         unknown_mask = (predicted_labels >= n_classes)
@@ -769,85 +875,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 on_epoch=True,
                 prog_bar=False,
             )
-
-    def _get_mode_data(self, mode: str = 'val') -> dict[str, np.ndarray]:
-        if mode == 'train':
-            full_dataset = self.trainer.datamodule.train_dataloader()
-        elif mode == 'val':
-            full_dataset = self.trainer.datamodule.val_dataloader()
-        else:
-            full_dataset = None
-
-        # Move batches to CUDA if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        def move_to_device(batch):
-            if isinstance(batch, dict):
-                return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            elif isinstance(batch, (list, tuple)):
-                return type(batch)(move_to_device(b) for b in batch)
-            elif isinstance(batch, torch.Tensor):
-                return batch.to(device)
-            else:
-                return batch
-
-        if full_dataset is not None:
-            pass
-
-        embeddings = []
-        labels = []
-        predicted_labels = []
-        covs = []
-        logits = []
-        # Collect results for all batches
-        for batch_idx, batch in enumerate(full_dataset):
-            with torch.no_grad():
-                # Compute KL warmup
-                if "kl_weight" in self.loss_kwargs:
-                    self.loss_kwargs.update({"kl_weight": self.kl_weight})
-                # Compute CL warmup
-                self.loss_kwargs.update({"classification_ratio": self.classification_ratio})
-                # Compute contrastive weight
-                if self.use_contrastive_loader in ['both', mode]:
-                    contr_weight = self.contrastive_loss_weight
-                else:
-                    contr_weight = 0.0
-                self.loss_kwargs.update({"contrastive_loss_weight": contr_weight})
-                self.loss_kwargs.update({"alignment_loss_weight": self.alignment_loss_weight})
-                self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == mode or self.use_posterior_mean == "both"})
-                self.loss_kwargs.update({"class_kl_temperature": self.class_kl_temperature})
-                # Setup kwargs
-                input_kwargs = {}
-                input_kwargs.update(self.loss_kwargs)
-                # Add external gene embedding to batch
-                if self.gene_emb is not None:
-                    # Add gene embedding matrix to batch
-                    batch[REGISTRY_KEYS.GENE_EMB_KEY] = self.gene_emb
-                # Perform actual forward pass
-                inference_outputs, _, loss_output = self.forward(move_to_device(batch), loss_kwargs=input_kwargs)
-                # Save inference and generative output
-                embeddings.append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
-                covs.append(batch[REGISTRY_KEYS.BATCH_KEY].cpu())
-                labels.append(loss_output.true_labels)
-                # No classification (yet), skip batch
-                if loss_output.logits is not None:
-                    # Add predicted labels from each batch
-                    predicted_labels.append(torch.argmax(loss_output.logits, dim=-1))
-                    logits.append(loss_output.logits)
-        # Concat results pull to cpu, and reformat
-        embeddings = torch.cat(embeddings, dim=0).cpu().numpy()
-        labels = torch.cat(labels, dim=0).cpu().numpy().squeeze()
-        predicted_labels = torch.cat(predicted_labels, dim=0).cpu().numpy().squeeze() if len(predicted_labels) > 0 else np.array([])
-        logits = torch.cat(logits, dim=0).cpu().numpy().squeeze() if len(logits) > 0 else np.array([])
-        covs = torch.cat(covs, dim=0).cpu().numpy().squeeze()
-        
-        # Package data for return
-        return {
-            'embeddings': embeddings,
-            'labels': labels,
-            'predicted_labels': predicted_labels,
-            'logits': logits,
-            'covs': covs
-        }
 
     def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray], use_history: bool = True):
         """Plot umap of latent space in tensorboard logger"""
