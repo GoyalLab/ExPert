@@ -1,6 +1,5 @@
 import os
 import argparse
-import logging
 import pandas as pd
 
 import torch
@@ -16,11 +15,9 @@ from src.utils.io import read_config
 from src.tune._statics import CONF_KEYS
 from src.models._jedvi import JEDVI
 
+import logging
+log = logging.getLogger(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run vae model')
@@ -38,7 +35,7 @@ def get_ouptut_dir(config_p: str, output_base_dir: str | None = None) -> str:
         output_dir = os.path.dirname(config_p)
     else:
         output_dir = os.path.join(output_base_dir, os.path.basename(config_p).replace('.yaml', ''))
-    logging.info(f'Run output directory: {output_dir}')
+    log.info(f'Run output directory: {output_dir}')
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
@@ -52,7 +49,7 @@ def _train(
         **train_kwargs
     ) -> JEDVI:
     """Train wrapper for JEDVI.train()"""
-    logging.info(f'Reading training data from: {adata_p}')
+    log.info(f'Reading training data from: {adata_p}')
     model_set = sc.read(adata_p)
     # Check if dataset is compatible
     assert cls_label in model_set.obs.columns and batch_key in model_set.obs.columns
@@ -61,7 +58,7 @@ def _train(
     torch.set_float32_matmul_precision('medium')
 
     # Setup model
-    logging.info('Setting up model.')
+    log.info('Setting up model.')
     # Setup anndata with model
     setup_kwargs = {'batch_key': batch_key, 'labels_key': cls_label}
     setup_kwargs.update(config.get(CONF_KEYS.MODEL_SETUP, {}))
@@ -75,7 +72,7 @@ def _train(
     # Set training logger
     config[CONF_KEYS.TRAIN]['logger'] = pl.loggers.TensorBoardLogger(step_model_dir)
     # Train the model
-    logging.info(f'Running at: {step_model_dir}')
+    log.info(f'Running at: {step_model_dir}')
     model.train(config, **train_kwargs)
     return model
 
@@ -125,7 +122,7 @@ def full_run(
         )
     # Do not test model if no test path is provided
     if test_p is None or not os.path.exists(test_p):
-        logging.info(f'Skipping model test since no valid test path is provided.')
+        log.info(f'Skipping model test since no valid test path is provided.')
         return None
     # Create test output directory
     test_out = os.path.join(output_dir, 'test')

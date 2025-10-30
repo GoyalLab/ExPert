@@ -1,6 +1,5 @@
 import os
 import yaml
-import logging
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -14,6 +13,9 @@ import torch
 import torch.nn as nn
 
 from src.tune._statics import CONF_KEYS, NESTED_CONF_KEYS
+
+import logging
+log = logging.getLogger(__name__)
 
 
 def to_tensor(m: sp.csr_matrix | torch.Tensor | np.ndarray | pd.DataFrame | None) -> torch.Tensor:
@@ -111,7 +113,7 @@ def sample_configs(space: dict, src_config: dict, N: int = 10, base_dir: str | N
         conf_out = os.path.join(run_dir, 'config.yaml')
         config_paths.append(conf_out)
         if verbose:
-            logging.info(f'Saving run config to {conf_out}')
+            log.info(f'Saving run config to {conf_out}')
         with open(conf_out, 'w') as f:
             yaml.dump(merged_config, f, sort_keys=False)
 
@@ -136,7 +138,7 @@ def setup_config(config: dict) -> None:
 
 def read_config(config_p: str, setup: bool = True) -> dict:
     """Read hyperparameter yaml file"""
-    logging.info(f'Loading config file: {config_p}')
+    log.info(f'Loading config file: {config_p}')
     with open(config_p, 'r') as f:
         config: dict = yaml.safe_load(f)
     # Check for config keys
@@ -161,7 +163,7 @@ def ens_to_symbol(adata: ad.AnnData, gene_symbol_keys: list[str] = ['gene_symbol
     adata.var.set_index(gsh, inplace=True)
     # Check for duplicate index conflicts
     if adata.var_names.nunique() != adata.shape[0]:
-        logging.info(f'Found duplicate indices for ensembl to symbol mapping, highest number of conflicts: {adata.var_names.value_counts().max()}')
+        log.info(f'Found duplicate indices for ensembl to symbol mapping, highest number of conflicts: {adata.var_names.value_counts().max()}')
         # Fix conflicts by choosing the gene with the higher harmonic mean of mean expression and normalized variance out of pool
         if len(set(['means', 'variances_norm']).intersection(adata.var.columns)) == 2:
             adata.var['hm_var'] = (2 * adata.var.means * adata.var.variances_norm) / (adata.var.means + adata.var.variances_norm)
@@ -175,7 +177,7 @@ def ens_to_symbol(adata: ad.AnnData, gene_symbol_keys: list[str] = ['gene_symbol
 def filter_min_cells_per_class(adata: ad.AnnData, cls_label: str, min_cells: int = 10) -> None:
     """Filter adata for minimum number of cells in .obs group"""
     if cls_label not in adata.obs:
-        logging.warning(f'{cls_label} not in adata.obs. Could not filter for cells per class.')
+        log.warning(f'{cls_label} not in adata.obs. Could not filter for cells per class.')
         return
     # Calculate number of cells per class
     cpc = adata.obs[cls_label].value_counts()
@@ -188,19 +190,19 @@ def filter_min_cells_per_class(adata: ad.AnnData, cls_label: str, min_cells: int
     adata._inplace_subset_obs(cls_mask)
     # Save number of classes after filtering
     nc_post_filter = valid.shape[0]
-    logging.info(f'Filtered adata.obs.{cls_label} for min. {min_cells} cells. Got {nc_post_filter}/{nc} classes.')
+    log.info(f'Filtered adata.obs.{cls_label} for min. {min_cells} cells. Got {nc_post_filter}/{nc} classes.')
 
 def filter_efficiency_score(adata: ad.AnnData, min_score: float = 2.0, col: str = 'mixscale_score') -> None:
     """Filter adata for minimum mixscale score."""
     if col not in adata.obs:
-        logging.warning(f'{col} not in adata.obs. Could not filter for mixscale score.')
+        log.warning(f'{col} not in adata.obs. Could not filter for mixscale score.')
         return
     # Filter for perturbation efficiency score (mixscale or similar)
     efficiency_mask = adata.obs[col] >= min_score
     nc = adata.shape[0]
     adata._inplace_subset_obs(efficiency_mask)
     nc_post_filter = adata.shape[0]
-    logging.info(f'Filtered adata.obs.{col} >= {min_score}. Got {nc_post_filter}/{nc} cells.')
+    log.info(f'Filtered adata.obs.{col} >= {min_score}. Got {nc_post_filter}/{nc} cells.')
 
 def read_adata(
         adata_p: str, 
@@ -218,7 +220,7 @@ def read_adata(
     adata = sc.read(adata_p, **kwargs)
     # Convert gene names if needed
     if check_gene_names and adata.var_names.str.lower().str.startswith('ens').all():
-        logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
+        log.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
         adata = ens_to_symbol(adata).copy()
     # Filter for perturbation efficiency if score is given
     if efficiency_col is not None and min_efficiency_score is not None:

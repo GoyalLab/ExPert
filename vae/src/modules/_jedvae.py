@@ -15,7 +15,6 @@ from src.utils.common import GradientReversalFn, batchmean
 
 from typing import Iterable
 
-import logging
 import torch
 import torch.nn.functional as F
 
@@ -32,6 +31,9 @@ from typing import Literal
 
 from torch.distributions import Distribution
 from scvi.model.base import BaseModelClass
+
+import logging
+log = logging.getLogger(__name__)
 
 
 class JEDVAE(VAE):
@@ -75,6 +77,7 @@ class JEDVAE(VAE):
         l2_lambda: float | None = 1e-3,
         l_mask: str | list[str] | None = None,
         focal_gamma: float = 2.0,
+        min_kl: float | None = 1.0,
         classification_module_type: Literal['standard', 'arc'] = 'arc',              # Main classifier module (does not use external embeddings)
         classification_loss_strategy: Literal['ce', 'focal'] = 'focal',                             # Main classifier loss strategy
         align_ext_emb_loss_strategy: Literal['kl', 'clip'] | list[str] | None = None,            # Secondary classifier module (links external embedding)
@@ -131,7 +134,7 @@ class JEDVAE(VAE):
         self.l_mask = l_mask
         
         if dropout_rate_decoder is not None:
-            logging.warning('Dropout rate for decoder currently unavailable. Will fall back to 0.')
+            log.warning('Dropout rate for decoder currently unavailable. Will fall back to 0.')
         
         # Classifier parameters
         self.classifier_parameters = classifier_parameters
@@ -142,6 +145,7 @@ class JEDVAE(VAE):
         self._update_cls_params()
         self.focal_gamma = focal_gamma
         self.kl_class_temperature = kl_class_temperature
+        self.min_kl = min_kl
         # Contrastive parameters
         self.contrastive_temperature = contrastive_temperature
         # Set reduction metrics
@@ -177,9 +181,9 @@ class JEDVAE(VAE):
                 use_control=use_learnable_control_emb,
                 device=self.device
             )
-            logging.info(f'Registered class embedding with shape: {self.class_embedding.shape}, using control: {use_learnable_control_emb}')
+            log.info(f'Registered class embedding with shape: {self.class_embedding.shape}, using control: {use_learnable_control_emb}')
         else:
-            logging.info(f'No external class embedding registered with model.')
+            log.info(f'No external class embedding registered with model.')
             self.class_embedding = None 
 
         # Setup normalizations for en- and decoder
@@ -241,7 +245,7 @@ class JEDVAE(VAE):
         # Setup decoder
         self.decode_y = decode_y
         if self.decode_y:
-            logging.warning(f'Training a CVAE, decoder will be conditioned on class label.')
+            log.warning(f'Training a CVAE, decoder will be conditioned on class label.')
         # Setup decoder module
         self.decoder = DecoderSCVI(
             n_input=n_input_decoder,
@@ -260,7 +264,7 @@ class JEDVAE(VAE):
         
         # Setup main classifier module
         cls_module = self.get_classifier_module()
-        logging.info('Registered classifier.')
+        log.info('Registered classifier.')
         n_cls_labels = n_labels if self.ctrl_class_idx is None else n_labels - 1
         self.classifier = cls_module(
             n_latent,
@@ -273,7 +277,7 @@ class JEDVAE(VAE):
 
         # Setup external embedding classifier
         if self.has_align_cls and self.class_embedding is not None:
-            logging.info('Registered external embedding aligner.')
+            log.info('Registered external embedding aligner.')
             base_aligner_parameters = {
                 'n_input': n_latent,
                 'class_embed_dim': ext_class_embed_dim,
@@ -292,7 +296,7 @@ class JEDVAE(VAE):
 
         # Initialize an adversial context (batch/cell type or line) classifier
         if self.use_adversial_context_cls:
-            logging.info('Registered adversial context classifier.')
+            log.info('Registered adversial context classifier.')
             self.context_classifier = Classifier(
                 n_input=n_latent,
                 n_hidden=context_classifier_n_hidden,
@@ -395,14 +399,14 @@ class JEDVAE(VAE):
         module = getattr(self, key)
         # Can't freeze what we don't have
         if module is None or not isinstance(module, torch.nn.Module):
-            logging.warning(f'{module} is not a valid module, skipped freeze.')
+            log.warning(f'{module} is not a valid module, skipped freeze.')
             return
         # Set module to eval mode
         module.eval()
         # Disable gradient flow for all module parameters
         for param in module.parameters():
             param.requires_grad = False
-        logging.info(f'Successfully froze {key} parameters.')
+        log.info(f'Successfully froze {key} parameters.')
         # Label the module as frozen
         module.frozen = True
 
@@ -761,10 +765,10 @@ class JEDVAE(VAE):
         y: torch.Tensor,
         cls_emb: torch.Tensor,
         reduction: str = 'mean',
-        lambda_proxy: float = 0.5,
-        lambda_energy: float = 0.3,
-        margin: float = 0.1,
+        lambda_proxy: float = 0.0,
+        lambda_energy: float = 0.0,
         proxy_margin: float = 0.1,
+        margin: float = 0.1,
         return_loss_dict: bool = True,
         **kwargs
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -812,20 +816,26 @@ class JEDVAE(VAE):
         loss_c2z_red = red_fn(loss_c2z)
 
         # Use Proxy Anchor
-        y_oh = F.one_hot(y, num_classes=cls_emb.size(0)).float()
-        # Positive and negative anchors
-        pos_term = torch.log1p(torch.exp(-self.proxy_temp * (logits[y_oh.bool()] - proxy_margin))).mean()
-        neg_term = torch.log1p(torch.exp(self.proxy_temp * (logits[~y_oh.bool()] + proxy_margin))).mean()
-        loss_proxy = pos_term + neg_term
+        if lambda_proxy > 0:
+            y_oh = F.one_hot(y, num_classes=cls_emb.size(0)).float()
+            # Positive and negative anchors
+            pos_term = torch.log1p(torch.exp(-self.proxy_temp * (logits[y_oh.bool()] - proxy_margin))).mean()
+            neg_term = torch.log1p(torch.exp(self.proxy_temp * (logits[~y_oh.bool()] + proxy_margin))).mean()
+            loss_proxy = pos_term + neg_term
+        else:
+            loss_proxy = torch.tensor(0.0)
 
-        # Energy-based ranking
-        pos_sim = torch.sum(z * chosen, dim=-1)  # (B,), How similar is each sample to its embedding overall
-        pos_mask = (y==torch.arange(cls_emb.shape[0], device=y.device).reshape(-1, 1)).sum(-1)
-        neg_sim, _ = (z @ cls_emb[~pos_mask].T).max(dim=-1)     # Hardest negative per sample
-        energy_loss_per_sample = F.softplus(margin - pos_sim + neg_sim).mean(-1)
-        energy_loss = red_fn(energy_loss_per_sample)
+        # Energy-based ranking TODO: debug assertion error in `cls_emb[~pos_mask]`
+        if lambda_energy > 0:
+            pos_sim = torch.sum(z * chosen, dim=-1)  # (B,), How similar is each sample to its embedding overall
+            pos_mask = (y==torch.arange(cls_emb.shape[0], device=y.device).reshape(-1, 1)).sum(-1)
+            neg_sim, _ = (z @ cls_emb[~pos_mask].T).max(dim=-1)     # Hardest negative per sample
+            energy_loss_per_sample = F.softplus(margin - pos_sim + neg_sim).mean(-1)
+            energy_loss = red_fn(energy_loss_per_sample)
+        else:
+            energy_loss = torch.tensor(0.0)
 
-        # Combine final loss
+        # Combine final clip loss
         loss = clip_loss \
            + lambda_proxy * loss_proxy \
            + lambda_energy * energy_loss
@@ -907,6 +917,7 @@ class JEDVAE(VAE):
                 # Calculate CLIP loss
                 _align_loss, _loss_dict = self._sym_contrastive_classification_loss(
                     z=z, 
+                    logits=logits,
                     y=y, 
                     cls_emb=cls_emb, 
                     reduction=reduction, 
@@ -1066,10 +1077,10 @@ class JEDVAE(VAE):
             data_dict[LOSS_KEYS.C2Z] = c2z          # External class embedding space to latent projection
             # Calculate alignment loss
             align_loss_dict = self._calc_alignment_loss(
-                z=_z,
+                z=z2c,
                 logits=align_logits,
                 y=_y,
-                cls_emb=_cls_emb,
+                cls_emb=c2z,
                 reduction=reduction,
                 **kwargs
             )
@@ -1331,6 +1342,9 @@ class JEDVAE(VAE):
         kl_divergence_z_mat = kl_divergence(qz, pz)
         # Calculate reconstruction loss over batch and all features
         reconst_loss_mat = -px.log_prob(x)
+        # Clamp KL to a minimum if option is provided
+        if self.min_kl is not None:
+            kl_divergence_z_mat = torch.clamp(kl_divergence_z_mat, min=self.min_kl)
         # Aggregate elbo losses over latent dimensions / input features, will get batch normalized internally
         if self.reduction == 'batchmean':
             kl_divergence_z = kl_divergence_z_mat.sum(-1) # (b,)

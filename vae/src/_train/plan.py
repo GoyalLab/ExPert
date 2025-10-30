@@ -33,65 +33,6 @@ def _exponential_schedule(t, T, k):
     max_val = 1 - np.exp(-k)
     return raw / max_val
 
-def _compute_weight(
-    epoch: int,
-    step: int,
-    n_epochs_warmup: int | None,
-    n_steps_warmup: int | None,
-    n_epochs_stall: int | None = None,
-    max_weight: float | None = 0.0,
-    min_weight: float | None = 0.0,
-    schedule: Literal["linear", "sigmoid", "exponential"] = "sigmoid",
-    anneal_k: float = 10.0,
-    invert: bool = False
-) -> float:
-    # Set undefined weights to
-    if min_weight is None:
-        min_weight = 0.0
-    if max_weight is None:
-        max_weight = 0.0
-    # Auto-invert if min > max
-    if min_weight > max_weight:
-        min_weight, max_weight = max_weight, min_weight
-        invert = not invert
-
-    # Apply stall
-    if n_epochs_stall is not None and epoch < n_epochs_stall:
-        return max_weight if invert else 0.0
-    # Reset epochs if stalling is enabled
-    if n_epochs_stall:
-        epoch -= n_epochs_stall
-        n_epochs_warmup -= n_epochs_stall
-    # Calculate slope for function
-    slope = max_weight - min_weight
-    # Calculate time points
-    if n_epochs_warmup is not None:
-        t = epoch
-        T = n_epochs_warmup
-    elif n_steps_warmup is not None:
-        t = step
-        T = n_steps_warmup
-    else:
-        return 0.0 if invert else max_weight
-    # Set start point
-    t = min(t, T)
-    # Select schedule
-    if schedule == "linear":
-        w = t / T
-    elif schedule == "sigmoid":
-        w = _sigmoid_schedule(t, T, anneal_k)
-    elif schedule == "exponential":
-        w = _exponential_schedule(t, T, anneal_k)
-    else:
-        raise ValueError(f"Invalid schedule type: '{schedule}'")
-    # Get final weight
-    weight = min_weight + slope * w
-    # Invert function if needed
-    if invert:
-        return max_weight - weight + min_weight
-    else:
-        return weight
-
 
 class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     """Lightning module task for Contrastive Supervised Training.
@@ -154,6 +95,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         log_class_distribution: bool = False,
         log_full_val: bool = True,
         freeze_encoder_epoch: int | None = None,
+        freeze_decoder_epoch: int | None = None,
         gene_emb: torch.Tensor | None = None,
         incl_n_unseen: int | None = None,
         anneal_schedules: dict[str, dict[str | float]] | None = None,
@@ -202,7 +144,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Contrastive params
         self.log_class_distribution = log_class_distribution
         self.freeze_encoder_epoch = freeze_encoder_epoch
-        self.encoder_freezed = False
+        self.freeze_decoder_epoch = freeze_decoder_epoch
         self.use_contrastive_loader = use_contrastive_loader
         # Misc
         self.average = average                                                      # How to reduce the classification metrics
@@ -290,17 +232,103 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # TODO: Include this with a base training plan
         self.log(f"{mode}_{key}", value, **kwargs)
 
+    def _compute_weight(
+        self,
+        n_epochs_warmup: int | None,
+        n_steps_warmup: int | None,
+        n_epochs_stall: int | None = None,
+        max_weight: float | None = 0.0,
+        min_weight: float | None = 0.0,
+        post_min_weight: float | None = None,
+        schedule: Literal["linear", "sigmoid", "exponential"] = "sigmoid",
+        anneal_k: float = 10.0,
+        hard_stall: bool = True,
+        invert: bool = False
+    ) -> float:
+        # Pull current epoch
+        epoch = self.current_epoch
+        # Set undefined weights to
+        if min_weight is None:
+            min_weight = 0.0
+        if max_weight is None:
+            max_weight = 0.0
+        # Auto-invert if min > max
+        if min_weight > max_weight:
+            min_weight, max_weight = max_weight, min_weight
+            invert = not invert
+
+        # Apply stall
+        if n_epochs_stall is not None and epoch < n_epochs_stall:
+            # Disable loss during stall or return registered minimum weight
+            if not invert:
+                w = 0.0 if hard_stall else min_weight
+            # Invert loss and return maximum weight during stall period
+            else:
+                w = max_weight
+            return w
+
+        # Reset epochs if stalling is enabled
+        if n_epochs_stall:
+            epoch -= n_epochs_stall
+            n_epochs_warmup -= n_epochs_stall
+        # Calculate slope for function
+        slope = max_weight - min_weight
+        # Calculate time points
+        if n_epochs_warmup is not None:
+            t = epoch
+            T = n_epochs_warmup
+        elif n_steps_warmup is not None:
+            t = self.global_step
+            T = n_steps_warmup
+        else:
+            return 0.0 if invert else max_weight
+        # Set start point
+        t = min(t, T)
+        # Select schedule
+        if schedule == "linear":
+            w = t / T
+        elif schedule == "sigmoid":
+            w = _sigmoid_schedule(t, T, anneal_k)
+        elif schedule == "exponential":
+            w = _exponential_schedule(t, T, anneal_k)
+        else:
+            raise ValueError(f"Invalid schedule type: '{schedule}'")
+        # Get final weight
+        weight = min_weight + slope * w
+        # Invert function if needed
+        if invert:
+            weight = max_weight - weight + min_weight
+
+        # Reverse anneal if a new post warmup minimum is given
+        if (
+            post_min_weight is not None
+            and self.n_epochs_warmup is not None
+            and epoch >= n_epochs_warmup
+            and self.n_epochs_warmup > n_epochs_warmup
+        ):
+            # progress from end of warmup → total duration
+            t2 = epoch - n_epochs_warmup
+            T2 = self.n_epochs_warmup - n_epochs_warmup
+            if schedule == "linear":
+                w2 = t2 / T2
+            elif schedule == "sigmoid":
+                w2 = _sigmoid_schedule(t2, T2, anneal_k)
+            elif schedule == "exponential":
+                w2 = _exponential_schedule(t2, T2, anneal_k)
+            else:
+                w2 = t2 / T2
+            # decay from max_weight → post_min_weight
+            weight = max_weight - (max_weight - post_min_weight) * w2
+        # Return weight on epoch
+        return weight
+
     @property
     def rl_weight(self):
         """Scaling factor on classification weight during training. Consider Jax"""
+        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
         kwargs = self.anneal_schedules.get('rl_weight', {'min_weight': 1.0, 'max_weight': 1.0})
-        klw = _compute_weight(
-            self.current_epoch,
-            self.global_step,
-            self.n_epochs_warmup,
-            self.n_steps_warmup,
-            **kwargs
-        )
+        sched_kwargs.update(kwargs)
+        klw = self._compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -315,27 +343,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         n_epochs_stall = 0
         n_epochs_warmup = self.n_epochs_warmup
         # Handle stall schedules
-        if reset_at.shape[0] > 1:
+        if reset_at.shape[0] > 1 and self.use_local_stage_warmup:
             # Check in which state we currently are
             idx = (self.current_epoch > reset_at).sum() - 1
             # Get next stage starting epoch
             n_epochs_stall = reset_at[idx]
             
             # KL goes from min to max within each stage
-            if self.use_local_stage_warmup:
-                n_epochs_warmup = reset_at[idx+1] if idx+1 < len(reset_at) else self.n_epochs_warmup
-                min_weight = kwargs['min_weight'] if n_epochs_stall < 1 else kwargs['max_weight'] * self.multistage_kl_frac
-                n_epochs_warmup = n_epochs_warmup - n_epochs_stall
-            # Global behavior - KL resets to minimum and warms up continuously
-            else:
-                # Get starting KL weight
-                min_weight = kwargs['min_weight']
-                # Extend warmup period
-                n_epochs_warmup = n_epochs_warmup + n_epochs_stall
-                # Reset KL to multistage minimum at new stage
-                if n_epochs_stall > 0:
-                    min_weight = self.multistage_kl_min
-                
+            n_epochs_warmup = reset_at[idx+1] if idx+1 < len(reset_at) else self.n_epochs_warmup
+            min_weight = kwargs['min_weight'] if n_epochs_stall < 1 else kwargs['max_weight'] * self.multistage_kl_frac
+            n_epochs_warmup = n_epochs_warmup - n_epochs_stall                
             # Update min weight
             kwargs['min_weight'] = min_weight
 
@@ -345,11 +362,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         kwargs['n_epochs_stall'] = n_epochs_stall
         
         # Calculate final KL weight
-        klw = _compute_weight(
-            self.current_epoch,
-            self.global_step,
-            **kwargs
-        )
+        klw = self._compute_weight(**kwargs)
         
         return klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
 
@@ -357,11 +370,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def classification_ratio(self):
         """Scaling factor on classification weight during training. Consider Jax"""
         # Init basic args
-        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
         # Add scheduling params if given
         kwargs = self.anneal_schedules.get('classification_ratio', {})
         sched_kwargs.update(kwargs)
-        klw = _compute_weight(**sched_kwargs)
+        klw = self._compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -370,11 +383,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def alignment_loss_weight(self):
         """Scaling factor on contrastive weight during training. Consider Jax"""
         # Init basic args
-        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
         # Add scheduling params if given
         kwargs = self.anneal_schedules.get('alignment_loss_weight', {})
         sched_kwargs.update(kwargs)
-        klw = _compute_weight(**sched_kwargs)
+        klw = self._compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -383,11 +396,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def contrastive_loss_weight(self):
         """Scaling factor on contrastive weight during training. Consider Jax"""
         # Init basic args
-        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
         # Add scheduling params if given
         kwargs = self.anneal_schedules.get('contrastive_loss_weight', {})
         sched_kwargs.update(kwargs)
-        klw = _compute_weight(**sched_kwargs)
+        klw = self._compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -396,11 +409,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def class_kl_temperature(self):
         """Scaling factor on contrastive weight during training. Consider Jax"""
         # Init basic args
-        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
         # Add scheduling params if given
         kwargs = self.anneal_schedules.get('class_kl_temperature', {})
         sched_kwargs.update(kwargs)
-        klw = _compute_weight(**sched_kwargs)
+        klw = self._compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -409,11 +422,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def adversarial_context_lambda(self):
         """Lambda for adversial context loss during training. Consider Jax"""
         # Init basic args
-        sched_kwargs = {'epoch': self.current_epoch, 'step': self.global_step, 'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
         # Add scheduling params if given
         kwargs = self.anneal_schedules.get('adversarial_context_lambda', {})
         sched_kwargs.update(kwargs)
-        klw = _compute_weight(**sched_kwargs)
+        klw = self._compute_weight(**sched_kwargs)
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
@@ -459,7 +472,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         fig, ax = plt.subplots(figsize=(8, 4))
         
         # Plot density of KL values
-        sns.kdeplot(data=kl_values.flatten(), ax=ax, fill=True)
+        sns.kdeplot(data=kl_values.flatten(), ax=ax, fill=True, warn_singular=False)
 
         # Set y lim to 0-latent dims
         plt.ylim((0, kl_values.shape[0]))
@@ -674,6 +687,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             prog_bar=True,
         )
         self.log(
+            "rl_weight",
+            self.loss_kwargs['rl_weight'],
+            on_epoch=True,
+            batch_size=loss_output.n_obs_minibatch,
+            prog_bar=False,
+        )
+        self.log(
             "kl_weight",
             self.loss_kwargs['kl_weight'],
             on_epoch=True,
@@ -744,8 +764,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
 
     def on_train_epoch_start(self):        
         # Freeze module encoder at a certain epoch if option is enabled
-        if self.freeze_encoder_epoch is not None and self.current_epoch >= self.freeze_encoder_epoch and not self.encoder_frozen:
+        if self.freeze_encoder_epoch is not None and self.current_epoch >= self.freeze_encoder_epoch and not getattr(self.module.z_encoder, 'frozen', False):
             self.module.freeze_module('z_encoder')
+        if self.freeze_decoder_epoch is not None and self.current_epoch >= self.freeze_decoder_epoch and not getattr(self.module.decoder, 'frozen', False):
+            self.module.freeze_module('decoder')
     
     def on_train_epoch_end(self):
         if self.log_class_distribution:

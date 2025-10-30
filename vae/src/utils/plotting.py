@@ -1,5 +1,4 @@
 import os
-import logging
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -16,6 +15,8 @@ from scanpy.plotting import palettes
 
 from src.utils.constants import REGISTRY_KEYS
 
+import logging
+log = logging.getLogger(__name__)
 
 
 def get_pal(n: int, seed: int | None = None) -> list:
@@ -146,9 +147,9 @@ def calc_umap_scanpy(adata: ad.AnnData, rep: str = 'X') -> None:
         # Falling back to pca
         rep = 'X_pca'
         sc.pp.pca(adata, n_comps=50)
-    logging.info(f'Calculating latent neighbors')
+    log.info(f'Calculating latent neighbors')
     sc.pp.neighbors(adata, use_rep=rep)
-    logging.info(f'Calculating latent umap')
+    log.info(f'Calculating latent umap')
     sc.tl.umap(adata)
 
 def plot_umap_scanpy(adata: ad.AnnData, hue: str, split: str, plt_dir: str) -> None:
@@ -203,7 +204,7 @@ def plot_performance_support_corr(report: pd.DataFrame, o: str, hue: str | None 
         msg = f'Got uniform values for f1-score'
         if hue and hue in report.columns:
             msg += f', cannot plot kde for mode {report[hue].unique()[0]}.'
-        logging.info(msg)
+        log.info(msg)
         return
 
     plt.figure(figsize=(6, 5))

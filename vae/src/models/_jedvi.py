@@ -19,7 +19,6 @@ import pandas as pd
 import numpy as np
 import scipy.sparse as sp
 import anndata as ad
-import logging
 import numpy.typing as npt
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -54,7 +53,8 @@ from scvi.data.fields import (
 )
 from scvi._types import AnnOrMuData
 
-logger = logging.getLogger(__name__)
+import logging
+log = logging.getLogger(__name__)
 
 
 class JEDVI(
@@ -186,7 +186,7 @@ class JEDVI(
             ext_en_kw['use_ext_emb'] = True
             ext_en_kw['gene_emb_dim'] = emb_dim
             self._model_kwargs['extra_encoder_kwargs'] = ext_en_kw
-            logging.info(f'Initialized gene embedding with {emb_dim} dimensions')
+            log.info(f'Initialized gene embedding with {emb_dim} dimensions')
             # Convert to dense if sparse
             if sp.issparse(gene_emb):
                 gene_emb = gene_emb.todense()
@@ -211,7 +211,7 @@ class JEDVI(
             cls_emb_key = cls_emb_registry['data_registry'].get('attr_key') if ext_cls_emb_key is None else ext_cls_emb_key
             # Check if adata has already been registered with this model class
             if REGISTRY_KEYS.CLS_EMB_INIT in self.adata.uns and self._name == self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.MODEL_KEY]:
-                logging.info(f'Adata has already been initialized with {self.__class__}, loading model settings from adata.')
+                log.info(f'Adata has already been initialized with {self.__class__}, loading model settings from adata.')
                 # Set to embeddings found in adata
                 self.cls_emb = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
                 self.cls_sim = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
@@ -228,7 +228,7 @@ class JEDVI(
                 # Register adata's class embedding with this model
                 cls_emb: pd.DataFrame = self.adata.uns[cls_emb_key]
                 if not isinstance(cls_emb, pd.DataFrame):
-                    logging.warning(f'Class embedding has to be a dataframe with labels as index, got {cls_emb.__class__}. Falling back to internal embedding.')
+                    log.warning(f'Class embedding has to be a dataframe with labels as index, got {cls_emb.__class__}. Falling back to internal embedding.')
                 else:
                     # Order external embedding to match label mapping and convert to csr matrix
                     _label_series = pd.Series(self._code_to_label.values())
@@ -239,13 +239,13 @@ class JEDVI(
                     ctrl_class_idx_matches = np.where(_label_series==self.ctrl_class)[0]
                     ctrl_exists_in_data = len(ctrl_class_idx_matches) > 0
                     if not ctrl_exists_in_data:
-                        logging.warning(f'Specified control label {self.ctrl_class} is not in adata class labels, ignoring parameter.')
+                        log.warning(f'Specified control label {self.ctrl_class} is not in adata class labels, ignoring parameter.')
                     if self.ctrl_class is not None and ctrl_exists_in_data:
                         # Find control index
                         self.ctrl_class_idx = ctrl_class_idx_matches[0]
                         # Create empty embedding for control
                         if self.ctrl_class not in _shared_labels:
-                            logging.info(f'Adding empty control external class embedding, will be learned by model.')
+                            log.info(f'Adding empty control external class embedding, will be learned by model.')
                             # Create empty embedding at last slot
                             dummy_emb = pd.DataFrame(np.zeros((1, cls_emb.shape[-1])), index=[self.ctrl_class], columns=cls_emb.columns)
                             # Add dummy embedding as 
@@ -257,7 +257,7 @@ class JEDVI(
                                 np.array(_shared_labels), np.array([self.ctrl_class])
                             ))
                         else:
-                            logging.info(f'Overwriting existing external control class embedding, will be learned by model.')
+                            log.info(f'Overwriting existing external control class embedding, will be learned by model.')
                         # Reset label overlap
                         _label_overlap = _label_series.isin(_shared_labels)
                     else:
@@ -271,7 +271,7 @@ class JEDVI(
                     # Re-order embedding: first training labels then rest
                     cls_emb = pd.concat([cls_emb.loc[_shared_labels], cls_emb.loc[_unseen_labels]], axis=0)
                     # Include class similarity as pre-calculated matrix
-                    logging.info(f'Calculating external class similarities')
+                    log.info(f'Calculating external class similarities')
                     # Set gene embedding as class parameter
                     self.cls_emb = torch.tensor(cls_emb.values, dtype=torch.float32)
                     # Normalize embedding before calculating similarities
@@ -354,7 +354,7 @@ class JEDVI(
         if check_model_kwargs:
             for k, _ in {**non_kwargs, **kwargs}.items():
                 if k in model_kwargs.keys():
-                    logging.warning(f'Duplicate model config key detected, removing: {k}')
+                    log.warning(f'Duplicate model config key detected, removing: {k}')
                     del model_kwargs[k]
         model_params.update(model_kwargs)
         # Fall back to pre-training data if no new traiing data is provided
@@ -560,7 +560,7 @@ class JEDVI(
         self._check_if_trained(warn=False)
         # Log usage of gene embeddings
         if self.gene_emb is not None:
-            logging.info(f'Using model gene embeddings ({self.gene_emb.shape})')
+            log.info(f'Using model gene embeddings ({self.gene_emb.shape})')
         # validate adata or get it from model
         adata = self._validate_anndata(adata)
 
@@ -580,7 +580,7 @@ class JEDVI(
             cls_emb = self.cls_emb
 
         if cls_emb is not None:
-            logging.info(f'Using class embedding: {cls_emb.shape}')
+            log.info(f'Using class embedding: {cls_emb.shape}')
         
         # Regular predictions
         y_pred = []
@@ -742,7 +742,7 @@ class JEDVI(
             if self.was_pretrained:
                 max_epochs = int(np.min([10, np.max([2, round(max_epochs / 3.0)])]))
             epochs = max_epochs
-        logging.info(f'Epochs suggested: {max_epochs}, training for {epochs} epochs.')
+        log.info(f'Epochs suggested: {max_epochs}, training for {epochs} epochs.')
         # Get training split fraction
         train_size: int = data_params.pop('train_size', 0.9)
         if not train_size < 1.0 and train_size > 0:
@@ -760,7 +760,7 @@ class JEDVI(
 
         # Cache indices if model was pre-trained
         if self.was_pretrained and cache_data_splitter:
-            logging.info(f'Re-using pre-training data split.')
+            log.info(f'Re-using pre-training data split.')
             cache_indices = {
                 'train': self.train_indices,
                 'val': self.validation_indices,
@@ -824,7 +824,7 @@ class JEDVI(
                 mode=checkpoint_mode,
                 save_top_k=1,
             )
-            logging.info(f'Saving model checkpoints to: {checkpoint_dir}')
+            log.info(f'Saving model checkpoints to: {checkpoint_dir}')
             # Add to list of callbacks
             callbacks.append(checkpoint_callback)
         # Add callbacks to Trainer kwargs
@@ -871,7 +871,7 @@ class JEDVI(
         self._register_latent_variables()
         # Minify the model if enabled and adata is not already minified
         if minify_adata and not self.is_minified:
-            logging.info(f'Minifying adata with latent distribution')
+            log.info(f'Minifying adata with latent distribution')
             self.minify_adata(use_latent_qzm_key=self._LATENT_QZM_KEY, use_latent_qzv_key=self._LATENT_QZV_KEY)
         
     def _validate_anndata(
@@ -885,7 +885,7 @@ class JEDVI(
 
         adata_manager = self.get_anndata_manager(adata)
         if adata_manager is None:
-            logger.info(
+            log.info(
                 "Input AnnData not setup with scvi-tools. "
                 + "attempting to transfer AnnData setup"
             )
@@ -1047,18 +1047,18 @@ class JEDVI(
         self.adata.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.SOFT_PREDICTION_KEY]          # (cells, classes)
         # Save aligned predictions and latent spaces to model
         aligned_pred = po.get(PREDICTION_KEYS.ALIGN_PREDICTION_KEY)
-        if aligned_pred:
+        if aligned_pred is not None:
             self.adata.obs[PREDICTION_KEYS.ALIGN_PREDICTION_KEY] = aligned_pred
         # Add aligned soft prediction
         aligned_soft_pred = po.get(PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY)
-        if aligned_soft_pred:
-            self.adata.obs[PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY] = aligned_soft_pred
+        if aligned_soft_pred is not None:
+            self.adata.obsm[PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY] = aligned_soft_pred
         # Save aligned latent spaces
         z2c = po.get(PREDICTION_KEYS.Z2C_KEY)
-        if z2c:
+        if z2c is not None:
             self.adata.obsm[self._LATENT_Z2C_KEY] = z2c     # z to class space projection latent (cells, shared dim)
         c2z = po.get(PREDICTION_KEYS.C2Z_KEY)
-        if c2z:
+        if c2z is not None:
             self.adata.uns[self._LATENT_C2Z_KEY] = c2z      # class embedding space (classes, shared dim)
         # Calculate top N predictions over model data
         self._register_top_n_predictions()
@@ -1076,15 +1076,15 @@ class JEDVI(
         ) -> dict[pd.DataFrame] | None:
         """Run model evaluation for all available data splits registered with the model."""
         if self.is_evaluated and not force:
-            logging.info('This model has already been evaluated, pass force=True to re-evaluate.')
+            log.info('This model has already been evaluated, pass force=True to re-evaluate.')
             return
         # Refactor results mode to always be a list of options or None
         results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
         # Run full prediction for all registered data
-        logging.info('Running model predictions on all data splits.')
+        log.info('Running model predictions on all data splits.')
         self._register_model_predictions(force=force)
         # Run classification report for all data splits
-        logging.info('Generating reports.')
+        log.info('Generating reports.')
         self._register_classification_report(force=force, ignore_ctrl=ignore_ctrl)
         # Save model to tensorboard logger directory if registered
         if getattr(self, 'model_log_dir', None) is not None:
@@ -1096,11 +1096,11 @@ class JEDVI(
                 base_output_dir = output_dir
                 model_output_dir = os.path.join(output_dir, 'model')
             else:
-                logging.warning('Could not find model tensorboard log directory or a specified "output_dir", skipping model saving.')
+                log.warning('Could not find model tensorboard log directory or a specified "output_dir", skipping model saving.')
                 base_output_dir = None
                 model_output_dir = None
         # Plot evalutation results if specified
-        logging.info('Plotting evaluation results.')
+        log.info('Plotting evaluation results.')
         if plot:
             self._plot_evalutation(output_dir=base_output_dir)
         # Save model only if we have an output directory
@@ -1109,7 +1109,7 @@ class JEDVI(
             save_anndata = True if self.is_minified else save_anndata
             save_ad_txt = 'with' if save_anndata else 'without'
             adata_txt = 'adata (minified)' if self.is_minified else 'adata'
-            logging.info(f'Saving model {save_ad_txt} {adata_txt} to: {model_output_dir}')
+            log.info(f'Saving model {save_ad_txt} {adata_txt} to: {model_output_dir}')
             self.save(dir_path=model_output_dir, save_anndata=save_anndata, overwrite=True)
         # Create evalutaion return object
         return_obj = None
@@ -1125,24 +1125,24 @@ class JEDVI(
                 }
             # Save reports as seperate files in output directory
             if 'save' in results_mode:
-                logging.info(f'Saving evaluation metrics to: {base_output_dir}')
+                log.info(f'Saving evaluation metrics to: {base_output_dir}')
                 sum_o = os.path.join(base_output_dir, f'{self._name}_eval_summary.csv')
                 rep_o = os.path.join(base_output_dir, f'{self._name}_eval_report.csv')
                 eval_summary.to_csv(sum_o)
                 eval_report.to_csv(rep_o)
-        logging.info(f'Evaluation done.')
+        log.info(f'Evaluation done.')
         # Return 
         return return_obj
     
     def get_eval_summary(self) -> pd.DataFrame | None:
         if PREDICTION_KEYS.SUMMARY_KEY not in self.adata.uns:
-            logging.warning('No model evaluation summary available.')
+            log.warning('No model evaluation summary available.')
             return None
         return self.adata.uns[PREDICTION_KEYS.SUMMARY_KEY]
     
     def get_eval_report(self) -> pd.DataFrame | None:
         if PREDICTION_KEYS.REPORT_KEY not in self.adata.uns:
-            logging.warning('No model evaluation report available.')
+            log.warning('No model evaluation report available.')
             return None
         return self.adata.uns[PREDICTION_KEYS.REPORT_KEY]
     
@@ -1171,7 +1171,7 @@ class JEDVI(
     def _plot_evalutation(self, output_dir: str | None, metric: str = 'f1-score') -> None:
         """Save plots associated to model evaluation."""
         if output_dir is None:
-            logging.warning('Evalutaion output directory is not available. Skipping plots.')
+            log.warning('Evalutaion output directory is not available. Skipping plots.')
             return
         # Set plotting directory and create if needed
         plt_dir = os.path.join(output_dir, 'plots')
@@ -1213,7 +1213,7 @@ class JEDVI(
         missing_genes = model_genes.difference(adata.var_names)
         n_missing = len(missing_genes)
         if n_missing > 0:
-            logging.info(f'Found {n_missing} missing features in test data.')
+            log.info(f'Found {n_missing} missing features in test data.')
             # Copy .var info from model's adata
             missing_var = self.adata[:,missing_genes].var
             # Retain cell-specfic information
@@ -1260,7 +1260,7 @@ class JEDVI(
         # TODO: actually pretty easy, just set prediction column to unknown for all cells duh
         # TODO: make this more modular
         # Read test adata and filter columns
-        logging.info(f'Testing model with: {test_adata_p}')
+        log.info(f'Testing model with: {test_adata_p}')
         test_ad = io.read_adata(test_adata_p, cls_label=cls_label, min_cells_per_class=min_cells_per_class)
         # Filter test adata for trained classes
         train_cls = set(self.get_training_classes())
@@ -1276,7 +1276,7 @@ class JEDVI(
         # Include unseen classes in testing or fall back to shared classes only
         filter_cls = test_cls if incl_unseen else shared_cls
         test_ad._inplace_subset_obs(test_ad.obs[cls_label].isin(filter_cls))
-        logging.info(f'Testing on {len(filter_cls)}/{len(test_cls)} classes.')
+        log.info(f'Testing on {len(filter_cls)}/{len(test_cls)} classes.')
         # Use a fixed dataset label for testing
         ds_name = os.path.basename(test_adata_p).split('.h5ad')[0]
         # Save original batch keys in adata
@@ -1284,13 +1284,13 @@ class JEDVI(
         test_ad.obs[orig_batch_key] = test_ad.obs[batch_label].values
         # Set dataset labels for classification
         if not use_fixed_dataset_label:
-            logging.info('Randomly drawing dataset labels from training data.')
+            log.info('Randomly drawing dataset labels from training data.')
             training_datasets = self.adata.obs[self.original_batch_key].unique()
             np.random.seed(seed)
             ds_names = np.random.choice(training_datasets, test_ad.shape[0])
             test_ad.obs[batch_label] = pd.Categorical(ds_names)
         else:
-            logging.info(f'Added {ds_name} as dataset key.')
+            log.info(f'Added {ds_name} as dataset key.')
             test_ad.obs[batch_label] = ds_name
         # Register new testing data with model
         self.setup_anndata(test_ad, labels_key=cls_label, batch_key=batch_label)
@@ -1302,7 +1302,7 @@ class JEDVI(
         test_ad.obsm[self._LATENT_QZV_KEY] = qzv
         # Minify test data
         if minify:
-            logging.info('Minifying test data.')
+            log.info('Minifying test data.')
             self.minify_query(test_ad)
         # Get model predictions for test data
         use_full = None if not incl_unseen else True
@@ -1310,12 +1310,12 @@ class JEDVI(
         # Select aligned output if available
         if PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY in prediction_output:
             # Set aligned predictions as final predictions
-            soft_pred_key = prediction_output[PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY]
-            pred_key = prediction_output[PREDICTION_KEYS.ALIGN_PREDICTION_KEY]
+            soft_pred_key = PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY
+            pred_key = PREDICTION_KEYS.ALIGN_PREDICTION_KEY
         # Fall back to standard classification
         else:
             if incl_unseen:
-                logging.warning(f'Unseen classes are included. Default classification output cannot zero-shot.')
+                log.warning(f'Unseen classes are included. Default classification output cannot zero-shot.')
             soft_pred_key = PREDICTION_KEYS.SOFT_PREDICTION_KEY
             pred_key = PREDICTION_KEYS.PREDICTION_KEY
         # Get predictions from model output
@@ -1326,13 +1326,13 @@ class JEDVI(
         test_ad.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = soft_predictions
         # Evaluate test results
         if output_dir is None and getattr(self, 'model_log_dir', None) is None:
-            logging.warning(f'No output location provided. Please specify an output directory.')
+            log.warning(f'No output location provided. Please specify an output directory.')
             return
         # Create output directory, fall back to model's tensorboard directory
         if output_dir is None:
             output_dir = os.path.join(self.model_log_dir, 'test', ds_name)
         os.makedirs(output_dir, exist_ok=True)
-        logging.info(f'Evaluating results for test set. Test output dir: {output_dir}')
+        log.info(f'Evaluating results for test set. Test output dir: {output_dir}')
         summary, report = pf.get_classification_report(
             test_ad,
             cls_label=cls_label,
@@ -1419,10 +1419,10 @@ class JEDVI(
             checkpoint_model_paths = glob.glob(f'{checkpoint_dir}/**/{model_name}')
             if len(checkpoint_model_paths) > 0:
                 checkpoint_model_p = checkpoint_model_paths[n] if n > 0 and n < len(checkpoint_model_paths) else checkpoint_model_paths[0]
-                logging.info(f'Loading model checkpoint {checkpoint_model_p}.')
+                log.info(f'Loading model checkpoint {checkpoint_model_p}.')
                 checkpoint_model_dir = os.path.dirname(checkpoint_model_p)
                 return super().load(checkpoint_model_dir, adata=adata)
-        logging.info(f'Could not find model checkpoint(s). Using default "{default_dirname}" directory.')    
+        log.info(f'Could not find model checkpoint(s). Using default "{default_dirname}" directory.')    
         model_state_dir = os.path.join(model_dir, default_dirname)
         return super().load(model_state_dir, adata=adata)
     
@@ -1463,7 +1463,7 @@ class JEDVI(
         Setup AnnData object for training a JEDVI model.
         """
         if not isinstance(adata.X, sp.csr_matrix) and cast_to_csr:
-            logging.info('Converting adata.X to csr matrix to boost training efficiency.')
+            log.info('Converting adata.X to csr matrix to boost training efficiency.')
             adata.X = sp.csr_matrix(adata.X)
         setup_method_args = cls._get_setup_method_args(**locals())
         
@@ -1477,15 +1477,15 @@ class JEDVI(
         ]
         # Add class embedding matrix with shape (n_labels, class_emb_dim)
         if class_emb_uns_key is not None and class_emb_uns_key in adata.uns:
-            logging.info(f'Registered class embedding from adata.uns[{class_emb_uns_key}].')
+            log.info(f'Registered class embedding from adata.uns[{class_emb_uns_key}].')
             anndata_fields.append(StringUnsField(REGISTRY_KEYS.CLS_EMB_KEY, class_emb_uns_key))
         # Add gene embedding matrix with shape (n_vars, emb_dim)
         if gene_emb_varm_key is not None and gene_emb_varm_key in adata.varm:
-            logging.info(f'Registered gene embedding from adata.varm[{gene_emb_varm_key}].')
+            log.info(f'Registered gene embedding from adata.varm[{gene_emb_varm_key}].')
             anndata_fields.append(VarmField(REGISTRY_KEYS.GENE_EMB_KEY, gene_emb_varm_key))
         # Add class score per cell, ensure its scaled [0, 1]
         if class_certainty_key is not None:
-            logging.info(f'Registered class certainty score from adata.obs[{class_certainty_key}].')
+            log.info(f'Registered class certainty score from adata.obs[{class_certainty_key}].')
             scaled_class_cert_key = f'{class_certainty_key}_scaled'
             adata.obs[scaled_class_cert_key] = scale_1d_array(adata.obs[class_certainty_key].astype(float).values)
             anndata_fields.append(NumericalObsField(REGISTRY_KEYS.CLS_CERT_KEY, scaled_class_cert_key, required=False))

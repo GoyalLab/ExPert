@@ -1124,8 +1124,8 @@ class Encoder(nn.Module):
         if self.n_dim_context_emb > 0 and context_emb is not None:
             if self.use_film:
                 # Film modulation inside encoder
-                q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
-                q = self.film(q, context_emb)
+                q = self.film(x, context_emb)
+                q = self.encoder(q, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
             else:
                 # Simple concatenation
                 x = torch.cat([x, context_emb], dim=-1)
@@ -1198,7 +1198,7 @@ class DecoderSCVI(nn.Module):
             )
 
         if use_film and self.n_dim_context_emb > 0:
-            self.film = FiLM(feature_dim=funnel_out_dim, context_dim=self.n_dim_context_emb)
+            self.film = FiLM(feature_dim=decoder_input_dim, context_dim=self.n_dim_context_emb)
 
         if scale_activation == "softmax":
             px_scale_activation = nn.Softmax(dim=-1)
@@ -1214,12 +1214,13 @@ class DecoderSCVI(nn.Module):
     def forward(self, dispersion: str, z: torch.Tensor, library: torch.Tensor, *cat_list: int, context_emb: torch.Tensor | None = None):
         # Concatenate or modulate by context
         if self.n_dim_context_emb > 0 and context_emb is not None:
+            # Use FiLM to combine the latent space with batch information
             if self.use_film:
-                px = self.px_decoder(z, *cat_list)
-                px = self.film(px, context_emb)
+                px = self.film(z, context_emb)
+            # Use simple concatenation
             else:
                 z = torch.cat([z, context_emb], dim=-1)
-                px = self.px_decoder(z, *cat_list)
+            px = self.px_decoder(z, *cat_list)
         else:
             px = self.px_decoder(z, *cat_list)
 
