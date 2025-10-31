@@ -206,11 +206,12 @@ class JEDVAE(VAE):
         if self.batch_representation == 'embedding' and encode_covariates:
             self.use_context_emb = True
             n_dim_context_emb = self.get_embedding(REGISTRY_KEYS.BATCH_KEY).embedding_dim
-            self.context_emb = ContextEmbedding(n_batch, n_dim_context_emb)
+            self.e_context_emb = ContextEmbedding(n_batch, n_dim_context_emb)
+            self.d_context_emb = ContextEmbedding(n_batch, n_dim_context_emb)
             cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
         else:
             self.use_context_emb = False
-            self.context_emb = None
+            self.e_context_emb, self.d_context_emb = None, None
             n_dim_context_emb = 0
             cat_list = [n_batch] + list([] if n_cats_per_cov is None else n_cats_per_cov)
         # Setup batch index and other categorical co-variates
@@ -471,7 +472,7 @@ class JEDVAE(VAE):
 
         # Inflate context embedding
         if self.use_context_emb:
-            context_emb = self.context_emb(batch_index).reshape(batch_index.shape[0], -1)
+            context_emb = self.e_context_emb(batch_index).reshape(batch_index.shape[0], -1)
         else:
             context_emb = None
 
@@ -551,7 +552,7 @@ class JEDVAE(VAE):
 
         # Inflate context embedding
         if self.use_context_emb:
-            context_emb = self.context_emb(batch_index).reshape(batch_index.shape[0], -1)
+            context_emb = self.d_context_emb(batch_index).reshape(batch_index.shape[0], -1)
         else:
             context_emb = None
 

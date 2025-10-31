@@ -74,10 +74,12 @@ class ContextEmbedding(nn.Module):
         emb_dim: int = 5,
         add_unseen_buffer: bool = True,
         set_buffer_to_mean: bool = True,
+        observed_buffer_prob: float = 0.05,
     ):
         super().__init__()
         self.add_unseen_buffer = add_unseen_buffer
         self.set_buffer_to_mean = set_buffer_to_mean
+        self.observed_buffer_prob = observed_buffer_prob
 
         n_total = n_contexts + (1 if add_unseen_buffer else 0)
         self.embedding = nn.Embedding(n_total, emb_dim)
@@ -89,6 +91,14 @@ class ContextEmbedding(nn.Module):
                 self.embedding.weight[-1] = mean_vec
 
     def forward(self, context_idx: torch.Tensor):
+        """Return inflated embedding by context indices of batch."""
+        # With probability p, replace some context indices with buffer index
+        if self.training and self.add_unseen_buffer and self.observed_buffer_prob > 0:
+            mask = torch.rand_like(context_idx.float()) < self.observed_buffer_prob
+            context_idx = torch.where(mask, 
+                                      torch.full_like(context_idx, self.unseen_index), 
+                                      context_idx)
+        # Return inflated context embedding of (b,c)
         return self.embedding(context_idx)
 
     @property
@@ -1107,7 +1117,7 @@ class Encoder(nn.Module):
         )
 
         if use_film and self.n_dim_context_emb > 0:
-            self.film = FiLM(feature_dim=funnel_out_dim, context_dim=self.n_dim_context_emb)
+            self.film = FiLM(feature_dim=encoder_input_dim, context_dim=self.n_dim_context_emb)
 
         self.mean_encoder = nn.Linear(funnel_out_dim, n_output)
         self.var_encoder = nn.Linear(funnel_out_dim, n_output)
@@ -1124,8 +1134,8 @@ class Encoder(nn.Module):
         if self.n_dim_context_emb > 0 and context_emb is not None:
             if self.use_film:
                 # Film modulation inside encoder
-                q = self.film(x, context_emb)
-                q = self.encoder(q, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
+                x = self.film(x, context_emb)
+                q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
             else:
                 # Simple concatenation
                 x = torch.cat([x, context_emb], dim=-1)

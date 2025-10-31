@@ -18,6 +18,11 @@ import logging
 log = logging.getLogger(__name__)
 
 
+mutually_excl_keys: dict[str, list[tuple[str]]] = {
+    CONF_KEYS.MODEL: [('use_batch_norm', 'use_layer_norm')]
+}
+
+
 def to_tensor(m: sp.csr_matrix | torch.Tensor | np.ndarray | pd.DataFrame | None) -> torch.Tensor:
     if m is None:
         return None
@@ -45,16 +50,29 @@ def replace_nn_modules(d):
     else:
         return d
     
-def generate_random_configs(space: dict, n_samples: int | None = None, fixed_weights: bool = True, seed: int | None = None):
+def generate_random_configs(space: dict, n_samples: int | None = None, seed: int | None = None):
     if seed is not None:
         random.seed(seed)
 
-    def valid_schedule(schedule):
-        if 'min_weight' in schedule and 'max_weight' in schedule:
-            if fixed_weights and schedule['max_weight'] != schedule['min_weight']:
-                return False
-            if schedule['max_weight'] < schedule['min_weight']:
-                return False
+    def valid_config(config: dict):
+        # Check if there are mutually exclusive parameter values
+        for sched_key, mu_kw_list in mutually_excl_keys.items():
+            # Get schedule
+            sched: dict = config.get(sched_key)
+            if sched is None:
+                return True
+            # Check all mututally exclusive params in schedule
+            for mu_tuple in mu_kw_list:
+                # Collect all unique params
+                vs = set()
+                for kw in mu_tuple:
+                    vs.add(sched.get(kw))
+                # Validate config if they are all None (don't exist in config)
+                if len(vs) == 1 and list(vs)[0] is None:
+                    return True
+                # Reject config if there is less values than number of keywords
+                if len(vs) < len(mu_tuple):
+                    return False
         return True
 
     def sample_from_space(subspace):
@@ -64,22 +82,14 @@ def generate_random_configs(space: dict, n_samples: int | None = None, fixed_wei
             return random.choice(subspace)
         return subspace
 
-    def random_config():
-        config = {k: sample_from_space(v) for k, v in space.items()}
-        
-        # Special handling for schedules to ensure validity
-        if CONF_KEYS.SCHEDULES in config:
-            schedules = {}
-            for name, _ in config[CONF_KEYS.SCHEDULES].items():
-                max_iter = 0
-                while True and max_iter < 100:
-                    schedule = sample_from_space(space[CONF_KEYS.SCHEDULES][name])
-                    if valid_schedule(schedule):
-                        schedules[name] = schedule
-                        break
-                    max_iter += 1
-            config[CONF_KEYS.SCHEDULES] = schedules
-        
+    def random_config(max_iter: int = 100):
+        i = 0
+        while True and i < max_iter:
+            # Keep sampling configs if they are invalid
+            config = {k: sample_from_space(v) for k, v in space.items()}
+            if valid_config(config):
+                break
+            i += 1
         return config
 
     count = 0

@@ -315,21 +315,23 @@ def plot_cls_masks(latents: ad.AnnData, plt_dir: str, max_classes: int = 100):
         plt.savefig(os.path.join(pp_plt_dir, f'{p}.png'), dpi=300, bbox_inches='tight')
         plt.close()
 
-def plot_interactive_latent(latent: ad.AnnData, report: pd.DataFrame | None = None, color_options: list[str] = ['perturbation', 'dataset', 'mode'], deep_mode: bool = True):
+def plot_interactive_latent(latent: ad.AnnData, report: pd.DataFrame | None = None, color_options: list[str] = ['perturbation', 'dataset', 'mode'], deep_mode: bool = True, obsm_key: str = 'X_umap'):
     import plotly.graph_objects as go
     import pandas as pd
     import plotly.io as pio
     pio.renderers.default = "notebook"
 
     # Extract umap data from latent
-    umap = pd.DataFrame(latent.obsm['X_umap'], columns=['UMAP_1', 'UMAP_2'])
+    umap = pd.DataFrame(latent.obsm[obsm_key], columns=['UMAP_1', 'UMAP_2'])
     umap = pd.concat([umap, latent.obs.reset_index()], axis=1)
     # Define color options
     default_color = color_options[0]
-    hover_info_cols = ['perturbation', 'celltype', 'mode', 'dataset', 'mixscale_score']
+    hover_info_cols = ['perturbation', 'celltype', 'split', 'dataset', 'mixscale_score']
     # Add classification validation performance to plot
     if report is not None and 'val-f1-score' not in umap.columns:
-        tmp = report.loc[report['mode']=='val',['cls_label', 'f1-score']].copy()
+        tmp = report.copy()
+        tmp.reset_index(names=['cls_label'], inplace=True)
+        tmp = tmp.loc[tmp['split']=='val',['cls_label', 'f1-score']].copy()
         tmp['val-f1-score'] = tmp['f1-score'].values
         umap = umap.merge(tmp[['cls_label', 'val-f1-score']], on='cls_label', how='left')
         hover_info_cols.append('val-f1-score')

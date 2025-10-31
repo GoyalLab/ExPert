@@ -438,14 +438,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             import seaborn as sns
 
             # Get embedding weights and convert to numpy array for plotting 
-            weights = self.module.context_emb.weight.clone().detach().cpu().numpy()
+            weights = self.module.e_context_emb.weight.clone().detach().cpu().numpy()
             # Get context labels
             batch_labels = self.batch_labels
             
             # Create heatmap
             fig, ax = plt.subplots(figsize=(12, 8))
             sns.heatmap(weights, cmap='viridis', ax=ax, annot=True, fmt=".3f")
-            ax.set_title(f'Context Embedding Weights @ Epoch {self.current_epoch}')
+            ax.set_title(f'Encoder Context Embedding Weights @ Epoch {self.current_epoch}')
             ax.set_xlabel('Embedding Dimension')
             ax.set_ylabel('Context Index')
 
