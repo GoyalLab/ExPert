@@ -9,6 +9,7 @@ class _REGISTRY_KEYS_NT(NamedTuple):
     SAMPLE_KEY: str = "sample"
     LABELS_KEY: str = "labels"
     GENE_EMB_KEY: str = "gene_embedding"
+    CTX_EMB_KEY: str = "ctx_embedding"
     CLS_EMB_KEY: str = "cls_embedding"
     CLS_SIM_KEY: str = "cls_embedding_sim"
     CLS_EMB_INIT: str = "CLS_EMB_INIT"

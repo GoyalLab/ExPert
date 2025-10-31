@@ -45,8 +45,6 @@ def replace_nn_modules(d):
     elif isinstance(d, str) and d.startswith("nn."):
         attr = d.split("nn.")[-1]
         return getattr(nn, attr)
-    elif isinstance(d, str) and hasattr(nn, d):
-        return getattr(nn, d)
     else:
         return d
     

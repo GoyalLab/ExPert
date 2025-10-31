@@ -55,6 +55,7 @@ class JEDVAE(VAE):
         n_layers: int = 2,
         cls_emb: torch.Tensor | None = None,
         cls_sim: torch.Tensor | None = None,
+        ctx_emb: torch.Tensor | None = None,
         dropout_rate_encoder: float = 0.2,
         dropout_rate_decoder: float | None = None,
         ext_class_embed_dim: int | None = None,
@@ -202,13 +203,26 @@ class JEDVAE(VAE):
         # ----- Setup modules -----
         n_input_encoder = n_input + n_continuous_cov * encode_covariates
         n_input_decoder = n_latent + n_continuous_cov * decode_covariates
+        # Setup default categorical covariates
+        cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
+        self.use_ext_emb = False
+        # Add external context embedding
+        if ctx_emb is not None:
+            self.use_context_emb = True
+            self.use_ext_emb = True
+            n_batch = ctx_emb.shape[0]                  # Register number of contexts in embedding
+            n_dim_context_emb = ctx_emb.shape[-1]       # Register number of dimensions in embedding
+            # Create context embedding class
+            _ctx_emb = ContextEmbedding(n_batch, n_dim_context_emb, add_unseen_buffer=False, ext_emb=ctx_emb)
+            # Register embedding to both encoder and decoder
+            self.e_context_emb = _ctx_emb
+            self.d_context_emb = _ctx_emb
         # Add context embedding dimensions to encoder and or decoder dimensions
-        if self.batch_representation == 'embedding' and encode_covariates:
+        elif self.batch_representation == 'embedding' and encode_covariates:
             self.use_context_emb = True
             n_dim_context_emb = self.get_embedding(REGISTRY_KEYS.BATCH_KEY).embedding_dim
             self.e_context_emb = ContextEmbedding(n_batch, n_dim_context_emb)
             self.d_context_emb = ContextEmbedding(n_batch, n_dim_context_emb)
-            cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
         else:
             self.use_context_emb = False
             self.e_context_emb, self.d_context_emb = None, None
@@ -239,6 +253,7 @@ class JEDVAE(VAE):
             use_feature_mask=use_feature_mask,
             drop_prob=drop_prob,
             n_dim_context_emb=n_dim_context_emb,
+            use_context_inference=self.use_ext_emb,
             **_extra_encoder_kwargs,
             return_dist=True,
         )
@@ -472,7 +487,11 @@ class JEDVAE(VAE):
 
         # Inflate context embedding
         if self.use_context_emb:
-            context_emb = self.e_context_emb(batch_index).reshape(batch_index.shape[0], -1)
+            if self.use_ext_emb:
+                # Pass full embedding to encoder
+                context_emb = self.e_context_emb.weight
+            else:
+                context_emb = self.e_context_emb(batch_index).reshape(batch_index.shape[0], -1)
         else:
             context_emb = None
 

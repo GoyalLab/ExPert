@@ -75,6 +75,8 @@ class ContextEmbedding(nn.Module):
         add_unseen_buffer: bool = True,
         set_buffer_to_mean: bool = True,
         observed_buffer_prob: float = 0.05,
+        ext_emb: torch.Tensor | None = None,
+        freeze_pretrained: bool = True,
     ):
         super().__init__()
         self.add_unseen_buffer = add_unseen_buffer
@@ -82,7 +84,12 @@ class ContextEmbedding(nn.Module):
         self.observed_buffer_prob = observed_buffer_prob
 
         n_total = n_contexts + (1 if add_unseen_buffer else 0)
-        self.embedding = nn.Embedding(n_total, emb_dim)
+        # Initialize a learnable context embedding
+        if ext_emb is None:
+            self.embedding = nn.Embedding(n_total, emb_dim)
+        else:
+            # Set inital weights to pre-trained embedding
+            self.embedding = nn.Embedding.from_pretrained(ext_emb, freeze=freeze_pretrained)
 
         # Optionally initialize unseen buffer to mean of others
         if set_buffer_to_mean and add_unseen_buffer:
@@ -1057,6 +1064,22 @@ class FiLM(nn.Module):
         beta = self.beta(context_emb)
         return gamma * z + beta  # FiLM modulation
 
+class ContextFeatureAttention(nn.Module):
+    def __init__(self, n_features: int, d_ctx: int, d_hidden: int):
+        super().__init__()
+        self.query = nn.Linear(d_ctx, d_hidden)
+        self.key   = nn.Linear(n_features, d_hidden)
+        self.value = nn.Linear(n_features, n_features)
+        self.scale = d_hidden ** 0.5
+
+    def forward(self, x: torch.Tensor, c_emb: torch.Tensor):
+        # x: [batch, n_genes], c_emb: [batch, d_ctx]
+        Q = self.query(c_emb).unsqueeze(1)       # [B, 1, d_h]
+        K = self.key(x).unsqueeze(1)             # [B, 1, d_h]
+        attn = torch.softmax(Q @ K.transpose(-2, -1) / self.scale, dim=-1)
+        x_attn = attn @ self.value(x).unsqueeze(1)
+        return x + x_attn.squeeze(1)             # context-modulated features
+
 # Encoder
 class Encoder(nn.Module):
     """Encode data into latent space, optionally conditioned on context via concatenation or FiLM."""
@@ -1077,7 +1100,10 @@ class Encoder(nn.Module):
         use_feature_mask: bool = False,
         drop_prob: float = 0.25,
         encoder_type: Literal["funnel", "fc", "transformer"] = "funnel",
-        use_film: bool = False,
+        context_integration_method : Literal["concat", "film", "attention"] | None = "attention",
+        use_context_inference: bool = True,
+        use_learnable_temperature: bool = True,
+        temperature: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -1092,6 +1118,7 @@ class Encoder(nn.Module):
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
 
+        # Save init params
         self.encoder_type = encoder_type
         self.distribution = distribution
         self.var_eps = var_eps
@@ -1100,10 +1127,19 @@ class Encoder(nn.Module):
         self.use_feature_mask = use_feature_mask
         self.drop_prob = drop_prob
         self.return_dist = return_dist
-        self.use_film = use_film
+        self.context_integration_method = context_integration_method
+        self.use_context_inference = use_context_inference
+        self.use_learnable_temperature = use_learnable_temperature
 
         funnel_out_dim = 2 * n_output
-        encoder_input_dim = n_input if use_film else n_input + self.n_dim_context_emb
+        if context_integration_method is not None and self.context_integration_method not in ["concat", "film", "attention"]:
+            raise ValueError(f'Invalid context integration method: "{context_integration_method}"')
+        # Use concatenated dimensions as input
+        if self.context_integration_method == 'concat':
+            encoder_input_dim = n_input + self.n_dim_context_emb
+        # Use input dimension
+        else:
+            encoder_input_dim = n_input
 
         # Base encoder layers
         self.encoder = self.fclayers_class(
@@ -1115,14 +1151,40 @@ class Encoder(nn.Module):
             dropout_rate=dropout_rate,
             **kwargs,
         )
+        # Initialize context intergration method:
+        if self.context_integration_method == 'film' and self.n_dim_context_emb > 0:
+            self.ctx_integration = FiLM(feature_dim=encoder_input_dim, context_dim=self.n_dim_context_emb)
+        elif self.context_integration_method == 'attention' and self.n_dim_context_emb > 0:
+            self.ctx_integration = ContextFeatureAttention(n_features=encoder_input_dim, d_ctx=self.n_dim_context_emb, d_hidden=n_hidden)
+        else:
+            self.ctx_integration = None
+        # Add context projection
+        if self.use_context_inference:
+            self.context_proj = nn.Linear(self.n_dim_context_emb, funnel_out_dim)
+        else:
+            self.context_proj = None
 
-        if use_film and self.n_dim_context_emb > 0:
-            self.film = FiLM(feature_dim=encoder_input_dim, context_dim=self.n_dim_context_emb)
+        # Create a learnable temperature scaling
+        if use_learnable_temperature:
+            self._temperature = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
+        # Fall back to static default temperature
+        else:
+            self._temperature = temperature
 
+        # Create base vae projections
         self.mean_encoder = nn.Linear(funnel_out_dim, n_output)
         self.var_encoder = nn.Linear(funnel_out_dim, n_output)
         self.var_activation = torch.exp if var_activation is None else var_activation
         self.z_transformation = nn.Softmax(dim=-1) if distribution == "ln" else _identity
+
+    @property
+    def temperature(self) -> torch.Tensor:
+        if self.use_learnable_temperature:
+            # Calculate logit scale
+            return 1.0 / self._temperature.clamp(-1, 4.6).exp()
+        else:
+            return self._temperature
+    
 
     def forward(self, x: torch.Tensor, *cat_list: int, g: torch.Tensor | None = None, context_emb: torch.Tensor | None = None):
         # Optional feature masking
@@ -1132,9 +1194,23 @@ class Encoder(nn.Module):
 
         # Concatenate or modulate by context
         if self.n_dim_context_emb > 0 and context_emb is not None:
-            if self.use_film:
-                # Film modulation inside encoder
-                x = self.film(x, context_emb)
+            if self.context_integration_method != 'concat':
+                # Use context inference method
+                if self.use_context_inference:
+                    # Encode x only TODO: try separate linear projection for disentanglement
+                    h_x = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
+                    # Project context to shared dimensionality
+                    h_c = self.context_proj(context_emb)            # (n_contexts, d_h)
+                    # Calculate context similarity
+                    ctx_logits = h_x @ h_c.T / self.temperature         # (b, d_h) @ (d_h, n_contexts) = (b, n_contexts)
+                    # Select context information based on highest softmax
+                    ctx_emb = (torch.softmax(ctx_logits, dim=-1).unsqueeze(-1) * context_emb.unsqueeze(0)).sum(dim=1)
+                else:
+                    # Use batch inflated context embedding
+                    ctx_emb = context_emb
+                # Add context integration
+                x = self.ctx_integration(x, ctx_emb)
+                # Do final encoder forward pass
                 q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
             else:
                 # Simple concatenation
@@ -1242,6 +1318,24 @@ class DecoderSCVI(nn.Module):
         return px_scale, px_r, px_rate, px_dropout
 
 
+class CrossClassAttention(nn.Module):
+    def __init__(self, n_latent: int, cls_emb_dim: int, dim_shared: int):
+        super().__init__()
+        self.query = nn.Linear(n_latent, dim_shared)
+        self.key   = nn.Linear(cls_emb_dim, dim_shared)
+        self.value = nn.Linear(cls_emb_dim, dim_shared)
+        self.scale = dim_shared ** 0.5
+
+    def forward(self, z, cls_emb):
+        # z: [B, d_latent], cls_emb: [C, d_class]
+        Q = self.query(z).unsqueeze(1)           # [B, 1, d]
+        K = self.key(cls_emb).unsqueeze(0)       # [1, C, d]
+        V = self.value(cls_emb).unsqueeze(0)     # [1, C, d]
+        attn = torch.softmax(Q @ K.transpose(-2, -1) / self.scale, dim=-1)
+        z_aligned = (attn @ V).squeeze(1)        # [B, d]
+        return z_aligned, attn.squeeze(1)        # also gives attention weights
+
+
 class EmbeddingAligner(nn.Module):
     """Classifier where latent attends to class embeddings, optionally externally provided,
     using dot product or cosine similarity. Compatible with external CE loss logic.
@@ -1265,6 +1359,8 @@ class EmbeddingAligner(nn.Module):
         temperature: float = 0.1,
         use_learnable_temperature: bool = True,
         mode: Literal["latent_to_class", "class_to_latent", "shared"] = "latent_to_class",
+        use_cross_attention: bool = False,
+        n_heads: int = 4,
         **kwargs,
     ):
         super().__init__()
@@ -1276,6 +1372,7 @@ class EmbeddingAligner(nn.Module):
         self.mode = mode
         self._temperature = temperature
         self.use_learnable_temperature = use_learnable_temperature
+        self.use_cross_attention = use_cross_attention
         # Create a learnable temperature scaling
         if use_learnable_temperature:
             self._temperature = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
@@ -1330,11 +1427,17 @@ class EmbeddingAligner(nn.Module):
         # ---- Dropout ---- #
         self.dropout = nn.Dropout(p=dropout_rate)
 
+        # ---- Cross attention (optional) --- #
+        if self.use_cross_attention:
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=self.n_output, num_heads=n_heads, batch_first=True
+            )
+
     @property
     def temperature(self) -> torch.Tensor:
         if self.use_learnable_temperature:
             # Calculate logit scale
-            return 1.0 / self._temperature.clamp(1e-6, 4.6).exp()
+            return 1.0 / self._temperature.clamp(-1, 4.6).exp()
         else:
             return self._temperature
     
@@ -1357,18 +1460,31 @@ class EmbeddingAligner(nn.Module):
             c = c + noise_sigma * F.normalize((torch.rand_like(c) * 2 - 1), dim=-1)
         if self.dropout_rate > 0:
             z = self.dropout(z)
-
-        # Compute logits
+        # Apply normalization to projections
         z_norm = F.normalize(z, dim=-1)
         c_norm = F.normalize(c, dim=-1)
-        logits = torch.matmul(z_norm, c_norm.T).clamp(-1, 1)
 
-        # Scale by temperature
-        logits = logits / self.temperature
+        # ---- OPTION 1: Cross-Attention path ---- #
+        if self.use_cross_attention:
+            # Reshape for MultiheadAttention: [B, 1, D] attends to [1, C, D]
+            q = z_norm.unsqueeze(1)     # queries = latents
+            k = c_norm.unsqueeze(0)     # keys = class embeddings
+            v = c.unsqueeze(0)
+            z_attn, attn_weights = self.cross_attn(q, k, v)  # [B,1,D], [B,1,C]
+            z_proj = z_attn.squeeze(1)
+            logits = attn_weights.squeeze(1)  # attention weights as logits (before softmax)
+            logits = logits / self.temperature
+
+        # ---- OPTION 2: Standard CLIP-style similarity ---- #
+        else:
+            logits = torch.matmul(z_norm, c_norm.T).clamp(-1, 1)
+            logits = logits / self.temperature
+            z_proj = z_norm
+
         # Optionally return softmax
         logits = logits if self.logits else F.softmax(logits, dim=-1)
         # Return logits only or tuple of logits and latent spaces
-        return (logits, z_norm, c_norm) if self.return_latents else logits
+        return (logits, z_proj, c_norm) if self.return_latents else logits
     
 
 class ArcClassifier(nn.Module):

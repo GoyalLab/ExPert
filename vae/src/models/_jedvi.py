@@ -98,6 +98,7 @@ class JEDVI(
         self.ctrl_class = ctrl_class
         # Set number of classes
         self.n_labels = self.summary_stats.n_labels
+        self.n_batches = self.summary_stats.n_batches
         # Whether to use the full class embedding
         self.use_full_cls_emb = use_full_cls_emb
         # Create placeholder for log directory
@@ -129,6 +130,7 @@ class JEDVI(
             n_layers=n_layers,
             cls_emb=cls_emb,
             cls_sim=cls_sim,
+            ctx_emb=self.ctx_emb,
             dropout_rate_encoder=dropout_rate,
             dropout_rate_decoder=dropout_rate_decoder,
             ext_class_embed_dim=self.ext_class_embed_dim,
@@ -152,7 +154,9 @@ class JEDVI(
         self._model_summary_string = (
             f"{self.__class__} Model with the following params: \n"
             f"n_classes: {self.n_labels}, "
-            f"n_unseen_classes: {self.n_unseen_labels}, "
+            f"n_unseen_classes: {self.n_unseen_labels}, \n"
+            f"n_contexts: {self.n_batches}, "
+            f"n_unseen_contexts: {self.n_unobs_ctx}, \n" if self.n_unobs_ctx > 0 else "\n"
             f"use_gene_emb: {self.use_gene_emb}"
         )
         # Include control class information
@@ -197,6 +201,33 @@ class JEDVI(
         batch_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY)
         self.original_batch_key = batch_state_registry.original_key
         self._batch_mapping = batch_state_registry.categorical_mapping
+        self.idx_to_batch = pd.Series(self._batch_mapping)
+        # Add context embedding if given
+        ctx_emb_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CTX_EMB_KEY, {})
+        self.ctx_emb = None
+        self.n_unobs_ctx = 0
+        if len(ctx_emb_registry) > 0:
+            # Get registry keys for context embedding in adata
+            ext_ctx_emb_key = ctx_emb_registry.get('original_key')
+            ctx_emb_key = ctx_emb_registry['data_registry'].get('attr_key') if ext_ctx_emb_key is None else ext_ctx_emb_key
+            # Get the embedding from adata and check if it's a dataframe
+            if not isinstance(self.adata.uns[ctx_emb_key], pd.DataFrame):
+                log.warning(f'Context embedding has to be a dataframe with contexs as index, got {ctx_emb.__class__}. Falling back to internal embedding.')
+            else:
+                # Extract context embedding from adata
+                ctx_emb: pd.DataFrame = self.adata.uns[ctx_emb_key]
+                # Get observed and unobserved context labels
+                _obs_contexts_mask = self.idx_to_batch.isin(ctx_emb.index)
+                if _obs_contexts_mask.sum() != self.idx_to_batch.shape[0]:
+                    raise ValueError(f'Missing contexts in external context embedding. {self.idx_to_batch[~_obs_contexts_mask].values}')
+                _obs_ctx_labels = self.idx_to_batch[_obs_contexts_mask]
+                _unobs_ctx_labels = ctx_emb.index.difference(_obs_ctx_labels)
+                self.n_unobs_ctx = _unobs_ctx_labels.shape[0]
+                # Order embedding by observed contexts and unobserved after and update class variable
+                ctx_emb = pd.concat([ctx_emb.loc[_obs_ctx_labels], ctx_emb.loc[_unobs_ctx_labels]], axis=0)
+                # Convert to tensor
+                self.ctx_emb = io.to_tensor(ctx_emb)
+            
         # Assign class embedding
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
@@ -846,8 +877,6 @@ class JEDVI(
         )
         # Save hyperparameters to model output dir
         if logger is not None:
-            # Don't log the class embedding
-            plan_kwargs.pop(REGISTRY_KEYS.CLS_EMB_KEY, None)
             # save hyper-parameters to lightning logs
             hparams = {
                 'data_params': data_params,
@@ -1447,14 +1476,15 @@ class JEDVI(
         cls,
         adata: AnnData,
         labels_key: str | None = None,
-        layer: str | None = None,
-        class_emb_uns_key: str | None = 'cls_embedding',
-        class_certainty_key: str | None = None,
-        gene_emb_varm_key: str | None = None,
         batch_key: str | None = None,
+        class_emb_uns_key: str | None = 'cls_embedding',
+        context_emb_uns_key: str | None = 'ctx_embedding',
+        gene_emb_varm_key: str | None = None,
         size_factor_key: str | None = None,
+        class_certainty_key: str | None = None,
         cast_to_csr: bool = True,
         raw_counts: bool = True,
+        layer: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
         **kwargs,
@@ -1479,6 +1509,10 @@ class JEDVI(
         if class_emb_uns_key is not None and class_emb_uns_key in adata.uns:
             log.info(f'Registered class embedding from adata.uns[{class_emb_uns_key}].')
             anndata_fields.append(StringUnsField(REGISTRY_KEYS.CLS_EMB_KEY, class_emb_uns_key))
+        # Add context embedding matrix with shape (n_contexts, context_emb_dim)
+        if context_emb_uns_key is not None and context_emb_uns_key in adata.uns:
+            log.info(f'Registered context embedding from adata.uns[{context_emb_uns_key}].')
+            anndata_fields.append(StringUnsField(REGISTRY_KEYS.CTX_EMB_KEY, context_emb_uns_key))
         # Add gene embedding matrix with shape (n_vars, emb_dim)
         if gene_emb_varm_key is not None and gene_emb_varm_key in adata.varm:
             log.info(f'Registered gene embedding from adata.varm[{gene_emb_varm_key}].')

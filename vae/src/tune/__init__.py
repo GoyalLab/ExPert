@@ -1,7 +1,11 @@
 import logging
 from rich.logging import RichHandler
+import warnings
 
+# Ignore depreciation warnings
+warnings.simplefilter('ignore', category=FutureWarning)
 
+# Setup package logger
 logging.basicConfig(
     level='INFO',
     format='%(message)s',
