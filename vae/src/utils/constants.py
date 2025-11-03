@@ -47,6 +47,7 @@ class _MODULE_KEYS(NamedTuple):
     # inference (class embedding to latent projection)
     ZE_KEY: str = "ze"
     LIBRARY_G_KEY: str = "library_g"
+    CTX_LOGITS_KEY: str = "ctx_logits"
     # inference (library)
     LIBRARY_KEY: str = "library"
     LABEL_KEY: str = "label"
@@ -84,10 +85,11 @@ class _TRAINING_KEYS_NT(NamedTuple):
 class _LOSS_KEYS_NT(NamedTuple):
     # Loss keys
     LOSS: str = "loss"
-    CLS_LOSS: str = "ce_loss"
+    CLS_LOSS: str = "cls_loss"
     ALIGN_LOSS: str = "align_loss"
     ADV_LOSS: str = "adversial_context_loss"
     UNSCALED_LOSS: str = "unscaled_loss"
+    CTX_CLS_LOSS: str = "ctx_loss"
     # Data keys
     DATA: str = "data"
     LOGITS: str = "logits"

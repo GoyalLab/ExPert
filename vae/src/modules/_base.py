@@ -9,7 +9,7 @@ from typing import Literal, Iterable, Optional
 
 from torch.distributions import Normal
 
-from src.utils.constants import REGISTRY_KEYS
+from src.utils.constants import MODULE_KEYS
 from src.utils.io import to_tensor
 
 
@@ -1096,7 +1096,6 @@ class Encoder(nn.Module):
         distribution: str = "normal",
         var_eps: float = 1e-4,
         var_activation: Callable | None = None,
-        return_dist: bool = False,
         use_feature_mask: bool = False,
         drop_prob: float = 0.25,
         encoder_type: Literal["funnel", "fc", "transformer"] = "funnel",
@@ -1126,7 +1125,6 @@ class Encoder(nn.Module):
         self.n_dim_context_emb = n_dim_context_emb or 0
         self.use_feature_mask = use_feature_mask
         self.drop_prob = drop_prob
-        self.return_dist = return_dist
         self.context_integration_method = context_integration_method
         self.use_context_inference = use_context_inference
         self.use_learnable_temperature = use_learnable_temperature
@@ -1157,6 +1155,7 @@ class Encoder(nn.Module):
         elif self.context_integration_method == 'attention' and self.n_dim_context_emb > 0:
             self.ctx_integration = ContextFeatureAttention(n_features=encoder_input_dim, d_ctx=self.n_dim_context_emb, d_hidden=n_hidden)
         else:
+            # Skip context integration
             self.ctx_integration = None
         # Add context projection
         if self.use_context_inference:
@@ -1177,6 +1176,9 @@ class Encoder(nn.Module):
         self.var_activation = torch.exp if var_activation is None else var_activation
         self.z_transformation = nn.Softmax(dim=-1) if distribution == "ln" else _identity
 
+        # Debug
+        self.c = 0
+
     @property
     def temperature(self) -> torch.Tensor:
         if self.use_learnable_temperature:
@@ -1193,6 +1195,7 @@ class Encoder(nn.Module):
             x = x * mask.expand(x.shape[0], -1)
 
         # Concatenate or modulate by context
+        ctx_logits = None
         if self.n_dim_context_emb > 0 and context_emb is not None:
             if self.context_integration_method != 'concat':
                 # Use context inference method
@@ -1209,7 +1212,8 @@ class Encoder(nn.Module):
                     # Use batch inflated context embedding
                     ctx_emb = context_emb
                 # Add context integration
-                x = self.ctx_integration(x, ctx_emb)
+                if self.ctx_integration is not None:
+                    x = self.ctx_integration(x, ctx_emb)
                 # Do final encoder forward pass
                 q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
             else:
@@ -1218,13 +1222,21 @@ class Encoder(nn.Module):
                 q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
         else:
             q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
-
+        
+        # Debug
+        self.c = self.c + 1
         # Latent heads
         q_m = self.mean_encoder(q)
         q_v = self.var_activation(self.var_encoder(q)) + self.var_eps
-        dist = Normal(q_m, q_v.sqrt())
-        latent = self.z_transformation(dist.rsample())
-        return (dist, latent) if self.return_dist else (q_m, q_v, latent)
+        qz = Normal(q_m, q_v.sqrt())
+        z = self.z_transformation(qz.rsample())
+        return {
+            MODULE_KEYS.QZ_KEY: qz,
+            MODULE_KEYS.QZM_KEY: q_m,
+            MODULE_KEYS.QZV_KEY: q_v,
+            MODULE_KEYS.Z_KEY: z,
+            MODULE_KEYS.CTX_LOGITS_KEY: ctx_logits,
+        }
 
 
 # Decoder
@@ -1318,27 +1330,10 @@ class DecoderSCVI(nn.Module):
         return px_scale, px_r, px_rate, px_dropout
 
 
-class CrossClassAttention(nn.Module):
-    def __init__(self, n_latent: int, cls_emb_dim: int, dim_shared: int):
-        super().__init__()
-        self.query = nn.Linear(n_latent, dim_shared)
-        self.key   = nn.Linear(cls_emb_dim, dim_shared)
-        self.value = nn.Linear(cls_emb_dim, dim_shared)
-        self.scale = dim_shared ** 0.5
-
-    def forward(self, z, cls_emb):
-        # z: [B, d_latent], cls_emb: [C, d_class]
-        Q = self.query(z).unsqueeze(1)           # [B, 1, d]
-        K = self.key(cls_emb).unsqueeze(0)       # [1, C, d]
-        V = self.value(cls_emb).unsqueeze(0)     # [1, C, d]
-        attn = torch.softmax(Q @ K.transpose(-2, -1) / self.scale, dim=-1)
-        z_aligned = (attn @ V).squeeze(1)        # [B, d]
-        return z_aligned, attn.squeeze(1)        # also gives attention weights
-
-
 class EmbeddingAligner(nn.Module):
-    """Classifier where latent attends to class embeddings, optionally externally provided,
-    using dot product or cosine similarity. Compatible with external CE loss logic.
+    """
+    Classifier where latent attends to external class embeddings using dot product or cosine similarity. 
+    Returns classifier style logits to be used for clip or kl loss.
     """
 
     def __init__(
@@ -1359,7 +1354,7 @@ class EmbeddingAligner(nn.Module):
         temperature: float = 0.1,
         use_learnable_temperature: bool = True,
         mode: Literal["latent_to_class", "class_to_latent", "shared"] = "latent_to_class",
-        use_cross_attention: bool = False,
+        use_cross_attention: bool = True,
         n_heads: int = 4,
         **kwargs,
     ):
@@ -1427,12 +1422,6 @@ class EmbeddingAligner(nn.Module):
         # ---- Dropout ---- #
         self.dropout = nn.Dropout(p=dropout_rate)
 
-        # ---- Cross attention (optional) --- #
-        if self.use_cross_attention:
-            self.cross_attn = nn.MultiheadAttention(
-                embed_dim=self.n_output, num_heads=n_heads, batch_first=True
-            )
-
     @property
     def temperature(self) -> torch.Tensor:
         if self.use_learnable_temperature:
@@ -1466,16 +1455,23 @@ class EmbeddingAligner(nn.Module):
 
         # ---- OPTION 1: Cross-Attention path ---- #
         if self.use_cross_attention:
+            B, D = z_norm.shape
             # Reshape for MultiheadAttention: [B, 1, D] attends to [1, C, D]
-            q = z_norm.unsqueeze(1)     # queries = latents
-            k = c_norm.unsqueeze(0)     # keys = class embeddings
-            v = c.unsqueeze(0)
-            z_attn, attn_weights = self.cross_attn(q, k, v)  # [B,1,D], [B,1,C]
+            q = z.unsqueeze(1) / self.temperature         # queries = latents
+            # [B, C, D]
+            k = c_norm.unsqueeze(0).repeat(B, 1, 1)       # keys = class embeddings
+            v = c.unsqueeze(0).repeat(B, 1, 1)
+            # Apply attention
+            scores = (q @ k.transpose(1, 2)) / math.sqrt(D)
+            attn_weights = torch.softmax(scores, dim=-1)
+            z_attn = attn_weights @ v
+            # Apply cross attention
+            #z_attn, attn_weights = self.cross_attn(q, k, v)  # [B,1,D], [B,1,C]
             z_proj = z_attn.squeeze(1)
             logits = attn_weights.squeeze(1)  # attention weights as logits (before softmax)
-            logits = logits / self.temperature
+            #logits = logits / self.temperature      # apply temperature scaling
 
-        # ---- OPTION 2: Standard CLIP-style similarity ---- #
+        # ---- OPTION 2: Standard cosine similarity ---- #
         else:
             logits = torch.matmul(z_norm, c_norm.T).clamp(-1, 1)
             logits = logits / self.temperature

@@ -98,7 +98,7 @@ class JEDVI(
         self.ctrl_class = ctrl_class
         # Set number of classes
         self.n_labels = self.summary_stats.n_labels
-        self.n_batches = self.summary_stats.n_batches
+        self.n_batches = self.summary_stats.n_batch
         # Whether to use the full class embedding
         self.use_full_cls_emb = use_full_cls_emb
         # Create placeholder for log directory
@@ -890,7 +890,7 @@ class JEDVI(
         # Update model summary to include if it's trained on fixed or full class embedding
         self.use_full_cls_emb = bool(plan_kwargs.get('use_full_cls_emb'))
         if not self.was_pretrained:
-            self._model_summary_string += f", use_full_cls_emb: {self.use_full_cls_emb}"
+            self._model_summary_string += f"use_full_cls_emb: {self.use_full_cls_emb}"
         self.__repr__()
         # Save runner in model
         self.last_runner = runner
@@ -1416,6 +1416,13 @@ class JEDVI(
                 top_n=top_n,
                 mean_split='test'
             )
+            # Plot test heatmap
+            hm_o = os.path.join(plt_dir, f'confusion_matrix.png')
+            pl.plot_confusion(
+                y_true=test_ad.obs[cls_label].values.astype(str),
+                y_pred=predictions, 
+                plt_file=hm_o
+            )
             # Plot merged latent space for different labels
             hues = [REGISTRY_KEYS.SPLIT_KEY, self.original_batch_key, self.original_label_key]
             pl.plot_umaps(
@@ -1478,7 +1485,7 @@ class JEDVI(
         labels_key: str | None = None,
         batch_key: str | None = None,
         class_emb_uns_key: str | None = 'cls_embedding',
-        context_emb_uns_key: str | None = 'ctx_embedding',
+        context_emb_uns_key: str | None = None,
         gene_emb_varm_key: str | None = None,
         size_factor_key: str | None = None,
         class_certainty_key: str | None = None,

@@ -65,6 +65,7 @@ class JEDVAE(VAE):
         cls_weights: torch.Tensor | None = None,
         dispersion: Literal['gene', 'gene-batch', 'gene-label', 'gene-cell'] = 'gene',
         log_variational: bool = True,
+        use_cpm: bool = False,
         gene_likelihood: Literal['zinb', 'nb', 'poisson', 'normal'] = 'zinb',
         latent_distribution: Literal['normal', 'ln'] = 'normal',
         encode_covariates: bool = False,
@@ -133,6 +134,9 @@ class JEDVAE(VAE):
         self.l1_lambda = l1_lambda
         self.l2_lambda = l2_lambda
         self.l_mask = l_mask
+
+        # Setup batch transformation params
+        self.use_cpm = use_cpm
         
         if dropout_rate_decoder is not None:
             log.warning('Dropout rate for decoder currently unavailable. Will fall back to 0.')
@@ -207,7 +211,7 @@ class JEDVAE(VAE):
         cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
         self.use_ext_emb = False
         # Add external context embedding
-        if ctx_emb is not None:
+        if ctx_emb is not None and encode_covariates:
             self.use_context_emb = True
             self.use_ext_emb = True
             n_batch = ctx_emb.shape[0]                  # Register number of contexts in embedding
@@ -472,6 +476,10 @@ class JEDVAE(VAE):
         x_ = x
         if self.use_observed_lib_size:
             library = torch.log(x.sum(1)).unsqueeze(1)
+        # Apply CMP normalization to x
+        if self.use_cpm:
+            x_ = x_ / library * 1e6
+        # Apply log1p transformation to input batch
         if self.log_variational:
             x_ = torch.log1p(x_)
         # TODO: add min-max scaling
@@ -496,8 +504,10 @@ class JEDVAE(VAE):
             context_emb = None
 
         # Perform forward pass through encoder
-        qz, z = self.z_encoder(encoder_input, *categorical_input, g=g, context_emb=context_emb)
-
+        inference_out = self.z_encoder(encoder_input, *categorical_input, g=g, context_emb=context_emb)
+        # Unpack encoder output
+        qz = inference_out[MODULE_KEYS.QZ_KEY]
+        z = inference_out[MODULE_KEYS.Z_KEY]
         ql = None
         if not self.use_observed_lib_size:
             if self.batch_representation == 'embedding':
@@ -517,13 +527,17 @@ class JEDVAE(VAE):
                 )
             else:
                 library = ql.sample((n_samples,))
-
-        return {
+        # Construct output object
+        final_out = {
             MODULE_KEYS.Z_KEY: z,
             MODULE_KEYS.QZ_KEY: qz,
             MODULE_KEYS.QL_KEY: ql,
             MODULE_KEYS.LIBRARY_KEY: library,
         }
+        # Update initial inference outputs
+        inference_out.update(final_out)
+        # Return inference outputs
+        return inference_out
     
     @auto_move_data
     def generative(
@@ -1319,6 +1333,11 @@ class JEDVAE(VAE):
         else:
             raise ValueError(f'Invalid reduction: {reduction}')
         
+    def _context_classification_loss(self, ctx_logits: torch.Tensor, batch_indices: torch.Tensor, reduction: str = 'mean') -> torch.Tensor:
+        """Calculate context label classification loss."""
+        reduction = 'none' if reduction is None else reduction
+        return F.cross_entropy(ctx_logits, batch_indices.squeeze(-1), reduction=reduction)
+        
     def loss(
         self,
         tensors: dict[str, torch.Tensor],
@@ -1329,6 +1348,7 @@ class JEDVAE(VAE):
         contrastive_loss_weight: float | None = None,
         classification_ratio: float | None = None,
         alignment_loss_weight: float | None = None,
+        context_classification_weight: float | None = None,
         target_scale: float = 4.0,
         adversarial_context_lambda: float = 0.1,
         use_posterior_mean: bool = True,
@@ -1412,6 +1432,7 @@ class JEDVAE(VAE):
         kl_locals = {MODULE_KEYS.KL_Z_KEY: kl_divergence_z}
         # Batch normalize elbo loss of reconstruction + kl --> batchmean reduction
         total_loss = torch.mean(weighted_reconst_loss + weighted_kl_local)
+
         # Collect inital loss and extra parameters
         lo_kwargs = {
             'reconstruction_loss': reconst_loss,
@@ -1421,6 +1442,13 @@ class JEDVAE(VAE):
         }
         # Create extra metric container
         extra_metrics = {MODULE_KEYS.KL_Z_PER_LATENT_KEY: kl_div_per_latent}
+
+        # Calculate context classification loss (if available)
+        ctx_logits = inference_outputs.get(MODULE_KEYS.CTX_LOGITS_KEY)
+        if context_classification_weight is not None and context_classification_weight > 0 and ctx_logits is not None:
+            ctx_cls_loss = self._context_classification_loss(ctx_logits, b, reduction=self.non_elbo_reduction)
+            total_loss = total_loss + ctx_cls_loss * context_classification_weight
+            extra_metrics[LOSS_KEYS.CTX_CLS_LOSS] = ctx_cls_loss
 
         # Add supervised contrastive loss on z if it is specified
         if contrastive_loss_weight is not None and contrastive_loss_weight > 0:

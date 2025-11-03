@@ -125,14 +125,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             **loss_kwargs,
         )
         # Save annealing schedules and default params
-        self.anneal_schedules = anneal_schedules
+        self.anneal_schedules = {'kl_weight': {'min_weight': 0.0, 'max_weight': 1.0}}
+        self.anneal_schedules.update(anneal_schedules)
         self.n_epochs_warmup = n_epochs_warmup
         self.n_steps_warmup = n_steps_warmup
         self.multistage_kl_frac = multistage_kl_frac
         self.multistage_kl_min = multistage_kl_min
         self.kl_reset_epochs = self._get_stall_epochs()
         self.reset_kl_at = np.array(sorted(self.kl_reset_epochs.values()))
-        self.kl_kwargs = self.anneal_schedules.get('kl_weight', {'min_weight': 0.0, 'max_weight': 1.0})
+        self.kl_kwargs = self.anneal_schedules.get('kl_weight')
         self.use_local_stage_warmup = use_local_stage_warmup
         # CLS params
         self.n_classes = n_classes
@@ -431,6 +432,19 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
     
+    @property
+    def context_classification_weight(self):
+        """Weight for context classification. Consider Jax"""
+        # Init basic args
+        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
+        # Add scheduling params if given
+        kwargs = self.anneal_schedules.get('context_classification_weight', {})
+        sched_kwargs.update(kwargs)
+        klw = self._compute_weight(**sched_kwargs)
+        return (
+            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
+        )
+    
     def _plot_context_embedding_heatmap(self) -> None:
         """Plot context embedding"""
         if self.module.use_context_emb:
@@ -660,6 +674,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.loss_kwargs.update({"use_posterior_mean": self.use_posterior_mean == mode or self.use_posterior_mean == "both"})
         self.loss_kwargs.update({"class_kl_temperature": self.class_kl_temperature})
         self.loss_kwargs.update({"adversarial_context_lambda": self.adversarial_context_lambda})
+        self.loss_kwargs.update({"context_classification_weight": self.context_classification_weight})
+        
         # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
@@ -686,48 +702,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
             prog_bar=True,
         )
-        self.log(
-            "rl_weight",
-            self.loss_kwargs['rl_weight'],
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=False,
-        )
-        self.log(
-            "kl_weight",
-            self.loss_kwargs['kl_weight'],
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=False,
-        )
-        self.log(
-            "classification_ratio",
-            self.loss_kwargs['classification_ratio'],
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=False,
-        )
-        self.log(
-            "class_kl_temperature",
-            self.loss_kwargs['class_kl_temperature'],
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=False,
-        )
-        self.log(
-            "constrastive_loss_weight",
-            self.loss_kwargs['contrastive_loss_weight'],
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=False,
-        )
-        self.log(
-            "alignment_loss_weight",
-            self.loss_kwargs['alignment_loss_weight'],
-            on_epoch=True,
-            batch_size=loss_output.n_obs_minibatch,
-            prog_bar=False,
-        )
+        # Log all schedule weights
+        for name in self.anneal_schedules.keys():
+            value = getattr(self, name)
+            self.log(
+                name,
+                value,
+                on_epoch=True,
+                batch_size=loss_output.n_obs_minibatch,
+                prog_bar=False,
+            )
         # Log learnable temperatures if given
         self._log_temperatures()
         # Log other metrics

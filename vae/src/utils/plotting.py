@@ -45,8 +45,8 @@ def calc_umap(adata: ad.AnnData, rep: str = 'X_pca', slot_key: str | None = None
     # Cache umap generation
     if slot_key in adata.obsm and not force:
         return
-    # Setup umap instance
-    _umap = umap.UMAP(n_components=2)
+    # Setup umap instance, with sc.tl.umap defaults
+    _umap = umap.UMAP(n_components=2, min_dist=0.5, random_state=0)
     # Set embeddings to use
     if rep not in adata.obsm:
         raise ValueError(f'Could not find {rep} slot in adata.obsm.')
