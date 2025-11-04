@@ -24,7 +24,7 @@ class _NestedConfKeys(NamedTuple):
     ENCODER_KEY: str = 'extra_encoder_kwargs'
     DECODER_KEY: str = 'extra_decoder_kwargs'
     CLS_KEY: str = 'classifier_parameters'
-    ALIGN_KEY : str = 'aligner_parameters'
+    ALIGN_KEY : str = 'extra_aligner_kwargs'
 
 CONF_KEYS = _ConfKeys()
 NESTED_CONF_KEYS = _NestedConfKeys()

@@ -250,8 +250,8 @@ def compute_top_n_predictions(
 
 def collect_runs(base_dir: str):
     runs = []
-    for root, dirs, files in os.walk(base_dir):
-        summary_ps = glob.glob(f'{root}/**/JEDVI_eval_summary.csv', recursive=True)
+    for root, _, files in os.walk(base_dir):
+        summary_ps = glob.glob(f'{root}/**/*_eval_summary.csv', recursive=True)
         if "config.yaml" in files and len(summary_ps) > 0:
             cfg_path = os.path.join(root, "config.yaml")
             summ_path = summary_ps[0]

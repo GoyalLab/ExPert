@@ -14,6 +14,7 @@ from src.utils.constants import PREDICTION_KEYS
 from src.utils.io import read_config
 from src.tune._statics import CONF_KEYS
 from src.models._jedvi import JEDVI
+from src.models._expert import ExPert
 
 import logging
 log = logging.getLogger(__name__)
@@ -47,8 +48,8 @@ def _train(
         batch_key: str = 'dataset',
         verbose: bool = False,
         **train_kwargs
-    ) -> JEDVI:
-    """Train wrapper for JEDVI.train()"""
+    ) -> ExPert:
+    """Train wrapper for ExPert.train()"""
     log.info(f'Reading training data from: {adata_p}')
     model_set = sc.read(adata_p)
     # Check if dataset is compatible
@@ -62,11 +63,11 @@ def _train(
     # Setup anndata with model
     setup_kwargs = {'batch_key': batch_key, 'labels_key': cls_label}
     setup_kwargs.update(config.get(CONF_KEYS.MODEL_SETUP, {}))
-    JEDVI.setup_anndata(
+    ExPert.setup_anndata(
         model_set,
         **setup_kwargs
     )
-    model = JEDVI(model_set, **config[CONF_KEYS.MODEL].copy())
+    model = ExPert(model_set, **config[CONF_KEYS.MODEL].copy())
     if verbose:
         print(model.module)
     # Set training logger
@@ -78,12 +79,12 @@ def _train(
 
 def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.Module | pd.DataFrame | ad.AnnData | str]:
     """Train wrapper for use with config file."""
-    # Load run config
-    config = read_config(config_p)
+    # Load run config TODO: add model schema to check for invalid arguments
+    config = read_config(config_p, do_setup=False, check_schema=False)
     # Init run output dir
     step_model_dir = get_ouptut_dir(config_p, output_base_dir=out_dir)
     # Train the model
-    model: JEDVI = _train(
+    model: ExPert = _train(
         adata_p=adata_p, 
         step_model_dir=step_model_dir, 
         config=config,
@@ -96,7 +97,7 @@ def full_run(
         train_p: str,
         model_dir: str,
         test_p: str,
-        test_unseen: bool = False,
+        test_unseen: bool = True,
         load_checkpoint: bool = True,
         cls_label: str = 'cls_label',
         batch_label: str = 'dataset',
@@ -116,7 +117,7 @@ def full_run(
     output_dir = model.model_log_dir
     # Try to load best checkpoint, otherwise stick to final model
     if load_checkpoint:
-        model = JEDVI.load_checkpoint(
+        model = ExPert.load_checkpoint(
             output_dir,
             adata=model.adata
         )

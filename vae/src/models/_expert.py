@@ -2,12 +2,11 @@ import os
 from src.utils.constants import REGISTRY_KEYS, EXT_CLS_EMB_INIT, PREDICTION_KEYS, MODULE_KEYS
 import src.utils.io as io
 import src.utils.performance as pf
-from src.utils.preprocess import scale_1d_array
 from src.utils._callbacks import DelayedEarlyStopping
 import src.utils.plotting as pl
-from src.modules._jedvae import JEDVAE
+from src.modules._xpert import XPert
 from src.modules._splitter import ContrastiveDataSplitter
-from src._train.plan import ContrastiveSupervisedTrainingPlan
+from src._train.expert_plans import ContrastiveSupervisedTrainingPlan
 from src.data._manager import EmbAnnDataManager
 
 from copy import deepcopy
@@ -20,7 +19,6 @@ import numpy as np
 import scipy.sparse as sp
 import anndata as ad
 import numpy.typing as npt
-from sklearn.utils.class_weight import compute_class_weight
 
 
 from collections.abc import Sequence
@@ -57,22 +55,21 @@ import logging
 log = logging.getLogger(__name__)
 
 
-class JEDVI(
+class ExPert(
         RNASeqMixin, 
         VAEMixin,
         ArchesMixin, 
         UnsupervisedTrainingMixin,
         BaseMinifiedModeModelClass
     ):
-    _module_cls = JEDVAE
+    _module_cls = XPert
     _name = __qualname__
     _training_plan_cls = ContrastiveSupervisedTrainingPlan
     _LATENT_QZM_KEY = f"{__qualname__}_latent_qzm"
     _LATENT_QZV_KEY = f"{__qualname__}_latent_qzv"
-    _LATENT_ZC_KEY = f"{__qualname__}_latent_zc"
-    _LATENT_CW_KEY = f"{__qualname__}_latent_cw"
-    _LATENT_Z2C_KEY = f"{__qualname__}_latent_z2c"
-    _LATENT_C2Z_KEY = f"{__qualname__}_latent_c2z"
+    _LATENT_Z_SHARED_KEY = f"{__qualname__}_latent_z_shared"
+    _LATENT_CTX_PROJ_KEY = f"{__qualname__}_latent_ctx_proj"
+    _LATENT_CLS_PROJ_KEY = f"{__qualname__}_latent_cls_proj"
     _LATENT_UMAP = f"{__qualname__}_latent_umap"
 
 
@@ -82,27 +79,23 @@ class JEDVI(
         n_hidden: int = 256,
         n_latent: int = 20,
         n_layers: int = 2,
+        n_shared: int = 128,
         dropout_rate: float = 0.2,
-        dropout_rate_decoder: float | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
-        ctrl_class: str | None = None,
-        linear_classifier: bool = False,
-        cls_weight_method: str | None = None,
         use_full_cls_emb: bool = False,
         **model_kwargs,
     ):
         super().__init__(adata)
         self._model_kwargs = dict(model_kwargs)
         self.use_gene_emb = self.adata_manager.registry.get('field_registries', {}).get(REGISTRY_KEYS.GENE_EMB_KEY, None) is not None
-        self.ctrl_class = ctrl_class
         # Set number of classes
         self.n_labels = self.summary_stats.n_labels
-        self.n_batches = self.summary_stats.n_batch
         # Whether to use the full class embedding
         self.use_full_cls_emb = use_full_cls_emb
         # Create placeholder for log directory
         self.model_log_dir = None
+        self.ctrl_class = None
 
         # Initialize indices and labels for this VAE
         self._setup()
@@ -112,8 +105,6 @@ class JEDVI(
             if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
             else None
         )
-        # Add classification weights based on support in data set
-        cls_weights = self._get_cls_weights(cls_weight_method)
         # Determine number of batches/datasets and fix library method
         n_batch = self.summary_stats.n_batch
         # Check number of hidden neurons, set to input features if < 0 else use given number
@@ -128,19 +119,15 @@ class JEDVI(
             n_latent=n_latent,
             n_hidden=n_hidden,
             n_layers=n_layers,
+            n_shared=n_shared,
             cls_emb=cls_emb,
             cls_sim=cls_sim,
             ctx_emb=self.ctx_emb,
-            dropout_rate_encoder=dropout_rate,
-            dropout_rate_decoder=dropout_rate_decoder,
-            ext_class_embed_dim=self.ext_class_embed_dim,
-            ctrl_class_idx=self.ctrl_class_idx,
+            dropout_rate=dropout_rate,
             n_continuous_cov=self.summary_stats.get('n_extra_continuous_covs', 0),
             n_cats_per_cov=n_cats_per_cov,
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
-            linear_classifier=linear_classifier,
-            cls_weights=cls_weights,
             **self._model_kwargs,
         )
         # Fresh initialization, set params accordingly
@@ -148,34 +135,17 @@ class JEDVI(
         self.init_params_ = self._get_init_params(locals())
         self.was_pretrained = False
         self.is_evaluated = False
-        self.use_ctrl_emb = False
         # Give model summary
         self.n_unseen_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_unseen_labels'] if REGISTRY_KEYS.CLS_EMB_INIT in adata.uns else None
         self._model_summary_string = (
             f"{self.__class__} Model with the following params: \n"
             f"n_classes: {self.n_labels}, "
             f"n_unseen_classes: {self.n_unseen_labels}, \n"
-            f"n_contexts: {self.n_batches}, "
+            f"n_contexts: {n_batch}, "
             f"n_unseen_contexts: {self.n_unobs_ctx}, \n" if self.n_unobs_ctx > 0 else "\n"
             f"use_gene_emb: {self.use_gene_emb}"
         )
-        # Include control class information
-        if self.ctrl_class is not None and self.ctrl_class_idx is not None:
-            self._model_summary_string += f"\nctrl_class: {self.ctrl_class}"
-            self._model_summary_string += f"\nuse_learnable_control_emb: {self.module.use_learnable_control_emb}"
-
-    def _get_cls_weights(
-        self,
-        method: str | None = 'balanced'
-    ) -> torch.Tensor | None:
-        if method is None:
-            return None
-        else:
-            labels_key = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY).original_key
-            labels = self.adata.obs[labels_key].values
-            class_weights = compute_class_weight(method, classes=self._label_mapping, y=labels)
-            return torch.tensor(class_weights, dtype=torch.float32)
-
+        
     def _setup(self):
         """Setup adata for training. Prepare embeddings"""
         # Initialize both embeddings as None
@@ -206,27 +176,30 @@ class JEDVI(
         ctx_emb_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CTX_EMB_KEY, {})
         self.ctx_emb = None
         self.n_unobs_ctx = 0
-        if len(ctx_emb_registry) > 0:
-            # Get registry keys for context embedding in adata
-            ext_ctx_emb_key = ctx_emb_registry.get('original_key')
-            ctx_emb_key = ctx_emb_registry['data_registry'].get('attr_key') if ext_ctx_emb_key is None else ext_ctx_emb_key
-            # Get the embedding from adata and check if it's a dataframe
-            if not isinstance(self.adata.uns[ctx_emb_key], pd.DataFrame):
-                log.warning(f'Context embedding has to be a dataframe with contexs as index, got {ctx_emb.__class__}. Falling back to internal embedding.')
-            else:
-                # Extract context embedding from adata
-                ctx_emb: pd.DataFrame = self.adata.uns[ctx_emb_key]
-                # Get observed and unobserved context labels
-                _obs_contexts_mask = self.idx_to_batch.isin(ctx_emb.index)
-                if _obs_contexts_mask.sum() != self.idx_to_batch.shape[0]:
-                    raise ValueError(f'Missing contexts in external context embedding. {self.idx_to_batch[~_obs_contexts_mask].values}')
-                _obs_ctx_labels = self.idx_to_batch[_obs_contexts_mask]
-                _unobs_ctx_labels = ctx_emb.index.difference(_obs_ctx_labels)
-                self.n_unobs_ctx = _unobs_ctx_labels.shape[0]
-                # Order embedding by observed contexts and unobserved after and update class variable
-                ctx_emb = pd.concat([ctx_emb.loc[_obs_ctx_labels], ctx_emb.loc[_unobs_ctx_labels]], axis=0)
-                # Convert to tensor
-                self.ctx_emb = io.to_tensor(ctx_emb)
+        if len(ctx_emb_registry) == 0:
+            raise ValueError('ExPert requires context embeddings to be registered.')
+        # Get registry keys for context embedding in adata
+        ext_ctx_emb_key = ctx_emb_registry.get('original_key')
+        ctx_emb_key = ctx_emb_registry['data_registry'].get('attr_key') if ext_ctx_emb_key is None else ext_ctx_emb_key
+        # Get the embedding from adata and check if it's a dataframe
+        if not isinstance(self.adata.uns[ctx_emb_key], pd.DataFrame):
+            raise ValueError(f'Context embedding has to be a dataframe with contexs as index, got {ctx_emb.__class__}.')
+
+        # Extract context embedding from adata
+        ctx_emb: pd.DataFrame = self.adata.uns[ctx_emb_key]
+        # Get observed and unobserved context labels
+        _obs_contexts_mask = self.idx_to_batch.isin(ctx_emb.index)
+        if _obs_contexts_mask.sum() != self.idx_to_batch.shape[0]:
+            raise ValueError(f'Missing contexts in external context embedding. {self.idx_to_batch[~_obs_contexts_mask].values}')
+        _obs_ctx_labels = self.idx_to_batch[_obs_contexts_mask]
+        _unobs_ctx_labels = ctx_emb.index.difference(_obs_ctx_labels)
+        self.n_unobs_ctx = _unobs_ctx_labels.shape[0]
+        # Order embedding by observed contexts and unobserved after and update class variable
+        ctx_emb = pd.concat([ctx_emb.loc[_obs_ctx_labels], ctx_emb.loc[_unobs_ctx_labels]], axis=0)
+        # Set context labels appropriately
+        self.idx_to_batch = ctx_emb.index.values
+        # Convert to tensor
+        self.ctx_emb = io.to_tensor(ctx_emb)
             
         # Assign class embedding
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
@@ -236,106 +209,66 @@ class JEDVI(
         self._code_to_label = dict(enumerate(self._label_mapping))
         # Check if adata has an external class embedding registered
         cls_emb_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CLS_EMB_KEY, {})
-        if len(cls_emb_registry) > 0:
-            # Get adata.uns key for embedding, fall back to attribute key if no original key is given
-            ext_cls_emb_key = cls_emb_registry.get('original_key')
-            cls_emb_key = cls_emb_registry['data_registry'].get('attr_key') if ext_cls_emb_key is None else ext_cls_emb_key
-            # Check if adata has already been registered with this model class
-            if REGISTRY_KEYS.CLS_EMB_INIT in self.adata.uns and self._name == self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.MODEL_KEY]:
-                log.info(f'Adata has already been initialized with {self.__class__}, loading model settings from adata.')
-                # Set to embeddings found in adata
-                self.cls_emb = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
-                self.cls_sim = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
-                # Init train embeddings from adata
-                self.n_train_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY]
-                self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
-                self.train_cls_sim = self.cls_sim[:self.n_train_labels,:self.n_train_labels]
-                # Set indices
-                self.idx_to_label = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.LABELS_KEY])
-                # Set control class index
-                self.ctrl_class = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.CTRL_CLASS_KEY]
-                self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY]
-            else:
-                # Register adata's class embedding with this model
-                cls_emb: pd.DataFrame = self.adata.uns[cls_emb_key]
-                if not isinstance(cls_emb, pd.DataFrame):
-                    log.warning(f'Class embedding has to be a dataframe with labels as index, got {cls_emb.__class__}. Falling back to internal embedding.')
-                else:
-                    # Order external embedding to match label mapping and convert to csr matrix
-                    _label_series = pd.Series(self._code_to_label.values())
-                    _label_overlap = _label_series.isin(cls_emb.index)
-                    _shared_labels = _label_series[_label_overlap].values
-                    _unseen_labels = cls_emb.index.difference(_shared_labels)
-                    # Remove control embedding if given
-                    ctrl_class_idx_matches = np.where(_label_series==self.ctrl_class)[0]
-                    ctrl_exists_in_data = len(ctrl_class_idx_matches) > 0
-                    if not ctrl_exists_in_data:
-                        log.warning(f'Specified control label {self.ctrl_class} is not in adata class labels, ignoring parameter.')
-                    if self.ctrl_class is not None and ctrl_exists_in_data:
-                        # Find control index
-                        self.ctrl_class_idx = ctrl_class_idx_matches[0]
-                        # Create empty embedding for control
-                        if self.ctrl_class not in _shared_labels:
-                            log.info(f'Adding empty control external class embedding, will be learned by model.')
-                            # Create empty embedding at last slot
-                            dummy_emb = pd.DataFrame(np.zeros((1, cls_emb.shape[-1])), index=[self.ctrl_class], columns=cls_emb.columns)
-                            # Add dummy embedding as 
-                            _shared_cls_emb = cls_emb.loc[_shared_labels]
-                            _unseen_cls_emb = cls_emb.loc[_unseen_labels]
-                            cls_emb = pd.concat((_shared_cls_emb, dummy_emb, _unseen_cls_emb), axis=0)
-                            # Set control index to first embedding index
-                            _shared_labels = np.concatenate((
-                                np.array(_shared_labels), np.array([self.ctrl_class])
-                            ))
-                        else:
-                            log.info(f'Overwriting existing external control class embedding, will be learned by model.')
-                        # Reset label overlap
-                        _label_overlap = _label_series.isin(_shared_labels)
-                    else:
-                        # Set no label as control class
-                        self.ctrl_class_idx = None
-                    self.n_train_labels = _shared_labels.shape[0]
-                    self.n_unseen_labels = _unseen_labels.shape[0]
-                    n_missing = _label_overlap.shape[0] - _label_overlap.sum()
-                    if n_missing > 0:
-                        raise ValueError(f'Found {n_missing} missing labels in external class embedding: {_label_series[~_label_overlap]}')
-                    # Re-order embedding: first training labels then rest
-                    cls_emb = pd.concat([cls_emb.loc[_shared_labels], cls_emb.loc[_unseen_labels]], axis=0)
-                    # Include class similarity as pre-calculated matrix
-                    log.info(f'Calculating external class similarities')
-                    # Set gene embedding as class parameter
-                    self.cls_emb = torch.tensor(cls_emb.values, dtype=torch.float32)
-                    # Normalize embedding before calculating similarities
-                    self.cls_emb = F.normalize(self.cls_emb, p=2, dim=-1)
-                    # Set class similarities as class parameter
-                    self.cls_sim = self.cls_emb @ self.cls_emb.T
-                    # Save in adata for caching
-                    self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = self.cls_emb
-                    self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = self.cls_sim
-                    # Save train embeddings and similarities as class parameters
-                    self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
-                    self.train_cls_sim = self.train_cls_emb @ self.train_cls_emb.T
-                    # Get full list of perturbations for embedding
-                    self.idx_to_label = cls_emb.index.values
-                    # Save registration with this model
-                    self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT] = {
-                        EXT_CLS_EMB_INIT.MODEL_KEY: self._name,
-                        EXT_CLS_EMB_INIT.LABELS_KEY: self.idx_to_label,
-                        EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY: self.n_train_labels, 
-                        EXT_CLS_EMB_INIT.N_UNSEEN_LABELS_KEY: self.n_unseen_labels,
-                        EXT_CLS_EMB_INIT.CTRL_CLASS_KEY: self.ctrl_class,
-                        EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY: self.ctrl_class_idx,
-                    }
-            # Set embedding dimension
-            self.ext_class_embed_dim = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
-            # Use class embedding classifier
-            self.has_ext_emb = True
+        if len(cls_emb_registry) == 0:
+            raise ValueError('ExPert requires class embeddings to be registered.')
+        # Get adata.uns key for embedding, fall back to attribute key if no original key is given
+        ext_cls_emb_key = cls_emb_registry.get('original_key')
+        cls_emb_key = cls_emb_registry['data_registry'].get('attr_key') if ext_cls_emb_key is None else ext_cls_emb_key
+        # Check if adata has already been registered with this model class
+        if REGISTRY_KEYS.CLS_EMB_INIT in self.adata.uns and self._name == self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.MODEL_KEY]:
+            log.info(f'Adata has already been initialized with {self.__class__}, loading model settings from adata.')
+            # Set to embeddings found in adata
+            self.cls_emb = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
+            self.cls_sim = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
+            # Init train embeddings from adata
+            self.n_train_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY]
+            self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
+            self.train_cls_sim = self.cls_sim[:self.n_train_labels,:self.n_train_labels]
+            # Set indices
+            self.idx_to_label = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.LABELS_KEY])
         else:
-            self.idx_to_label = np.array(self._code_to_label.values())
-            self.ext_class_embed_dim = None
-            self.ctrl_class_idx = None
-            # Use base classifier
-            self.has_ext_emb = False
+            # Register adata's class embedding with this model
+            cls_emb: pd.DataFrame = self.adata.uns[cls_emb_key]
+            if not isinstance(cls_emb, pd.DataFrame):
+                raise ValueError(f'Class embedding has to be a dataframe with labels as index, got {cls_emb.__class__}.')
+            # Order external embedding to match label mapping and convert to csr matrix
+            _label_series = pd.Series(self._code_to_label.values())
+            _label_overlap = _label_series.isin(cls_emb.index)
+            _shared_labels = _label_series[_label_overlap].values
+            _unseen_labels = cls_emb.index.difference(_shared_labels)
+            
+            self.n_train_labels = _shared_labels.shape[0]
+            self.n_unseen_labels = _unseen_labels.shape[0]
+            n_missing = _label_overlap.shape[0] - _label_overlap.sum()
+            if n_missing > 0:
+                raise ValueError(f'Found {n_missing} missing labels in external class embedding: {_label_series[~_label_overlap]}')
+            # Re-order embedding: first training labels then rest
+            cls_emb = pd.concat([cls_emb.loc[_shared_labels], cls_emb.loc[_unseen_labels]], axis=0)
+            # Include class similarity as pre-calculated matrix
+            log.info(f'Calculating external class similarities')
+            # Set gene embedding as class parameter
+            self.cls_emb = torch.tensor(cls_emb.values, dtype=torch.float32)
+            # Normalize embedding before calculating similarities
+            cls_emb_norm = F.normalize(self.cls_emb, p=2, dim=-1)
+            # Set class similarities as class parameter
+            self.cls_sim = cls_emb_norm @ cls_emb_norm.T
+            # Save in adata for caching
+            self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = self.cls_emb
+            self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = self.cls_sim
+            # Save train embeddings and similarities as class parameters
+            self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
+            self.train_cls_sim = self.train_cls_emb @ self.train_cls_emb.T
+            # Get full list of perturbations for embedding
+            self.idx_to_label = cls_emb.index.values
+            # Save registration with this model
+            self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT] = {
+                EXT_CLS_EMB_INIT.MODEL_KEY: self._name,
+                EXT_CLS_EMB_INIT.LABELS_KEY: self.idx_to_label,
+                EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY: self.n_train_labels, 
+                EXT_CLS_EMB_INIT.N_UNSEEN_LABELS_KEY: self.n_unseen_labels,
+            }
+        # Set embedding dimension
+        self.ext_class_embed_dim = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
 
     def get_cls_emb(self, use_full_cls_emb: bool | None = None) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Helper getter to return either training or full class embedding"""
@@ -562,14 +495,38 @@ class JEDVI(
             return torch.cat(qz_means).numpy(), torch.cat(qz_vars).numpy()
         else:
             return torch.cat(zs).numpy()
+        
+    def validate_ctx_emb(self, ctx_emb: torch.Tensor):
+        # Extract labels if it's a dataframe
+        if isinstance(ctx_emb, pd.DataFrame):
+            labels = ctx_emb.index.values
+        else:
+            labels = None
+        # Convert to tensor
+        ctx_emb = io.to_tensor(ctx_emb)
+        assert self.module.n_ctx_dim != ctx_emb.shape[-1], f'Dimension mismatch, ctx_emb has to have {self.module.n_ctx_dim} dimensions.'
+        return labels, ctx_emb
+
+    def validate_cls_emb(self, cls_emb: torch.Tensor):
+        # Extract labels if it's a dataframe
+        if isinstance(cls_emb, pd.DataFrame):
+            labels = cls_emb.index.values
+        else:
+            labels = None
+        # Convert to tensor
+        cls_emb = io.to_tensor(cls_emb)
+        assert self.module.n_cls_dim != cls_emb.shape[-1], f'Dimension mismatch, cls_emb has to have {self.module.n_cls_dim} dimensions.'
+        return labels, cls_emb
 
     def predict(
         self,
         adata: AnnData | None = None,
         indices: Sequence[int] | None = None,
         batch_size: int | None = None,
-        use_full_cls_emb: bool | None = None,
         use_posterior_mean: bool = True,
+        ctx_emb: torch.Tensor | None = None,
+        cls_emb: torch.Tensor | None = None,
+        return_latents: bool = True,
         **kwargs
     ) -> dict[str, pd.DataFrame | np.ndarray]:
         """Return cell label predictions.
@@ -603,26 +560,33 @@ class JEDVI(
             indices=indices,
             batch_size=batch_size
         )
-        # Get class embeddings from model
-        if use_full_cls_emb is None or not use_full_cls_emb:
-            cls_emb = self.module.class_embedding(device=self.device)
-        # Fall back to full model embeddings
-        else:
-            cls_emb = self.cls_emb
-
-        if cls_emb is not None:
-            log.info(f'Using class embedding: {cls_emb.shape}')
         
-        # Regular predictions
-        y_pred = []
-        # Arc-specific predictions
-        zs = []
-        Ws = []
-        # Aligned predictions
-        y_aligned_pred = []
-        z2cs = []
-        c2zs = []
-        ls = []
+        # Use new context embedding at inference
+        if ctx_emb is not None:
+            log.info(f'Using new context embedding: {ctx_emb.shape}')
+            ctx_labels, ctx_emb = self.validate_ctx_emb(ctx_emb)
+        # Use model's context labels
+        else:
+            ctx_labels = self.idx_to_batch
+        # Use new class embedding at inference
+        if cls_emb is not None:
+            log.info(f'Using new class embedding: {cls_emb.shape}')
+            cls_labels, cls_emb = self.validate_cls_emb(cls_emb)
+        # Use model's class labels
+        else:
+            cls_labels = self.idx_to_label
+        
+        # Collect batch logits
+        ctx_logits = []
+        cls_logits = []
+        # Collect batch z shared
+        z_shared = []
+        ctx2z = []
+        cls2z = []
+        # Collect batch labels
+        data_ctx_labels = []
+        data_cls_labels = []
+        # Run through each batch of data
         with torch.no_grad():
             for _, tensors in enumerate(scdl):
                 # Unpack batch tensor
@@ -638,12 +602,12 @@ class JEDVI(
                 # TODO: cachce inference if adata is minified
                 if _is_minified(adata):
                     inference_outputs = {
-                        MODULE_KEYS.QZM_KEY: tensors[REGISTRY_KEYS.LATENT_QZM_KEY],
-                        MODULE_KEYS.QZV_KEY: tensors[REGISTRY_KEYS.LATENT_QZV_KEY], 
+                        MODULE_KEYS.QZM_KEY: tensors[self._LATENT_QZM_KEY],
+                        MODULE_KEYS.QZV_KEY: tensors[self._LATENT_QZV_KEY], 
                     }
                 else:
                     inference_outputs = None
-                # Run classification process
+                # Run classification process, i.e. full / cached / partial inference
                 cls_output = self.module.classify(
                     x,
                     batch_index=batch,
@@ -651,86 +615,67 @@ class JEDVI(
                     cat_covs=cat_covs,
                     cont_covs=cont_covs,
                     use_posterior_mean=use_posterior_mean,
-                    labels=l,
-                    inference_outputs=inference_outputs
+                    inference_outputs=inference_outputs,
+                    ctx_emb=ctx_emb,
+                    cls_emb=cls_emb,
                 )
-                # Handle output based on classifier used
-                if self.module.has_classifier_latent():
-                    # Unpack embedding projections
-                    pred, z, W = cls_output
-                    zs.append(z.detach().cpu())
-                    Ws.append(W.detach().cpu())
-                else:
-                    # Set embeddings to z, TODO: set to None or empty tensors?
-                    pred = cls_output        
+                # Unpack context and perturbation classification output
+                _ctx_logits = cls_output[MODULE_KEYS.CTX_LOGITS_KEY]
+                _cls_logits = cls_output[MODULE_KEYS.CLS_LOGITS_KEY]
                 # Add batch predictions to overall predictions
-                y_pred.append(pred.detach().cpu())
-
-                # Get aligned predictions and latent spaces
-                if self.module.has_align_cls:
-                    aligned_logits, z2c, c2z = self.module.align(
-                        x,
-                        batch_index=batch,
-                        g=self.gene_emb,
-                        cat_covs=cat_covs,
-                        cont_covs=cont_covs,
-                        use_posterior_mean=use_posterior_mean,
-                        class_embeds=cls_emb,
-                    )
-                    # Get aligned predictions
-                    y_aligned_pred.append(aligned_logits.detach().cpu())
-                    z2cs.append(z2c.detach().cpu())
-                    c2zs.append(c2z.detach().cpu())
-                # Log labels
-                ls.append(l.detach().cpu())
+                ctx_logits.append(_ctx_logits.detach().cpu())
+                cls_logits.append(_cls_logits.detach().cpu())
+                # Unpack shared latent spaces
+                _z_shared = cls_output[MODULE_KEYS.Z_SHARED_KEY]
+                _ctx2z = cls_output[MODULE_KEYS.CTX_PROJ_KEY]
+                _cls2z = cls_output[MODULE_KEYS.CLS_PROJ_KEY]
+                z_shared.append(_z_shared.detach().cpu())
+                ctx2z.append(_ctx2z.detach().cpu())
+                cls2z.append(_cls2z.detach().cpu())
+                # Collect labels
+                data_ctx_labels.append(batch.detach().cpu())
+                data_cls_labels.append(l.detach().cpu())
         
         # Concatenate batch results
-        ls = torch.cat(ls).numpy()
-        y_pred = torch.cat(y_pred).numpy()
-        # Get actual class labels for predictions
-        n_labels = len(pred[0])
-        soft_predictions = pd.DataFrame(
-            y_pred,
-            columns=self._label_mapping[:n_labels] if self.cls_emb is None else self.idx_to_label[:n_labels],
+        ctx_logits = torch.cat(ctx_logits).numpy()
+        cls_logits = torch.cat(cls_logits).numpy()
+        z_shared = torch.cat(z_shared).numpy()
+        ctx2z = torch.cat(ctx2z).numpy()
+        cls2z = torch.cat(cls2z).numpy()
+        data_ctx_labels = torch.cat(data_ctx_labels).numpy()
+        data_cls_labels = torch.cat(data_cls_labels).numpy()
+        # Get context predictions
+        n_ctx_labels = len(ctx_labels)
+        ctx_soft_predictions = pd.DataFrame(
+            ctx_logits,
+            columns=ctx_labels[:n_ctx_labels],
             index=adata.obs_names[indices],
         )
-        # Take top prediction labels
-        predictions = soft_predictions.columns[np.argmax(soft_predictions, axis=-1)]
-        # Create base result object
-        results = {
-            PREDICTION_KEYS.PREDICTION_KEY: predictions,
-            PREDICTION_KEYS.SOFT_PREDICTION_KEY: soft_predictions,
-            'labels': ls,
+        ctx_predictions = ctx_soft_predictions.columns[np.argmax(ctx_soft_predictions, axis=-1)]
+        # Get actual class labels for predictions
+        n_cls_labels = len(cls_labels)
+        cls_soft_predictions = pd.DataFrame(
+            cls_logits,
+            columns=cls_labels[:n_cls_labels],
+            index=adata.obs_names[indices],
+        )
+        cls_predictions = cls_soft_predictions.columns[np.argmax(cls_soft_predictions, axis=-1)]
+        # Return all model predictions
+        o = {
+            PREDICTION_KEYS.CTX_PREDICTION_KEY: ctx_predictions,
+            PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY: ctx_soft_predictions,
+            PREDICTION_KEYS.PREDICTION_KEY: cls_predictions,
+            PREDICTION_KEYS.SOFT_PREDICTION_KEY: cls_soft_predictions,
+            REGISTRY_KEYS.LABELS_KEY: data_cls_labels,
         }
-        # Check classifier latents
-        if len(zs) > 0 and len(Ws) > 0:
-            # Add classifier latents
-            results.update({
-                PREDICTION_KEYS.ZS_KEY: torch.cat(zs).numpy(),
-                PREDICTION_KEYS.WS_KEY: torch.stack(Ws, dim=0).mean(dim=0).numpy()
+        # Add latent spaces to prediction output
+        if return_latents:
+            o.update({
+                MODULE_KEYS.Z_SHARED_KEY: z_shared,
+                MODULE_KEYS.CTX_PROJ_KEY: ctx2z,
+                MODULE_KEYS.CLS_PROJ_KEY: cls2z,
             })
-            
-        # Check aligned latents
-        if len(y_aligned_pred) > 0 and len(z2cs) > 0 and len(c2zs) > 0:
-            # Add aligned latents
-            y_aligned_pred = torch.cat(y_aligned_pred).numpy()
-            # Get actual class labels for predictions
-            n_algined_labels = len(aligned_logits[0])
-            aligned_soft_predictions = pd.DataFrame(
-                y_pred,
-                columns=self._label_mapping[:n_algined_labels] if self.cls_emb is None else self.idx_to_label[:n_algined_labels],
-                index=adata.obs_names[indices],
-            )
-            # Take top prediction labels
-            aligned_predictions = aligned_soft_predictions.columns[np.argmax(aligned_soft_predictions, axis=-1)]
-            results.update({
-                PREDICTION_KEYS.ALIGN_PREDICTION_KEY: aligned_predictions,
-                PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY: aligned_soft_predictions,
-                PREDICTION_KEYS.ZS_KEY: torch.cat(z2cs).numpy(),
-                PREDICTION_KEYS.WS_KEY: torch.stack(c2zs, dim=0).mean(dim=0).numpy()
-            })
-        # Return predictions
-        return results
+        return o
         
     def get_training_plan(self, **plan_kwargs):
         return self._training_plan_cls(
@@ -743,6 +688,23 @@ class JEDVI(
     @property
     def is_minified(self) -> bool:
         return _get_adata_minify_type(self.adata) is not None
+    
+    @classmethod
+    def config_schema(cls) -> dict[str, Any]:
+        from src.tune._statics import CONF_KEYS, NESTED_CONF_KEYS
+        return {
+            CONF_KEYS.DATA: {},
+            CONF_KEYS.MODEL: {
+                NESTED_CONF_KEYS.ENCODER_KEY,
+                NESTED_CONF_KEYS.DECODER_KEY,
+                NESTED_CONF_KEYS.ALIGN_KEY,
+            },
+            CONF_KEYS.TRAIN: {
+                NESTED_CONF_KEYS.PLAN_KEY: {
+                    NESTED_CONF_KEYS.SCHEDULES_KEY
+                }
+            },
+        }
         
     @devices_dsp.dedent
     def train(
@@ -786,8 +748,6 @@ class JEDVI(
             mcb = data_params.get("max_classes_per_batch", 16)
             batch_size = int(msb * mcb)
             data_params["batch_size"] = batch_size
-        # Add control class index to data params
-        data_params['ctrl_class'] = self.ctrl_class
 
         # Cache indices if model was pre-trained
         if self.was_pretrained and cache_data_splitter:
@@ -1014,7 +974,7 @@ class JEDVI(
             summaries.append(summary)
             reports.append(report)
         summaries = pd.concat(summaries, axis=0)
-        reports = pd.concat(reports, axis=0)
+        reports = pd.concat(reports, axis=0).reset_index(names=['cls_label'])
         self.adata.uns[PREDICTION_KEYS.SUMMARY_KEY] = summaries
         self.adata.uns[PREDICTION_KEYS.REPORT_KEY] = reports
 
@@ -1070,25 +1030,17 @@ class JEDVI(
         # Add split information to self.adata
         self._register_split_labels(force=force)
         # Run classifier forward pass, return soft predictions and latent spaces
-        po = self.predict()
+        po = self.predict(return_latents=True)
+        # Save context predictions
+        self.adata.obs[PREDICTION_KEYS.CTX_PREDICTION_KEY] = po[PREDICTION_KEYS.CTX_PREDICTION_KEY]
+        self.adata.obsm[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY]
         # Save regular classification predictions to model adata
         self.adata.obs[PREDICTION_KEYS.PREDICTION_KEY] = po[PREDICTION_KEYS.PREDICTION_KEY]
         self.adata.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.SOFT_PREDICTION_KEY]          # (cells, classes)
-        # Save aligned predictions and latent spaces to model
-        aligned_pred = po.get(PREDICTION_KEYS.ALIGN_PREDICTION_KEY)
-        if aligned_pred is not None:
-            self.adata.obs[PREDICTION_KEYS.ALIGN_PREDICTION_KEY] = aligned_pred
-        # Add aligned soft prediction
-        aligned_soft_pred = po.get(PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY)
-        if aligned_soft_pred is not None:
-            self.adata.obsm[PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY] = aligned_soft_pred
-        # Save aligned latent spaces
-        z2c = po.get(PREDICTION_KEYS.Z2C_KEY)
-        if z2c is not None:
-            self.adata.obsm[self._LATENT_Z2C_KEY] = z2c     # z to class space projection latent (cells, shared dim)
-        c2z = po.get(PREDICTION_KEYS.C2Z_KEY)
-        if c2z is not None:
-            self.adata.uns[self._LATENT_C2Z_KEY] = c2z      # class embedding space (classes, shared dim)
+        # Register aligned latent spaces with model's adata
+        self.adata.obsm[self._LATENT_Z_SHARED_KEY] = po[MODULE_KEYS.Z_SHARED_KEY]
+        self.adata.uns[self._LATENT_CTX_PROJ_KEY] = po[MODULE_KEYS.CTX_PROJ_KEY]
+        self.adata.uns[self._LATENT_CLS_PROJ_KEY] = po[MODULE_KEYS.CLS_PROJ_KEY]
         # Calculate top N predictions over model data
         self._register_top_n_predictions()
         # Set evaluation as completed
@@ -1337,24 +1289,12 @@ class JEDVI(
             self.minify_query(test_ad)
         # Get model predictions for test data
         use_full = None if not incl_unseen else True
-        prediction_output = self.predict(adata=test_ad, use_full_cls_emb=use_full)
-        # Select aligned output if available
-        if PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY in prediction_output:
-            # Set aligned predictions as final predictions
-            soft_pred_key = PREDICTION_KEYS.ALIGN_SOFT_PREDICTION_KEY
-            pred_key = PREDICTION_KEYS.ALIGN_PREDICTION_KEY
-        # Fall back to standard classification
-        else:
-            if incl_unseen:
-                log.warning(f'Unseen classes are included. Default classification output cannot zero-shot.')
-            soft_pred_key = PREDICTION_KEYS.SOFT_PREDICTION_KEY
-            pred_key = PREDICTION_KEYS.PREDICTION_KEY
-        # Get predictions from model output
-        soft_predictions = prediction_output[soft_pred_key]
-        predictions = prediction_output[pred_key]
+        prediction_output = self.predict(adata=test_ad, use_full_cls_emb=use_full, return_latents=True)
+        # TODO: plot shared latents too
         # Save predictions to test adata
+        predictions = prediction_output[PREDICTION_KEYS.PREDICTION_KEY]
         test_ad.obs[PREDICTION_KEYS.PREDICTION_KEY] = predictions
-        test_ad.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = soft_predictions
+        test_ad.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = prediction_output[PREDICTION_KEYS.SOFT_PREDICTION_KEY]
         # Evaluate test results
         if output_dir is None and getattr(self, 'model_log_dir', None) is None:
             log.warning(f'No output location provided. Please specify an output directory.')
@@ -1412,9 +1352,25 @@ class JEDVI(
             os.makedirs(plt_dir, exist_ok=True)
             # Plot top n metrics
             top_n_o = os.path.join(plt_dir, f'top_n_predictions_split.svg')
+            # Add another split to data if unseen classes are included
+            if incl_unseen:
+                # Copy values of split where actual values are
+                ext_cls_label = 'ext_cls_label'
+                no_random_mask = top_n_predictions.split!='random'
+                zero_shot_mask = ~top_n_predictions['is_training_perturbation']
+                top_n_predictions[ext_cls_label] = top_n_predictions.split.values
+                # Set all mark zero-shot labels as such if they are not random
+                ext_mask = no_random_mask & zero_shot_mask
+                top_n_predictions.loc[ext_mask,ext_cls_label] = top_n_predictions.loc[ext_mask,ext_cls_label].astype(str) + '-zero-shot'
+                # Set label as split hue
+                hue = ext_cls_label
+            else:
+                hue = REGISTRY_KEYS.SPLIT_KEY
+            # Plot top N performance
             pl.plot_top_n_performance(
                 top_n_predictions=top_n_predictions,
                 output_file=top_n_o,
+                hue=hue,
                 top_n=top_n,
                 mean_split='test'
             )
@@ -1484,13 +1440,12 @@ class JEDVI(
     def setup_anndata(
         cls,
         adata: AnnData,
-        labels_key: str | None = None,
         batch_key: str | None = None,
+        labels_key: str | None = None,
+        context_emb_uns_key: str | None = 'ctx_embedding',
         class_emb_uns_key: str | None = 'cls_embedding',
-        context_emb_uns_key: str | None = None,
         gene_emb_varm_key: str | None = None,
         size_factor_key: str | None = None,
-        class_certainty_key: str | None = None,
         cast_to_csr: bool = True,
         raw_counts: bool = True,
         layer: str | None = None,
@@ -1526,12 +1481,6 @@ class JEDVI(
         if gene_emb_varm_key is not None and gene_emb_varm_key in adata.varm:
             log.info(f'Registered gene embedding from adata.varm[{gene_emb_varm_key}].')
             anndata_fields.append(VarmField(REGISTRY_KEYS.GENE_EMB_KEY, gene_emb_varm_key))
-        # Add class score per cell, ensure its scaled [0, 1]
-        if class_certainty_key is not None:
-            log.info(f'Registered class certainty score from adata.obs[{class_certainty_key}].')
-            scaled_class_cert_key = f'{class_certainty_key}_scaled'
-            adata.obs[scaled_class_cert_key] = scale_1d_array(adata.obs[class_certainty_key].astype(float).values)
-            anndata_fields.append(NumericalObsField(REGISTRY_KEYS.CLS_CERT_KEY, scaled_class_cert_key, required=False))
         # Register latent fields of adata is minified
         adata_minify_type = _get_adata_minify_type(adata)
         if adata_minify_type is not None:

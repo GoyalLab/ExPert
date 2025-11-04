@@ -2,7 +2,7 @@
 from src.modules._gpvae import GPVAE
 from src.utils.constants import REGISTRY_KEYS
 from src.utils.constants import MODULE_KEYS
-from src._train.plan import SemiSupervisedTrainingPlan
+from vae.src._train.plan import SemiSupervisedTrainingPlan
 from src.utils.preprocess import _prep_adata
 
 import torch

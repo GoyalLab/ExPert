@@ -47,7 +47,11 @@ class _MODULE_KEYS(NamedTuple):
     # inference (class embedding to latent projection)
     ZE_KEY: str = "ze"
     LIBRARY_G_KEY: str = "library_g"
+    Z_SHARED_KEY: str = "z_shared"
     CTX_LOGITS_KEY: str = "ctx_logits"
+    CLS_LOGITS_KEY: str = "cls_logits"
+    CTX_PROJ_KEY: str = "ctx_proj"
+    CLS_PROJ_KEY: str = "cls_proj"
     # inference (library)
     LIBRARY_KEY: str = "library"
     LABEL_KEY: str = "label"
@@ -110,6 +114,8 @@ class _EXT_CLS_EMB_INIT_NT(NamedTuple):
 class _PREDICTION_KEYS_NT(NamedTuple):
     PREDICTION_KEY: str = "prediction"
     SOFT_PREDICTION_KEY: str = "soft_predictions"
+    CTX_PREDICTION_KEY: str = "ctx_prediction"
+    CTX_SOFT_PREDICTION_KEY: str = "ctx_soft_prediction"
     ZS_KEY: str = "zs"
     WS_KEY: str = "Ws"
     ALIGN_PREDICTION_KEY: str = "aligned_prediction"

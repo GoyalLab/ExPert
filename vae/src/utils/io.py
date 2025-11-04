@@ -48,6 +48,13 @@ def replace_nn_modules(d):
     else:
         return d
     
+def non_zero(x: torch.Tensor | float | int | None) -> bool:
+    if x is None:
+        return False
+    if x > 0:
+        return True
+    return False
+    
 def generate_random_configs(space: dict, n_samples: int | None = None, seed: int | None = None):
     if seed is not None:
         random.seed(seed)
@@ -144,17 +151,19 @@ def setup_config(config: dict) -> None:
     # Add aligner args to model
     config[CONF_KEYS.MODEL][NESTED_CONF_KEYS.ALIGN_KEY] = config[CONF_KEYS.ALIGNER]
 
-def read_config(config_p: str, setup: bool = True) -> dict:
+def read_config(config_p: str, do_setup: bool = True, check_schema: bool = False) -> dict:
     """Read hyperparameter yaml file"""
     log.info(f'Loading config file: {config_p}')
     with open(config_p, 'r') as f:
         config: dict = yaml.safe_load(f)
     # Check for config keys
-    expected_keys = set(CONF_KEYS._asdict().values())
-    assert expected_keys.issubset(config.keys()), f"Missing keys: {expected_keys - set(config.keys())}"
+    if check_schema:
+        expected_keys = set(CONF_KEYS._asdict().values())
+        if not expected_keys.issubset(config.keys()):
+            raise AssertionError(f"Missing keys: {expected_keys - set(config.keys())}")
     # Convert nn modules to actual classes
     config = replace_nn_modules(config)
-    if setup:
+    if do_setup:
         # Set up nested structure
         setup_config(config=config)
     return config

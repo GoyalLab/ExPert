@@ -45,8 +45,8 @@ def calc_umap(adata: ad.AnnData, rep: str = 'X_pca', slot_key: str | None = None
     # Cache umap generation
     if slot_key in adata.obsm and not force:
         return
-    # Setup umap instance, with sc.tl.umap defaults
-    _umap = umap.UMAP(n_components=2, min_dist=0.5, random_state=0)
+    # Setup umap instance, with sc.tl.umap defaults, apart from random state (slows it down a lot)
+    _umap = umap.UMAP(n_components=2, min_dist=0.5)
     # Set embeddings to use
     if rep not in adata.obsm:
         raise ValueError(f'Could not find {rep} slot in adata.obsm.')
@@ -242,6 +242,7 @@ def plot_top_n_performance(
         top_n_predictions: pd.DataFrame,
         output_file: str | None,
         hue: str = 'split',
+        cls_label: str = 'label',
         metric: Literal['f1-score', 'accuracy', 'precision', 'recall'] = 'f1-score',
         show_random: bool = True,
         title: str | None = None,
@@ -259,8 +260,8 @@ def plot_top_n_performance(
         # Replace all values of hue with random if 'mode' is random
         data.loc[data['mode']=='random',hue] = 'random'
     # Calculate mean values for a specified split if given
-    if mean_split is not None and mean_split in top_n_predictions[REGISTRY_KEYS.SPLIT_KEY].unique():
-        top_split = data[data[REGISTRY_KEYS.SPLIT_KEY]==mean_split]
+    if mean_split is not None and mean_split in top_n_predictions[hue].unique():
+        top_split = data[data[hue]==mean_split]
         means = top_split.groupby('top_n')[metric].mean()
     # Don't plot means
     else:
@@ -277,17 +278,26 @@ def plot_top_n_performance(
         hue=hue,
         **kwargs
     )
-    # Put legend outside of main plot
-    plt.legend(
+    # Get handles and current labels
+    handles, labels = ax.get_legend_handles_labels()
+    # Compute unique counts per hue
+    counts = data.groupby([hue])[cls_label].nunique()
+    # Build new labels with (N=...)
+    new_labels = [f"{lab} (N={counts.get(lab, 0)})" for lab in labels]
+    # Put legend outside of main plot and add counts
+    ax.legend(
+        handles,
+        new_labels,
         title=hue,
         bbox_to_anchor=(1.05, 1),
         loc='upper left',
         borderaxespad=0
     )
+
     # Rename axis labels
     plt.xlabel('Top N predictions')
     plt.ylabel(metric.capitalize())
-    plt.title(title, pad=20)
+    plt.title(f'{title} (w. {mean_split} mean)', pad=20)
     # Set y axis limits to 0-1
     plt.ylim((0, 1))
     # Display means on top of boxes if not none

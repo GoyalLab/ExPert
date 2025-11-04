@@ -82,6 +82,7 @@ class JEDVAE(VAE):
         min_kl: float | None = 1.0,
         classification_module_type: Literal['standard', 'arc'] = 'arc',              # Main classifier module (does not use external embeddings)
         classification_loss_strategy: Literal['ce', 'focal'] = 'focal',                             # Main classifier loss strategy
+        aligner_module: Literal['class', 'context_class'] | None = None,
         align_ext_emb_loss_strategy: Literal['kl', 'clip'] | list[str] | None = None,            # Secondary classifier module (links external embedding)
         ctrl_class_idx: int | None = None,
         kl_class_temperature: float = 0.1,
