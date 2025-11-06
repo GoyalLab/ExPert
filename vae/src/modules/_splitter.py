@@ -11,6 +11,9 @@ from scvi.dataloaders._ann_dataloader import AnnDataLoader
 from scvi.dataloaders._semi_dataloader import SemiSupervisedDataLoader
 from scvi.dataloaders._data_splitting import validate_data_split, validate_data_split_with_external_indexing
 
+import logging
+log = logging.getLogger(__name__)
+
 
 class SemiSupervisedDataSplitter(pl.LightningDataModule):
     """Creates data loaders ``train_set``, ``validation_set``, ``test_set``.
@@ -260,6 +263,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         pin_memory: bool = False,
         use_contrastive_loader: Literal['train', 'val', 'both'] | None = 'train',
         use_control: Literal['train', 'val', 'both'] | None = 'train',
+        test_context_labels: np.ndarray | None = None,
         external_indexing: list[np.array, np.array, np.array] | None = None,
         cache_indices: dict[str, np.array] | None = None,
         **kwargs,
@@ -280,6 +284,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         self.shuffle_classes = shuffle_classes
         self.use_contrastive_loader = use_contrastive_loader
         self.use_control = use_control
+        self.test_context_labels = test_context_labels
         # Fall back to product of max cells per batch * max classes per batch
         _bs = self.data_loader_kwargs.get("batch_size")
         if _bs is None:
@@ -312,8 +317,21 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         """Split indices in train/test/val sets."""
         # Split indices into sets if no cache is provided
         if self.cache_indices is None:
+            # Split entire data into train/val and test if test groups are provided
+            if self.test_context_labels is not None:
+                # Create mask for all indices in test contexts
+                test_mask = np.isin(self.batches, self.test_context_labels)
+                # Set main split
+                base_idx = self.indices[~test_mask]
+                # Set test split
+                test_idx = self.indices[test_mask]
+            else:
+                # Set main split to all available data
+                base_idx = self.indices
+                test_idx = []
+
             # Only split non-control cells into train and validation
-            ctrl_mask = self.labels == self.ctrl_class
+            ctrl_mask = self.labels[base_idx] == self.ctrl_class
             # Split control cells beforehand
             if ctrl_mask.sum() > 0:
                 class_indices = self.indices[~ctrl_mask]
@@ -321,8 +339,8 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
                 ctrl_indices = np.array(self.indices[ctrl_mask])
             else:
                 # Use all available indices if no control cells are given
-                class_indices = self.indices
-                class_labels = self.labels
+                class_indices = self.indices[base_idx]
+                class_labels = self.labels[base_idx]
                 ctrl_indices = None
             # Split dataset into train and validation set
             train_idx, val_idx = train_test_split(
@@ -336,7 +354,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
             # Split indices are stratified, TODO: add test split logic
             indices_train = np.array(train_idx)
             indices_val = np.array(val_idx)
-            indices_test = np.array([])
+            indices_test = np.array(test_idx)
 
             # Add control indices to train pool
             if ctrl_indices is not None:
@@ -426,7 +444,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
                 shuffle=False,
                 drop_last=False,
                 pin_memory=self.pin_memory,
-                **self.data_loader_kwargs,
+                **self.val_data_loader_kwargs,
             )
         else:
             pass

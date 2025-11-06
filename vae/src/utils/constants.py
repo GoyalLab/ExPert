@@ -48,6 +48,8 @@ class _MODULE_KEYS(NamedTuple):
     ZE_KEY: str = "ze"
     LIBRARY_G_KEY: str = "library_g"
     Z_SHARED_KEY: str = "z_shared"
+    H_CTX_KEY: str = "h_ctx"
+    H_CLS_KEY: str = "h_cls"
     CTX_LOGITS_KEY: str = "ctx_logits"
     CLS_LOGITS_KEY: str = "cls_logits"
     CTX_PROJ_KEY: str = "ctx_proj"
@@ -94,6 +96,8 @@ class _LOSS_KEYS_NT(NamedTuple):
     ADV_LOSS: str = "adversial_context_loss"
     UNSCALED_LOSS: str = "unscaled_loss"
     CTX_CLS_LOSS: str = "ctx_loss"
+    PSEUDO_Z_LOSS: str = "pseudo_z_loss"
+    MANIFOLD_REG_LOSS: str = "manifold_reg_loss"
     # Data keys
     DATA: str = "data"
     LOGITS: str = "logits"

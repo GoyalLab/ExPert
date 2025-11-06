@@ -1349,124 +1349,145 @@ class ContextClassAligner(nn.Module):
         use_learnable_temperature: bool = True,
         use_learnable_sigma: bool = True,
         use_cross_attention: bool = True,
+        use_joint_projection: bool = True,
+        unseen_buffer_prob: float = 0.1,
         return_projections: bool = True,
+        n_heads: int = 1,
         **kwargs,
     ):
         super().__init__()
         self.dropout_rate = dropout_rate
         self._temperature = temperature
-        self.use_learnable_temperature = use_learnable_temperature
         self.noise_sigma = noise_sigma
-        self.use_learnable_sigma = use_learnable_sigma
         self.use_cross_attention = use_cross_attention
+        self.use_joint_projection = use_joint_projection
         self.return_projections = return_projections
+        self.unseen_buffer_prob = unseen_buffer_prob
+        self.n_heads = n_heads
 
-        # Create linear projections from latent space to shared space
-        self.latent_projection = nn.Linear(n_input, n_shared)
-        # Create linear projection from ext context embedding to shared space
+        # --------- Temperature ---------
+        if use_learnable_temperature:
+            self._ctx_temperature = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
+            self._cls_temperature = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
+        else:
+            self.register_buffer("_ctx_temperature", torch.tensor(math.log(1.0 / temperature)))
+            self.register_buffer("_cls_temperature", torch.tensor(math.log(1.0 / temperature)))
+
+        # --------- Sigma ---------
+        if use_learnable_sigma and noise_sigma is not None:
+            self.noise_sigma = nn.Parameter(torch.tensor(noise_sigma))
+
+        # --------- Latent projections ---------
+        if use_joint_projection:
+            self.latent_projection = nn.Linear(n_input, n_shared)
+        else:
+            self.z_ctx_projection = nn.Linear(n_input, n_shared)
+            self.z_cls_projection = nn.Linear(n_input, n_shared)
+
+        # --------- External embedding projections ---------
         self.ctx_projection = nn.Linear(ctx_emb_dim, n_shared)
-        # Create linear projection from ext class embedding to shared space
         self.cls_projection = nn.Linear(cls_emb_dim, n_shared)
 
-        # Create a learnable temperature scaling
-        if use_learnable_temperature:
-            self._ctx_temperature = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
-            self._cls_temperature = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
-        # Replace sigma with a learnable parameter if it is not set to None
-        if use_learnable_sigma and noise_sigma is not None:
-            self.noise_sigma = torch.nn.Parameter(torch.tensor(noise_sigma))
-        # ---- Dropout ---- #
+        # --------- Dropout ---------
         self.dropout = nn.Dropout(p=dropout_rate)
 
     @property
     def ctx_temperature(self) -> torch.Tensor:
-        if self.use_learnable_temperature:
-            # Calculate logit scale
-            return 1.0 / self._ctx_temperature.clamp(-1, 4.6).exp()
-        else:
-            return self._temperature
-        
+        return 1.0 / self._ctx_temperature.clamp(-1, 4.6).exp()
+
     @property
     def cls_temperature(self) -> torch.Tensor:
-        if self.use_learnable_temperature:
-            # Calculate logit scale
-            return 1.0 / self._cls_temperature.clamp(-1, 4.6).exp()
-        else:
-            return self._temperature
+        return 1.0 / self._cls_temperature.clamp(-1, 4.6).exp()
 
     def forward(
-            self, 
-            z: torch.Tensor, 
-            ctx_emb: torch.Tensor,
-            cls_emb: torch.Tensor,
-        ) -> dict[str, torch.Tensor]:
+        self,
+        z: torch.Tensor,
+        ctx_emb: torch.Tensor,
+        cls_emb: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         """
         Parameters
         ----------
-        z : Tensor, shape (batch, latent_dim)
-        cls_emb : Tensor, shape (n_labels, cls_emb_dim)
-        ctx_emb : Tensor, shape (n_contexts, ctx_emb_dim)
+        z : Tensor, shape (B, latent_dim)
+        ctx_emb : Tensor, shape (N_ctx, ctx_emb_dim)
+        cls_emb : Tensor, shape (N_cls, cls_emb_dim)
         """
         B = z.size(0)
-        ctx_emb = ctx_emb.to(z.device)
-        cls_emb = cls_emb.to(z.device)
+        ctx_emb, cls_emb = ctx_emb.to(z.device), cls_emb.to(z.device)
 
-        # ----- Project to shared space -----
-        h = self.latent_projection(z)             # (B, d)
-        c_ctx = self.ctx_projection(ctx_emb)      # (N_ctx, d)
-        c_cls = self.cls_projection(cls_emb)      # (N_cls, d)
-        # ----- Add optional uncertainty to embeddings -----
-        if self.noise_sigma is not None and self.noise_sigma > 0:
-            c_ctx = c_ctx + self.noise_sigma * F.normalize(torch.randn_like(c_ctx), dim=-1)
-            c_cls = c_cls + self.noise_sigma * F.normalize(torch.randn_like(c_cls), dim=-1)
-        # ----- Normalize projections -----
-        h_norm = F.normalize(h, dim=-1)
-        c_ctx_norm = F.normalize(c_ctx, dim=-1)
-        c_cls_norm = F.normalize(c_cls, dim=-1)
-        # ----- Add optional dropout to h -----
+        # ----- Latent projection -----
+        if self.use_joint_projection:
+            h = self.latent_projection(z)
+            h_ctx, h_cls = h, h
+        else:
+            h_ctx = self.z_ctx_projection(z)
+            h_cls = self.z_cls_projection(z)
+
         if self.dropout_rate > 0:
-            h = self.dropout(h)
+            h_ctx = self.dropout(h_ctx)
+            h_cls = self.dropout(h_cls)
 
-        # ----- Context and class alignment -----
+        # ----- External projections -----
+        c_ctx = self.ctx_projection(ctx_emb)
+        c_cls = self.cls_projection(cls_emb)
+
+        # Optional noise regularization
+        if self.noise_sigma is not None and self.noise_sigma > 0:
+            noise_ctx = F.normalize(torch.randn_like(c_ctx), dim=-1)
+            noise_cls = F.normalize(torch.randn_like(c_cls), dim=-1)
+            c_ctx = c_ctx + self.noise_sigma * noise_ctx
+            c_cls = c_cls + self.noise_sigma * noise_cls
+
+        # Normalize
+        h_ctx_norm, h_cls_norm = F.normalize(h_ctx, dim=-1), F.normalize(h_cls, dim=-1)
+        c_ctx_norm, c_cls_norm = F.normalize(c_ctx, dim=-1), F.normalize(c_cls, dim=-1)
+
+        # ---------------------------------------------------------------------
+        #  Alignment: Cross-attention or cosine
+        # ---------------------------------------------------------------------
         if self.use_cross_attention:
-            # ---- Context attention ---- TODO: figure this shit out
-            q = h.unsqueeze(1)
-            k_ctx = c_ctx_norm.unsqueeze(0).repeat(B, 1, 1)
-            v_ctx = c_ctx.unsqueeze(0).repeat(B, 1, 1)
-            scores_ctx = (q @ k_ctx.transpose(1, 2)) / math.sqrt(c_ctx.size(-1))
+            # ---- Context attention ----
+            q_ctx = h_ctx.unsqueeze(1)                                # (B, 1, d)
+            k_ctx = c_ctx_norm.unsqueeze(0).expand(B, -1, -1)          # (B, N_ctx, d)
+            v_ctx = c_ctx.unsqueeze(0).expand(B, -1, -1)
+            scores_ctx = (q_ctx @ k_ctx.transpose(1, 2)) / math.sqrt(c_ctx.size(-1))
             attn_ctx = F.softmax(scores_ctx, dim=-1)
             z_ctx = (attn_ctx @ v_ctx).squeeze(1)
             logits_ctx = attn_ctx.squeeze(1) / self.ctx_temperature
 
             # ---- Class attention ----
-            k_cls = c_cls_norm.unsqueeze(0).repeat(B, 1, 1)
-            v_cls = c_cls.unsqueeze(0).repeat(B, 1, 1)
-            scores_cls = (q @ k_cls.transpose(1, 2)) / math.sqrt(c_cls.size(-1))
+            q_cls = h_cls.unsqueeze(1)
+            k_cls = c_cls_norm.unsqueeze(0).expand(B, -1, -1)
+            v_cls = c_cls.unsqueeze(0).expand(B, -1, -1)
+            scores_cls = (q_cls @ k_cls.transpose(1, 2)) / math.sqrt(c_cls.size(-1))
             attn_cls = F.softmax(scores_cls, dim=-1)
             z_cls = (attn_cls @ v_cls).squeeze(1)
             logits_cls = attn_cls.squeeze(1) / self.cls_temperature
 
-            # Combined latent (optional fusion)
+            # fused latent (optional)
             z_proj = F.normalize(0.5 * (z_ctx + z_cls), dim=-1)
         else:
-            # Cosine similarity (faster)
-            logits_ctx = (h_norm @ c_ctx_norm.T) / self.ctx_temperature
-            logits_cls = (h_norm @ c_cls_norm.T) / self.cls_temperature
-            z_proj = h
-       
-        # ----- Return aligned latent and logits -----
-        o = {
+            # Cosine similarity
+            logits_ctx = (h_ctx_norm @ c_ctx_norm.T) / self.ctx_temperature
+            logits_cls = (h_cls_norm @ c_cls_norm.T) / self.cls_temperature
+            # Combine hs, works the same if joint encoder is used
+            z_proj = F.normalize(0.5 * (h_ctx_norm + h_cls_norm), dim=-1)
+
+        # Outputs
+        outputs = {
             MODULE_KEYS.Z_SHARED_KEY: z_proj,
             MODULE_KEYS.CTX_LOGITS_KEY: logits_ctx,
-            MODULE_KEYS.CLS_LOGITS_KEY: logits_cls
+            MODULE_KEYS.CLS_LOGITS_KEY: logits_cls,
         }
-        # Add embedding projections to output
+
         if self.return_projections:
-            o.update({
+            outputs.update({
                 MODULE_KEYS.CTX_PROJ_KEY: c_ctx,
-                MODULE_KEYS.CLS_PROJ_KEY: c_cls
+                MODULE_KEYS.CLS_PROJ_KEY: c_cls,
+                MODULE_KEYS.H_CTX_KEY: h_ctx,
+                MODULE_KEYS.H_CLS_KEY: h_cls,
             })
-        return o
+        return outputs
 
 
 class EmbeddingAligner(nn.Module):

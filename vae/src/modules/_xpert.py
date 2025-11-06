@@ -7,8 +7,7 @@ from src.modules._base import (
 )
 import src.utils.io as io
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS, LOSS_KEYS
-from src.utils.distributions import rescale_targets
-from src.utils.common import GradientReversalFn, batchmean
+import src.utils.embeddings as emb_utils
 
 from typing import Iterable
 
@@ -71,13 +70,12 @@ class XPert(VAE):
         l_mask: str | list[str] | None = None,
         min_kl: float | None = 1.0,
         align_ext_emb_loss_strategy: Literal['kl', 'clip'] | list[str] = 'clip',            # Secondary classifier module (links external embedding)
-        use_learnable_temperature: bool = True,
         use_posterior_mean: bool = False,
         reduction: Literal['mean', 'sum', 'batchmean'] = 'mean',
         non_elbo_reduction: Literal['mean', 'sum', 'batchmean'] = 'mean',
         use_feature_mask: bool = False,
         drop_prob: float = 1e-3,
-        temperature: float = 1.0,
+        use_semantic_target_weights: bool = True,
         extra_encoder_kwargs: dict | None = None,
         extra_decoder_kwargs: dict | None = None,
         extra_aligner_kwargs: dict | None = None,
@@ -120,10 +118,11 @@ class XPert(VAE):
         self.min_kl = min_kl
         self.use_posterior_mean = use_posterior_mean
 
-        # Setup basic embedding params
-        self.n_ctx_dim = ctx_emb.shape[-1]
-        self.n_cls_dim = cls_emb.shape[-1]
+        # Setup embedding params
+        self.n_ctx, self.n_ctx_dim = ctx_emb.shape
+        self.n_cls, self.n_cls_dim = cls_emb.shape
         self.n_shared = n_shared
+        self.use_semantic_target_weights = use_semantic_target_weights
 
         # Set reduction metrics
         if reduction not in ['batchmean', 'mean']:
@@ -133,17 +132,10 @@ class XPert(VAE):
         self.reduction = reduction
         self.non_elbo_reduction = non_elbo_reduction
 
-        # Initialize learnable temperature scaling for logits
-        self.use_learnable_temperature = use_learnable_temperature
-        if use_learnable_temperature:
-            self.contr_logit_scale = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
-            self.clip_logit_scale = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
-            self.proxy_logit_scale = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
-        
         # Setup external embeddings
         self.ctx_emb = torch.nn.Embedding.from_pretrained(ctx_emb, freeze=True)
         self.cls_emb = torch.nn.Embedding.from_pretrained(cls_emb, freeze=True)
-        self.cls_sim = torch.nn.Embedding.from_pretrained(cls_sim, freeze=True)
+        self.cls_sim = torch.nn.Embedding.from_pretrained(cls_sim, freeze=True) if cls_sim is not None else None
 
         # Setup normalizations for en- and decoder
         use_batch_norm_encoder = use_batch_norm == 'encoder' or use_batch_norm == 'both'
@@ -207,8 +199,54 @@ class XPert(VAE):
         # Check loss strategies
         self.set_align_ext_emb_strategies(align_ext_emb_loss_strategy)
 
+        # Set semantic embedding targets for cross entropy
+        if self.use_semantic_target_weights:
+            log.info(f'Computing context similarity weights.')
+            self.ctx_targets = self.compute_semantic_embedding_targets(emb=self.ctx_emb.weight.data)
+            log.info(f'Computing class similarity weights.')
+            self.cls_targets = self.compute_semantic_embedding_targets(emb=self.cls_emb.weight.data)
+        else:
+            self.ctx_targets = None
+            self.cls_targets = None
+
         # ----- Debug -----
         self._step = 0
+
+    def draw_module(self):
+        return
+        from torchview import draw_graph
+
+        graph = draw_graph(self, input_size=(self), expand_nested=True)
+        graph.visual_graph.render("lightning_graph", format="png")
+
+    def compute_semantic_embedding_targets(
+        self,
+        emb: torch.Tensor,
+        eps: float = 1e-8,
+        use_gpu: bool = True,
+        batch_size: int = 512,
+    ) -> torch.Tensor:
+        """
+        Compute class similarity matrix for semantic label smoothing in batches.
+        emb: (N, D)
+        returns: (N, N) normalized similarity matrix.
+        """
+        device = torch.device("cuda:0" if (use_gpu and torch.cuda.is_available()) else "cpu")
+        emb = F.normalize(emb.to(device), dim=-1)
+
+        N, D = emb.shape
+        targets = torch.zeros((N, N), device=device, dtype=emb.dtype)
+
+        for i in range(0, N, batch_size):
+            j_end = min(i + batch_size, N)
+            # Compute cosine similarity for this batch vs all embeddings
+            batch = emb[i:j_end]                       # (B, D)
+            sim = batch @ emb.T                        # (B, N) -> cosine since emb is normalized
+            sim = F.relu(sim)                          # keep positive similarities
+            sim = sim / (sim.sum(dim=-1, keepdim=True) + eps)
+            targets[i:j_end] = sim                     # fill in chunk
+
+        return targets
 
     def set_align_ext_emb_strategies(self, align_ext_emb_loss_strategy) -> None:
         """Set alignment strategies."""
@@ -218,14 +256,6 @@ class XPert(VAE):
         for align_strategy in self.align_ext_emb_loss_strategies:
             if align_strategy not in self._align_ext_emb_loss_strategies:
                 raise ValueError(f'Unrecognized alignment strategy: {align_strategy}, choose one of {self._align_ext_emb_loss_strategies}')
-
-    @property
-    def clip_temp(self) -> torch.Tensor:
-        # Calculate logit scale
-        if self.use_learnable_temperature:
-            return 1.0 / self.clip_logit_scale.clamp(-1, 4.6).exp()
-        else:
-            return self.contrastive_temperature
         
     def _get_inference_input(
         self,
@@ -406,7 +436,7 @@ class XPert(VAE):
 
         if not self.use_size_factor_key:
             size_factor = library
-        # TODO: add film or cat for context embedding here
+        # Add context embedding to decoder
         if self.decode_covariates:
             ctx_emb = self.ctx_emb(batch_index).reshape(batch_index.shape[0], -1)
         else:
@@ -525,26 +555,110 @@ class XPert(VAE):
             return loss.sum(-1).mean()
         else:
             raise ValueError(f'Invalid reduction: {reduction}')
+        
+    def _ce_semantic(
+        self,
+        logits: torch.Tensor,
+        target_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        logits: (B, N)
+        targets: (B,) integer class labels
+        target_weights: (N, N) semantic smoothing targets from embeddings
+        """
+        log_probs = F.log_softmax(logits, dim=-1)
+        return torch.sum(-target_weights * log_probs, dim=-1)
     
-    def _clip_loss(self, z: torch.Tensor, logits: torch.Tensor, y: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        # Get temperature from aligner
-        T = self.aligner.cls_temperature
+    def _clip_loss(
+            self, 
+            z: torch.Tensor, 
+            logits: torch.Tensor, 
+            y: torch.Tensor, 
+            emb: torch.Tensor, 
+            T: torch.Tensor,
+            weights: torch.Tensor | None = None,
+        ) -> torch.Tensor:
         # Normalize z and embedding
         z = F.normalize(z, dim=-1)
         emb = F.normalize(emb, dim=-1)
-
-        # Latent -> class loss, logits are already scaled by classifier
-        loss_z2c = F.cross_entropy(logits, y, reduction='none')
 
         # For class -> latent, restrict to the classes present in the batch
         chosen = emb[y]   # (batch, d)
         logits_c2z = (chosen @ z.T) / T # (batch, batch)
         # Each class embedding should match its corresponding latent (diagonal)
         labels_c2z = torch.arange(z.size(0), device=z.device)
+
+        # ---- Calculate losses ----
+        # Latent -> class loss, logits are already scaled by classifier
+        if self.use_semantic_target_weights and weights is not None:
+            # Subset weights
+            target_weights = weights.to(y.device)[y]
+            # Use embedding similarities as reference for ce
+            loss_z2c = self._ce_semantic(logits, target_weights)
+        else:
+            # Use hard one-hot labels as reference for ce
+            loss_z2c = F.cross_entropy(logits, y, reduction='none')
+        # Class -> latent loss, can't use semantics here
         loss_c2z = F.cross_entropy(logits_c2z, labels_c2z, reduction='none')
 
         # Symmetric loss per sample
         return 0.5 * (loss_z2c + loss_c2z)
+    
+    def _random_unseen_replacement(
+        self,
+        ctx_idx: torch.Tensor,
+        cls_idx: torch.Tensor,
+        p: float = 0.1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Randomly replace some labels with unseen labels to keep zero-shot active.""" 
+        ctx_idx = emb_utils.replace_with_unseen_labels(ctx_idx, n_seen=self.n_batch, n_total=self.n_ctx, p=p)
+        cls_idx = emb_utils.replace_with_unseen_labels(cls_idx, n_seen=self.n_labels, n_total=self.n_cls, p=p)
+        return ctx_idx, cls_idx
+    
+    def _pseudo_latent_loss(
+        self,
+        z: torch.Tensor,
+        frac: float = 0.1,
+        alpha: float = 0.5,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """Ensure that a random latent alignment still has an unbiased distribution over all possible classes."""
+        B, D = z.shape
+        B_pseudo = int(B * frac)
+        device = z.device
+        # Sample random latents
+        z_pseudo = torch.randn(B_pseudo, D, device=device)
+        # Align pseudo-latent to embeddings
+        align_out = self.aligner(z_pseudo, ctx_emb=self.ctx_emb.weight, cls_emb=self.cls_emb.weight)
+        # Extract logits from pseudo-alignment
+        ctx_logits: torch.Tensor = align_out[MODULE_KEYS.CTX_LOGITS_KEY]
+        cls_logits: torch.Tensor = align_out[MODULE_KEYS.CLS_LOGITS_KEY]
+        # Compute probability distributions over random logits
+        p_ctx = ctx_logits.softmax(dim=-1).clamp(min=eps)
+        p_cls = cls_logits.softmax(dim=-1).clamp(min=eps)
+        # Calculate KL divergence to uniform target distributions
+        u_ctx = 1.0 / p_ctx.size(-1)
+        u_cls = 1.0 / p_cls.size(-1)
+        loss_ctx = (u_ctx * torch.log(u_ctx / p_ctx)).sum(dim=-1).mean()
+        loss_cls = (u_cls * torch.log(u_cls / p_cls)).sum(dim=-1).mean()
+        # Determine weight distribution between the two embeddings
+        beta = 1 - alpha
+        return alpha * loss_ctx + beta * loss_cls
+    
+    def _manifold_regularization_loss(
+        self,
+        ctx_proj: torch.Tensor,
+        cls_proj: torch.Tensor,
+        frac: float = 0.1,
+        alpha: float = 0.5,
+    ) -> torch.Tensor:
+        """Calculate manifold regularization loss to ensure projected embedding keeps geometry intact."""
+        n_ctx_sample = int(frac * self.n_ctx)
+        ctx_reg_loss = emb_utils.manifold_regularization(ext_emb=self.ctx_emb.weight, proj_emb=ctx_proj, n_sample=n_ctx_sample)
+        n_cls_sample = int(frac * self.n_cls)
+        cls_reg_loss = emb_utils.manifold_regularization(ext_emb=self.cls_emb.weight, proj_emb=cls_proj, n_sample=n_cls_sample)
+        # Compute final regularization loss
+        return alpha * ctx_reg_loss + (1-alpha) * cls_reg_loss
 
     def loss(
         self,
@@ -555,6 +669,9 @@ class XPert(VAE):
         kl_weight: float = 1.0,
         ctx_align_weight: float = 1.0,
         cls_align_weight: float = 1.0,
+        random_unseen_replacement_p: float = 0.05,
+        pseudo_latent_frac: float = 0.05,
+        manifold_regularization_frac: float = 0.0,
         **kwargs,
     ) -> LossOutput:
         # ---- DEBUG ----
@@ -610,8 +727,15 @@ class XPert(VAE):
 
         # Only do alignment part if loss > 0
         if io.non_zero(ctx_align_weight) or io.non_zero(cls_align_weight):
+            # Randomly set some labels to unseen contexts and classes to keep these embeddings active
+            if random_unseen_replacement_p > 0:
+                ctx, cls = self._random_unseen_replacement(ctx_idx=ctx, cls_idx=cls, p=random_unseen_replacement_p)
+            # Re-format labels
+            ctx = ctx.squeeze(-1)
+            cls = cls.squeeze(-1)
             # Extract shared latent space
             z_shared = inference_outputs.get(MODULE_KEYS.Z_SHARED_KEY)
+            # Extract the embedding projections to shared space
             ctx2z = inference_outputs.get(MODULE_KEYS.CTX_PROJ_KEY)
             cls2z = inference_outputs.get(MODULE_KEYS.CLS_PROJ_KEY)
             # Extract context logits from aligner
@@ -619,24 +743,56 @@ class XPert(VAE):
             # Extract class logits from aligner
             cls_logits = inference_outputs.get(MODULE_KEYS.CLS_LOGITS_KEY)
 
-            # Get loss for context and class embedding for shared z
-            ctx_loss_ps = self._clip_loss(z_shared, logits=ctx_logits, y=ctx.squeeze(-1), emb=ctx2z)
-            cls_loss_ps = self._clip_loss(z_shared, logits=cls_logits, y=cls.squeeze(-1), emb=cls2z)
+            # Calculate clip loss for context embedding
+            ctx_loss_ps = self._clip_loss(
+                z_shared, 
+                logits=ctx_logits, 
+                y=ctx, 
+                emb=ctx2z, 
+                weights=self.ctx_targets,
+                T=self.aligner.ctx_temperature
+            )
+            # Calculate clip loss for class embedding
+            cls_loss_ps = self._clip_loss(
+                z_shared, 
+                logits=cls_logits, 
+                y=cls, 
+                emb=cls2z, 
+                weights=self.cls_targets,
+                T=self.aligner.cls_temperature
+            )
             # Apply reductions
             ctx_loss = self._reduce_loss(ctx_loss_ps, reduction=self.non_elbo_reduction)
             cls_loss = self._reduce_loss(cls_loss_ps, reduction=self.non_elbo_reduction)
-            # Combine alignment losses
-            align_loss = ctx_loss * ctx_align_weight + cls_loss * cls_align_weight
             # Add to extra metrics
-            extra_metrics[LOSS_KEYS.ALIGN_LOSS] = align_loss
             extra_metrics[LOSS_KEYS.CTX_CLS_LOSS] = ctx_loss
             extra_metrics[LOSS_KEYS.CLS_LOSS] = cls_loss
             # Add classification loss details
             lo_kwargs.update({
                 'classification_loss': cls_loss,
-                'true_labels': cls,
                 'logits': cls_logits,
             })
+            # Combine alignment losses
+            align_loss = ctx_loss * ctx_align_weight + cls_loss * cls_align_weight
+            
+            # TODO: add weights Add additional regularization losses
+            if pseudo_latent_frac > 0:
+                pseudo_latent_weight = 1.0
+                pseudo_latent_loss = self._pseudo_latent_loss(z, frac=pseudo_latent_frac)
+                # Add to overall alignment loss
+                align_loss = align_loss + pseudo_latent_loss * pseudo_latent_weight
+                # Add to extra metrics for logging
+                extra_metrics[LOSS_KEYS.PSEUDO_Z_LOSS] = pseudo_latent_loss
+            # Add a manifold regularization loss on all embedding projections
+            if manifold_regularization_frac > 0:
+                manifold_regularization_weight = 1.0
+                mr_loss = self._manifold_regularization_loss(ctx_proj=ctx2z, cls_proj=cls2z, frac=manifold_regularization_frac, alpha=0.5)
+                # Add to overall alignment loss
+                align_loss = align_loss + mr_loss * manifold_regularization_weight
+                # Add to extra metrics
+                extra_metrics[LOSS_KEYS.MANIFOLD_REG_LOSS] = mr_loss
+            # Add to extra metrics
+            extra_metrics[LOSS_KEYS.ALIGN_LOSS] = align_loss
             # Add to total loss
             total_loss = total_loss + align_loss
         # Add extra metrics to loss output

@@ -91,22 +91,25 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         average: str = "macro",
         top_k: int = 1,
         use_posterior_mean: Literal["train", "val", "both"] | None = "val",
-        use_cls_scores: Literal["train", "val", "both"] | None = "train",
         log_class_distribution: bool = False,
-        log_full_val: bool = True,
         freeze_encoder_epoch: int | None = None,
         freeze_decoder_epoch: int | None = None,
         gene_emb: torch.Tensor | None = None,
-        incl_n_unseen: int | None = None,
         anneal_schedules: dict[str, dict[str | float]] | None = None,
-        full_val_log_every_n_epoch: int = 10,
         use_contrastive_loader: Literal["train", "val", "both"] | None = "train",
         multistage_kl_frac: float = 0.1,
         multistage_kl_min: float = 1e-2,
         use_local_stage_warmup: bool = False,
         batch_labels: np.ndarray | None = None,
+        # Full log options
+        log_full: list[str] | None = ['val', 'test'],
+        full_log_every_n_epoch: int = 10,
+        # Plotting options
+        plot_kl_distribution: bool = True,
+        plot_umap: bool = False,
         # Caching options
         cache_n_epochs: int | None = 1,
+        n_train_step_cache: int = 64,
         **loss_kwargs,
     ):
         super().__init__(
@@ -125,7 +128,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             **loss_kwargs,
         )
         # Save annealing schedules and default params
-        self.anneal_schedules = {'kl_weight': {'min_weight': 0.0, 'max_weight': 1.0}}
+        self.anneal_schedules = {
+            'rl_weight': {'min_weight': 1.0, 'max_weight': 1.0},
+            'kl_weight': {'min_weight': 0.0, 'max_weight': 1.0}
+        }
         self.anneal_schedules.update(anneal_schedules)
         self.n_epochs_warmup = n_epochs_warmup
         self.n_steps_warmup = n_steps_warmup
@@ -148,12 +154,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Misc
         self.average = average                                                      # How to reduce the classification metrics
         self.top_k = top_k                                                          # How many top predictions to consider for metrics
-        self.plot_cm = self.loss_kwargs.pop("plot_cm", False)
-        self.plot_umap = self.loss_kwargs.pop("plot_umap", None)
-        self.plot_kl_distribution = self.loss_kwargs.pop("plot_kl_distribution", False)
-        self.plot_context_emb = self.loss_kwargs.pop("plot_context_emb", False)
-        self.log_full_val = log_full_val
-        self.full_val_log_every_n_epoch = full_val_log_every_n_epoch
+        self.plot_umap = plot_umap
+        self.plot_kl_distribution = plot_kl_distribution
+        self.log_full = log_full
+        self.full_log_every_n_epoch = full_log_every_n_epoch
         self.batch_labels = batch_labels
         # Save classes that have been seen during training
         self.train_class_counts = []
@@ -161,23 +165,63 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.observed_classes = set()
         # ----- Cache -----
         self.cache = {}
+        self.n_train_step_cache = n_train_step_cache
         # Cache for embeddings and metadata within epoch
         self.epoch_cache = {
             'train': defaultdict(list),
-            'val': defaultdict(list)
+            'val': defaultdict(list),
+            'test': defaultdict(list)
         }
         # Cache for historical data across epochs TODO: implement properly
         self.history_cache = {
             'train': defaultdict(list),
-            'val': defaultdict(list)
+            'val': defaultdict(list),
+            'test': defaultdict(list)
         }
         # Save n epochs in cache
         self.cache_n_epochs = cache_n_epochs
 
+        # Setup test metrics
+        self._n_obs_test = None
+        self.initialize_test_metrics()
+
+    @property
+    def n_obs_test(self):
+        """Number of observations in the tset set.
+
+        This will update the loss kwargs for loss rescaling.
+
+        Notes
+        -----
+        This can get set after initialization
+        """
+        return self._n_obs_test
+
+    @n_obs_test.setter
+    def n_obs_test(self, n_obs: int):
+        if "n_obs" in self._loss_args:
+            self.loss_kwargs.update({"n_obs": n_obs})
+        self._n_obs_test = n_obs
+        self.initialize_test_metrics()
+
+    def initialize_test_metrics(self):
+        """Initialize test related metrics."""
+        (
+            self.elbo_test,
+            self.rec_loss_test,
+            self.kl_local_test,
+            self.kl_global_test,
+            self.test_metrics,
+        ) = self._create_elbo_metric_components(mode="test", n_total=self.n_obs_test)
+        self.elbo_test.reset()
+
     def _cache_step_data(self, mode: str, batch: dict, inference_outputs: dict, loss_output: LossOutput):
         """Cache data from a single step."""
         # Only cache every n epoch
-        if self.full_val_log_every_n_epoch > 0 and self.current_epoch % self.full_val_log_every_n_epoch == 0:
+        if self.full_log_every_n_epoch > 0 and self.current_epoch % self.full_log_every_n_epoch == 0:
+            # Stop caching training steps after limit is reached
+            if mode == 'train' and len(self.epoch_cache[mode]['embeddings']) > self.n_train_step_cache:
+                return
             self.epoch_cache[mode]['embeddings'].append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
             self.epoch_cache[mode]['labels'].append(loss_output.true_labels.cpu())
             self.epoch_cache[mode]['covs'].append(batch[REGISTRY_KEYS.BATCH_KEY].cpu())
@@ -208,7 +252,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             # Keep only last N epochs
             if len(self.history_cache[mode][k]) > self.cache_n_epochs:
                 self.history_cache[mode][k].pop(0)
-        
+        # Add mode to output data
+        processed['mode'] = np.repeat(mode, processed['labels'].shape[0])
         # Clear epoch cache
         self.epoch_cache[mode].clear()
         
@@ -242,7 +287,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         schedule: Literal["linear", "sigmoid", "exponential"] = "sigmoid",
         anneal_k: float = 10.0,
         hard_stall: bool = True,
-        invert: bool = False
+        invert: bool = False,
+        **kwargs
     ) -> float:
         # Pull current epoch
         epoch = self.current_epoch
@@ -321,19 +367,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Return weight on epoch
         return weight
 
-    @property
-    def rl_weight(self):
-        """Scaling factor on classification weight during training. Consider Jax"""
-        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
-        kwargs = self.anneal_schedules.get('rl_weight', {'min_weight': 1.0, 'max_weight': 1.0})
-        sched_kwargs.update(kwargs)
-        klw = self._compute_weight(**sched_kwargs)
-        return (
-            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
-        )
-
-    @property
-    def kl_weight_multistage(self):
+    def get_kl_weight(self):
         """KL weight for forward process. Resets every time a new loss objective activates."""
         # Get extra kl args from 
         kwargs = self.kl_kwargs
@@ -364,27 +398,22 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         klw = self._compute_weight(**kwargs)
         
         return klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
-
-    @property
-    def ctx_align_weight(self):
-        """Scaling factor on classification weight during training. Consider Jax"""
-        # Init basic args
-        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
-        # Add scheduling params if given
-        kwargs = self.anneal_schedules.get('ctx_align_weight', {})
-        sched_kwargs.update(kwargs)
-        klw = self._compute_weight(**sched_kwargs)
-        return (
-            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
-        )
     
-    @property
-    def cls_align_weight(self):
-        """Scaling factor on contrastive weight during training. Consider Jax"""
-        # Init basic args
+    def _get_schedule_weight(self, key: str, default: float = 0.0) -> torch.Tensor:
+        # Return default value if key is not in schedules
+        if key not in self.anneal_schedules:
+            return default
+        # Return non-default weights
+        if key == 'kl_weight':
+            return self.get_kl_weight()
+        # Init default args
         sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
         # Add scheduling params if given
-        kwargs = self.anneal_schedules.get('cls_align_weight', {})
+        kwargs = {}
+        kwargs.update(self.anneal_schedules.get(key, {}))
+        # Return default value of the mode is not correct
+        if bool(kwargs.pop('train_only', None)) and not self.training:
+            return default
         sched_kwargs.update(kwargs)
         klw = self._compute_weight(**sched_kwargs)
         return (
@@ -392,46 +421,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         )
 
     @property
-    def contrastive_loss_weight(self):
-        """Scaling factor on contrastive weight during training. Consider Jax"""
-        # Init basic args
-        sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
-        # Add scheduling params if given
-        kwargs = self.anneal_schedules.get('contrastive_loss_weight', {})
-        sched_kwargs.update(kwargs)
-        klw = self._compute_weight(**sched_kwargs)
-        return (
-            klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
-        )
-    
-    def _plot_context_embedding_heatmap(self) -> None:
-        """Plot context embedding"""
-        if self.module.use_context_emb:
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-
-            # Get embedding weights and convert to numpy array for plotting 
-            weights = self.module.e_context_emb.weight.clone().detach().cpu().numpy()
-            # Get context labels
-            batch_labels = self.batch_labels
-            
-            # Create heatmap
-            fig, ax = plt.subplots(figsize=(12, 8))
-            sns.heatmap(weights, cmap='viridis', ax=ax, annot=True, fmt=".3f")
-            ax.set_title(f'Encoder Context Embedding Weights @ Epoch {self.current_epoch}')
-            ax.set_xlabel('Embedding Dimension')
-            ax.set_ylabel('Context Index')
-
-            # Add context labels if available
-            if batch_labels is not None:
-                ax.set_yticks(np.arange(len(batch_labels)) + 0.5)
-                ax.set_yticklabels(batch_labels, rotation=0)
-            # Add tight layout to fit everything into the plot
-            plt.tight_layout()
-
-            # Log to tensorboard
-            self.logger.experiment.add_figure('context_embedding_heatmap', fig, self.current_epoch)
-            plt.close(fig)
+    def weights(self) -> dict[str, torch.Tensor]:
+        """Returns a dictionary of all current weights."""
+        return {k: self._get_schedule_weight(k) for k in self.anneal_schedules}
     
     def _plot_kl_distribution_over_latents(self, kl_tensor: torch.Tensor, metric: str) -> None:
         """Plot distribution of KL divergence over latent dimensions."""
@@ -500,8 +492,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         if (
             self.plot_kl_distribution
             and mode != 'train'
-            and self.full_val_log_every_n_epoch is not None 
-            and self.current_epoch % self.full_val_log_every_n_epoch == 0
+            and self.full_log_every_n_epoch is not None 
+            and self.current_epoch % self.full_log_every_n_epoch == 0
         ):
             self._plot_kl_distribution_over_latents(kl_tensor=kl_per_latent, metric=MODULE_KEYS.KL_Z_PER_LATENT_KEY)
         # Initialize default classification metrics
@@ -578,63 +570,40 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         return cls_emb @ cls_emb.T
     
     def _log_temperatures(self, batch_size: int | None = None):
-        # Log classifier temperature
-        if self.module.use_learnable_temperature:
-            # Check classifier temperature
-            ctx_temp = getattr(self.module.aligner, 'ctx_temperature', None)
-            cls_temp = getattr(self.module.aligner, 'cls_temperature', None)
-            sigma = getattr(self.module.aligner, 'noise_sigma', None)
+        # Log model temperatures
+        ctx_temp = getattr(self.module.aligner, 'ctx_temperature', None)
+        cls_temp = getattr(self.module.aligner, 'cls_temperature', None)
+        sigma = getattr(self.module.aligner, 'noise_sigma', None)
 
-            if ctx_temp:
-                self.log(
-                    "T_ctx_logit",
-                    ctx_temp,
-                    on_epoch=True,
-                    batch_size=batch_size,
-                    prog_bar=False,
-                )
-            if cls_temp:
-                self.log(
-                    "T_cls_logit",
-                    cls_temp,
-                    on_epoch=True,
-                    batch_size=batch_size,
-                    prog_bar=False,
-                )
-            if sigma:
-                self.log(
-                    "noise_sigma",
-                    sigma,
-                    on_epoch=True,
-                    batch_size=batch_size,
-                    prog_bar=False,
-                )
-            
+        if ctx_temp:
             self.log(
-                "T_clip_z",
-                self.module.clip_temp,
+                "T_ctx_logit",
+                ctx_temp,
+                on_epoch=True,
+                batch_size=batch_size,
+                prog_bar=False,
+            )
+        if cls_temp:
+            self.log(
+                "T_cls_logit",
+                cls_temp,
+                on_epoch=True,
+                batch_size=batch_size,
+                prog_bar=False,
+            )
+        if sigma:
+            self.log(
+                "noise_sigma",
+                sigma,
                 on_epoch=True,
                 batch_size=batch_size,
                 prog_bar=False,
             )
 
-    def step(self, mode, batch, batch_idx):
+    def step(self, batch, batch_idx):
         """Step for supervised training"""
-        # Compute RL weight
-        self.loss_kwargs.update({"rl_weight": self.rl_weight})
-        # Compute KL warmup
-        if "kl_weight" in self.loss_kwargs:
-            self.loss_kwargs.update({"kl_weight": self.kl_weight_multistage})
-        # Compute context weight
-        self.loss_kwargs.update({"ctx_align_weight": self.ctx_align_weight})
-        # Compute class weight
-        self.loss_kwargs.update({"cls_align_weight": self.cls_align_weight})
-        # Compute contrastive weight
-        if self.use_contrastive_loader in ['both', mode]:
-            self.loss_kwargs.update({"contrastive_loss_weight": self.contrastive_loss_weight})
-        else:
-            self.loss_kwargs.update({"contrastive_loss_weight": 0.0})
-        
+        # Update loss kwargs with schedules weights
+        self.loss_kwargs.update(self.weights)
         # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
@@ -649,7 +618,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def training_step(self, batch, batch_idx):
         """Training step for supervised training."""
         # Perform full forward pass of model
-        inference_outputs, _, loss_output = self.step(mode='train', batch=batch, batch_idx=batch_idx)
+        inference_outputs, _, loss_output = self.step(batch=batch, batch_idx=batch_idx)
         loss = loss_output.loss
         self.log(
             "train_loss",
@@ -659,15 +628,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             prog_bar=True,
         )
         # Log all schedule weights
-        for name in self.anneal_schedules.keys():
-            value = getattr(self, name)
-            self.log(
-                name,
-                value,
-                on_epoch=True,
-                batch_size=loss_output.n_obs_minibatch,
-                prog_bar=False,
-            )
+        for k, w in self.weights.items():
+            self.log(k, w, on_epoch=True, prog_bar=False)
         # Log learnable temperatures if given
         self._log_temperatures()
         # Log other metrics
@@ -688,7 +650,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def validation_step(self, batch, batch_idx):
         """Validation step for supervised training."""
         # Perform full forward pass of model
-        inference_outputs, _, loss_output = self.step(mode='val', batch=batch, batch_idx=batch_idx)
+        inference_outputs, _, loss_output = self.step(batch=batch, batch_idx=batch_idx)
         loss = loss_output.loss
         self.log(
             "validation_loss",
@@ -701,6 +663,24 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Cache the data
         with torch.no_grad():
             self._cache_step_data('val', batch, inference_outputs, loss_output)
+
+    def test_step(self, batch, batch_idx):
+        """Test step for supervised training."""
+        pass
+        # Perform full forward pass of model
+        inference_outputs, _, loss_output = self.step(batch=batch, batch_idx=batch_idx)
+        loss = loss_output.loss
+        self.log(
+            "test_loss",
+            loss,
+            on_epoch=True,
+            batch_size=loss_output.n_obs_minibatch,
+            prog_bar=True,
+        )
+        self.compute_and_log_metrics(loss_output, self.test_metrics, "test")
+        # Cache the data
+        with torch.no_grad():
+            self._cache_step_data('test', batch, inference_outputs, loss_output)
 
     def on_train_epoch_start(self):        
         # Freeze module encoder at a certain epoch if option is enabled
@@ -742,32 +722,55 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             plt.close(fig)
             # Reset for next epoch
             self.train_class_counts = []
-        # Plot umap
-        if self.plot_umap in ['train', 'both'] and self.current_epoch % 10 == 0:
-            train_data = self._process_epoch_cache('train')
-            if train_data:
-                self._plt_umap('train', train_data)
+
+    def _full_log_on_epoch_end(self):
+        """Plot umap of mode on epoch end"""
+        # Get modes to do a full log on
+        modes = self.log_full
+        if isinstance(modes, str):
+            modes = [modes]
+        # Do a full log for given modes
+        if len(self.log_full) == 0:
+            return
+        # Get cached steps from all modes
+        data = {}
+        _modes = []
+        for mode in modes:
+            # Get cached mode data
+            mode_data = self._process_epoch_cache(mode)
+            if mode_data is None:
+                continue
+            # Save used mode
+            _modes.extend(mode)
+            # Calculate performance metrics over entire set
+            if self.log_full:
+                self._log_full_metrics(mode, data)
+            # Combine modes only if we plot
+            if len(data) == 0 or not self.plot_umap:
+                data = mode_data
+                continue
+            # Concatenate existing data
+            for k, v in data.items():
+                new_v = mode_data.get(k)
+                if new_v is not None:
+                    data[k] = np.concatenate((v, new_v), axis=0)
+            
+        # If data is not empty and we want to plot
+        if len(_modes) > 0 and self.plot_umap:
+            # Plot UMAP for all splits
+            full_name = '-'.join(_modes) if len(_modes) > 1 else _modes[0]
+            self._plt_umap(full_name, data)
 
     # Calculate accuracy & f1 for entire validation set, not just per batch
     def on_validation_epoch_end(self):
-        """Plot full validation set UMAP projection."""
-        if self.full_val_log_every_n_epoch > 0 and self.current_epoch % self.full_val_log_every_n_epoch == 0:
-            plt_umap = self.plot_umap in ['val', 'both']
-            if plt_umap or self.log_full_val:
-                # Get data from forward pass
-                val_data = self._process_epoch_cache('val')
-                if val_data:
-                    # Plot UMAP for validation set
-                    if plt_umap:
-                        self._plt_umap('val', val_data)
-                    # Calculate performance metrics over entire validation set, not just batch
-                    if self.log_full_val and self.cls_align_weight > 0:
-                        self._log_full_val_metrics(val_data)
-            # Plot context embedding
-            if self.plot_context_emb:
-                self._plot_context_embedding_heatmap()
+        """Calculate metrics and plot charts for full data split(s)."""
+        if self.full_log_every_n_epoch > 0 and self.current_epoch % self.full_log_every_n_epoch == 0:
+            self._full_log_on_epoch_end()
                     
-    def _log_full_val_metrics(self, mode_data: dict[str, np.ndarray]) -> None:
+    def _log_full_metrics(self, mode: str, mode_data: dict[str, np.ndarray]) -> None:
+        # Skip logging if no classification is available yet
+        if 'labels' not in mode_data:
+            return
         true_labels = torch.tensor(mode_data.get('labels'))
         predicted_labels = torch.tensor(mode_data.get('predicted_labels')).squeeze(-1)
         n_classes = self.n_classes
@@ -793,13 +796,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             average=self.average,
         )
         self.log(
-            "validation_full_accuracy",
+            f"{mode}_full_accuracy",
             accuracy,
             on_epoch=True,
             prog_bar=False,
         )
         self.log(
-            "validation_full_f1",
+            f"{mode}_full_f1",
             f1,
             on_epoch=True,
             prog_bar=False,
@@ -807,8 +810,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Include top k predictions as well
         if self.top_k > 1:
             logits = torch.tensor(mode_data.get('logits'))
-            top_k_acc_key = f'validation_full_accuracy_top_{self.top_k}'
-            top_k_f1_key = f'validation_full_f1{self.top_k}'
+            top_k_acc_key = f'{mode}_full_accuracy_top_{self.top_k}'
+            top_k_f1_key = f'{mode}_full_f1{self.top_k}'
             top_k_accuracy = tmf.classification.multiclass_accuracy(
                 logits,
                 true_labels,
@@ -836,17 +839,21 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 prog_bar=False,
             )
 
-    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray], use_history: bool = True):
+    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray]):
         """Plot umap of latent space in tensorboard logger"""
         import umap
         # Extract data from forward pass
         embeddings = mode_data['embeddings']
         labels = mode_data['labels']
+        covs = mode_data['covs']
         # Look for actual label encoding
         if "_code_to_label" in self.loss_kwargs:
             labels = [self.loss_kwargs["_code_to_label"][l] for l in labels]
+        if self.batch_labels is not None:
+            covs = self.batch_labels[covs]
         labels = pd.Categorical(labels)
-        covs = pd.Categorical(mode_data['covs'])
+        covs = pd.Categorical(covs)
+        modes = pd.Categorical(mode_data['mode'])
         
         # Create cache structure if it doesn't exist
         if 'umap_cache' not in self.cache:
@@ -884,7 +891,21 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         import matplotlib.pyplot as plt
         import seaborn as sns
     
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150)
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=150)
+        # Plot modes
+        sns.scatterplot(
+            x=embeddings_2d[:, 0],
+            y=embeddings_2d[:, 1],
+            hue=modes,
+            alpha=0.7,
+            s=4,
+            ax=axes[0,0],
+            legend=True
+        )
+        axes[0,0].set_title(f"Splits @ Epoch: {self.current_epoch}")
+        axes[0,0].set_xlabel("UMAP1")
+        axes[0,0].set_ylabel("UMAP2")
+        axes[0,0].legend(title="Split")
         # Plot classes
         sns.scatterplot(
             x=embeddings_2d[:, 0],
@@ -892,12 +913,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             hue=labels,
             alpha=0.7,
             s=4,
-            ax=axes[0],
+            ax=axes[0,1],
             legend=False
         )
-        axes[0].set_title(f"Classes @ Epoch: {self.current_epoch}")
-        axes[0].set_xlabel("UMAP-1")
-        axes[0].set_ylabel("UMAP-2")
+        axes[0,1].set_title(f"Classes @ Epoch: {self.current_epoch}")
+        axes[0,1].set_xlabel("UMAP1")
+        axes[0,1].set_ylabel("UMAP2")
         # Plot batch keys
         sns.scatterplot(
             x=embeddings_2d[:, 0],
@@ -905,15 +926,18 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             hue=covs,
             alpha=0.7,
             s=4,
-            ax=axes[1],
+            ax=axes[1,0],
         )
-        axes[1].set_title(f"Batch Keys @ Epoch: {self.current_epoch}")
-        axes[1].set_xlabel("UMAP-1")
-        axes[1].set_ylabel("UMAP-2")
-        axes[1].legend(
-            bbox_to_anchor=(0.5, -0.15),
-            loc="upper center",
-            title="BATCH_KEY",
+        axes[1,0].set_title(f"Contexts @ Epoch: {self.current_epoch}")
+        axes[1,0].set_xlabel("UMAP1")
+        axes[1,0].set_ylabel("UMAP2")
+        axes[1,0].legend(
+            bbox_to_anchor=(1.05, 1),
+            loc='upper left',
+            borderaxespad=0,
+            title="Contexts",
         )
+        # Make last plot invisible
+        axes[1, 1].set_visible(False)
         self.logger.experiment.add_figure(f"{mode}_z_umap", fig, self.current_epoch)
         plt.close(fig)

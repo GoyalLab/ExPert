@@ -58,7 +58,7 @@ def plot_umap(
         adata: ad.AnnData, 
         slot: str, 
         hue: str, 
-        output_file: str | None,
+        output_file: str | None = None,
         title: str = '',
         show_spines: bool = True,
         **scatter_kwargs,

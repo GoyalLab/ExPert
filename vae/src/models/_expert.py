@@ -2,7 +2,7 @@ import os
 from src.utils.constants import REGISTRY_KEYS, EXT_CLS_EMB_INIT, PREDICTION_KEYS, MODULE_KEYS
 import src.utils.io as io
 import src.utils.performance as pf
-from src.utils._callbacks import DelayedEarlyStopping
+from src.utils._callbacks import DelayedEarlyStopping, PeriodicTestCallback
 import src.utils.plotting as pl
 from src.modules._xpert import XPert
 from src.modules._splitter import ContrastiveDataSplitter
@@ -70,6 +70,7 @@ class ExPert(
     _LATENT_Z_SHARED_KEY = f"{__qualname__}_latent_z_shared"
     _LATENT_CTX_PROJ_KEY = f"{__qualname__}_latent_ctx_proj"
     _LATENT_CLS_PROJ_KEY = f"{__qualname__}_latent_cls_proj"
+    _LATENT_Z_SHARED_UMAP = f"{__qualname__}_latent_h_umap"
     _LATENT_UMAP = f"{__qualname__}_latent_umap"
 
 
@@ -219,11 +220,14 @@ class ExPert(
             log.info(f'Adata has already been initialized with {self.__class__}, loading model settings from adata.')
             # Set to embeddings found in adata
             self.cls_emb = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
-            self.cls_sim = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
+            self.cls_sim = io.to_tensor(self.adata.uns.get(REGISTRY_KEYS.CLS_SIM_KEY))
             # Init train embeddings from adata
             self.n_train_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY]
             self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
-            self.train_cls_sim = self.cls_sim[:self.n_train_labels,:self.n_train_labels]
+            if self.cls_sim is not None:
+                self.train_cls_sim = self.cls_sim[:self.n_train_labels,:self.n_train_labels]
+            else:
+                self.train_cls_sim = None
             # Set indices
             self.idx_to_label = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.LABELS_KEY])
         else:
@@ -244,20 +248,14 @@ class ExPert(
                 raise ValueError(f'Found {n_missing} missing labels in external class embedding: {_label_series[~_label_overlap]}')
             # Re-order embedding: first training labels then rest
             cls_emb = pd.concat([cls_emb.loc[_shared_labels], cls_emb.loc[_unseen_labels]], axis=0)
-            # Include class similarity as pre-calculated matrix
-            log.info(f'Calculating external class similarities')
             # Set gene embedding as class parameter
             self.cls_emb = torch.tensor(cls_emb.values, dtype=torch.float32)
-            # Normalize embedding before calculating similarities
-            cls_emb_norm = F.normalize(self.cls_emb, p=2, dim=-1)
-            # Set class similarities as class parameter
-            self.cls_sim = cls_emb_norm @ cls_emb_norm.T
+            self.cls_sim = None
             # Save in adata for caching
             self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = self.cls_emb
-            self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = self.cls_sim
             # Save train embeddings and similarities as class parameters
             self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
-            self.train_cls_sim = self.train_cls_emb @ self.train_cls_emb.T
+            self.train_cls_sim = None
             # Get full list of perturbations for embedding
             self.idx_to_label = cls_emb.index.values
             # Save registration with this model
@@ -269,6 +267,16 @@ class ExPert(
             }
         # Set embedding dimension
         self.ext_class_embed_dim = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
+
+    def print_summary(self, max_depth: int = 3) -> None:
+        """Print overview of module"""
+        from pytorch_lightning.utilities.model_summary import ModelSummary
+        summary = ModelSummary(self.module, max_depth=max_depth)
+        log.info(summary)
+
+    def draw_module(self, **kwargs) -> None:
+        """Draw """
+        pass
 
     def get_cls_emb(self, use_full_cls_emb: bool | None = None) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Helper getter to return either training or full class embedding"""
@@ -640,12 +648,12 @@ class ExPert(
         ctx_logits = torch.cat(ctx_logits).numpy()
         cls_logits = torch.cat(cls_logits).numpy()
         z_shared = torch.cat(z_shared).numpy()
-        ctx2z = torch.cat(ctx2z).numpy()
-        cls2z = torch.cat(cls2z).numpy()
+        ctx2z = torch.stack(ctx2z, dim=0).mean(0).numpy()
+        cls2z = torch.stack(cls2z, dim=0).mean(0).numpy()
         data_ctx_labels = torch.cat(data_ctx_labels).numpy()
         data_cls_labels = torch.cat(data_cls_labels).numpy()
         # Get context predictions
-        n_ctx_labels = len(ctx_labels)
+        n_ctx_labels = ctx_logits.shape[-1]
         ctx_soft_predictions = pd.DataFrame(
             ctx_logits,
             columns=ctx_labels[:n_ctx_labels],
@@ -653,7 +661,7 @@ class ExPert(
         )
         ctx_predictions = ctx_soft_predictions.columns[np.argmax(ctx_soft_predictions, axis=-1)]
         # Get actual class labels for predictions
-        n_cls_labels = len(cls_labels)
+        n_cls_labels = cls_logits.shape[-1]
         cls_soft_predictions = pd.DataFrame(
             cls_logits,
             columns=cls_labels[:n_cls_labels],
@@ -749,6 +757,10 @@ class ExPert(
             batch_size = int(msb * mcb)
             data_params["batch_size"] = batch_size
 
+        # Look for test contexts
+        if 'test_context_labels' in data_params:
+            log.info(f'Using {data_params.get("test_context_labels")} as test context(s).')
+
         # Cache indices if model was pre-trained
         if self.was_pretrained and cache_data_splitter:
             log.info(f'Re-using pre-training data split.')
@@ -798,6 +810,11 @@ class ExPert(
             )
             # Add to callbacks
             callbacks.append(early_stopping_callback)
+        # Add test callback
+        check_test_every_n_epoch = train_params.pop('check_test_every_n_epoch')
+        if check_test_every_n_epoch is not None:
+            test_callback = PeriodicTestCallback(every_n_epochs=check_test_every_n_epoch)
+            callbacks.append(test_callback)
         # Manage checkpoint callback
         use_checkpoint = train_params.pop('checkpoint', False)
         checkpoint_monitor = train_params.pop('checkpoint_monitor', 'validation_loss')
@@ -858,6 +875,8 @@ class ExPert(
         runner()
         # Add latent representation to model
         self._register_latent_variables()
+        # TODO: Test call
+        # test_out = runner.trainer.test(self, datamodule=data_splitter)
         # Minify the model if enabled and adata is not already minified
         if minify_adata and not self.is_minified:
             log.info(f'Minifying adata with latent distribution')
@@ -1143,6 +1162,7 @@ class ExPert(
             # Plot a umap projection for every group
             o = os.path.join(plt_dir, f'umap_{split}_{group}.png')
             pl.plot_umap(adata, slot=self._LATENT_UMAP, hue=group, output_file=o)
+        # Plot latent projections
 
     def _plot_eval_splits(self, plt_dir: str) -> None:
         """Generate all split-specific plots."""
@@ -1159,17 +1179,6 @@ class ExPert(
         os.makedirs(plt_dir, exist_ok=True)
         # Save latent space to model adata if not already calculated
         self._register_latent_variables(force=False)
-        # Calculate UMAP for latent space based on latent mean
-        pl.calc_umap(self.adata, rep=self._LATENT_QZM_KEY, slot_key=self._LATENT_UMAP)
-        # Plot full UMAP colored by data split
-        umap_split_o = os.path.join(plt_dir, f'full_umap_{REGISTRY_KEYS.SPLIT_KEY}.png')
-        pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=REGISTRY_KEYS.SPLIT_KEY, output_file=umap_split_o)
-        # Plot full UMAP colored by batch label
-        umap_batch_o = os.path.join(plt_dir, f'full_umap_{self.original_batch_key}.png')
-        pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=self.original_batch_key, output_file=umap_batch_o)
-        # Plot full UMAP colored by batch label
-        umap_label_o = os.path.join(plt_dir, f'full_umap_{self.original_label_key}.png')
-        pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=self.original_label_key, output_file=umap_label_o)
         # Plot performance - support correlations
         support_corr_o = os.path.join(plt_dir, f'support_correlations.png')
         pl.plot_performance_support_corr(self.adata.uns[PREDICTION_KEYS.REPORT_KEY], o=support_corr_o, hue=REGISTRY_KEYS.SPLIT_KEY)
@@ -1181,6 +1190,19 @@ class ExPert(
             metric=metric,
             mean_split='val'
         )
+        # Calculate UMAP for latent space based on latent mean
+        pl.calc_umap(self.adata, rep=self._LATENT_QZM_KEY, slot_key=self._LATENT_UMAP)
+        # Plot full UMAP colored by data split
+        umap_split_o = os.path.join(plt_dir, f'full_umap_{REGISTRY_KEYS.SPLIT_KEY}.png')
+        pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=REGISTRY_KEYS.SPLIT_KEY, output_file=umap_split_o)
+        # Plot full UMAP colored by batch label
+        umap_batch_o = os.path.join(plt_dir, f'full_umap_{self.original_batch_key}.png')
+        pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=self.original_batch_key, output_file=umap_batch_o)
+        # Plot full UMAP colored by batch label
+        umap_label_o = os.path.join(plt_dir, f'full_umap_{self.original_label_key}.png')
+        pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=self.original_label_key, output_file=umap_label_o)
+        # TODO: Plot shared z umap with context and class embedding markers on it
+        # Combine z_shared with 
         # Plot individual splits
         self._plot_eval_splits(plt_dir)
         return
@@ -1228,21 +1250,21 @@ class ExPert(
         use_fixed_dataset_label: bool = True,
         plot: bool = True,
         results_mode: Literal['return', 'save'] | None | list[str] = 'save',
-        min_cells_per_class: int = 10,
         top_n: int = 10,
         ctrl_key: str | None = None,
         minify: bool = False,
         seed: int = 42,
+        **kwargs
     ) -> None:
         """Function to evaluate model on unseen data."""
         # Refactor results mode to always be a list of options or None
         results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
-        # TODO: all this only works for labelled data, inplement option to handle unlabelled data
+        # TODO: all this only works for labelled data, implement option to handle unlabelled data
         # TODO: actually pretty easy, just set prediction column to unknown for all cells duh
         # TODO: make this more modular
         # Read test adata and filter columns
         log.info(f'Testing model with: {test_adata_p}')
-        test_ad = io.read_adata(test_adata_p, cls_label=cls_label, min_cells_per_class=min_cells_per_class)
+        test_ad = io.read_adata(test_adata_p, cls_label=cls_label, **kwargs)
         # Filter test adata for trained classes
         train_cls = set(self.get_training_classes())
         test_cls = set(test_ad.obs[cls_label].unique())
@@ -1290,11 +1312,17 @@ class ExPert(
         # Get model predictions for test data
         use_full = None if not incl_unseen else True
         prediction_output = self.predict(adata=test_ad, use_full_cls_emb=use_full, return_latents=True)
-        # TODO: plot shared latents too
         # Save predictions to test adata
         predictions = prediction_output[PREDICTION_KEYS.PREDICTION_KEY]
         test_ad.obs[PREDICTION_KEYS.PREDICTION_KEY] = predictions
         test_ad.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = prediction_output[PREDICTION_KEYS.SOFT_PREDICTION_KEY]
+        # Save context predictions to test set
+        test_ad.obs[PREDICTION_KEYS.CTX_PREDICTION_KEY] = prediction_output[PREDICTION_KEYS.CTX_PREDICTION_KEY]
+        test_ad.obsm[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY] = prediction_output[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY]
+        # Save shared latent spaces to test set
+        test_ad.obsm[self._LATENT_Z_SHARED_KEY] = prediction_output[MODULE_KEYS.Z_SHARED_KEY]
+        test_ad.uns[self._LATENT_CTX_PROJ_KEY] = prediction_output[MODULE_KEYS.CTX_PROJ_KEY]
+        test_ad.uns[self._LATENT_CLS_PROJ_KEY] = prediction_output[MODULE_KEYS.CLS_PROJ_KEY]
         # Evaluate test results
         if output_dir is None and getattr(self, 'model_log_dir', None) is None:
             log.warning(f'No output location provided. Please specify an output directory.')

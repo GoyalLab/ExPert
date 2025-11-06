@@ -14,6 +14,7 @@ from tqdm import tqdm
 from src.vae import VAE
 
 import torch
+import torch.nn.functional as F
 from datetime import datetime
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -56,6 +57,30 @@ def pearson(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8, dim: int = -1):
     std = torch.sqrt((xm**2).sum(dim=dim) * (ym**2).sum(dim=dim)).clamp_min(eps)  # (B,)
 
     return cov / std
+
+def cross_entropy(
+            logits: torch.Tensor, 
+            targets: torch.Tensor, 
+            smoothing: float = 0.05
+        ) -> torch.Tensor:
+        """
+        Cross-entropy with label smoothing.
+        logits: (B, num_classes)
+        targets: (B,) integer class indices
+        """
+        # Return default cross entropy
+        if not smoothing > 0:
+            return F.cross_entropy(logits, targets, reduction='none')
+        # Return label smoothing cross entropy
+        num_classes = logits.size(-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        with torch.no_grad():
+            true_dist = torch.zeros_like(log_probs)
+            true_dist.fill_(smoothing / (num_classes - 1))
+            true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - smoothing)
+
+        return torch.sum(-true_dist * log_probs, dim=-1)
 
 def add_pp_layer(adata: ad.AnnData) -> None:
     if 'log1p' in adata.layers:
