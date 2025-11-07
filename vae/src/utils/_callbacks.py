@@ -15,6 +15,7 @@ class DelayedEarlyStopping(LoudEarlyStopping):
 
 class PeriodicTestCallback(Callback):
     def __init__(self, every_n_epochs=5):
+        super().__init__()
         self.every_n_epochs = every_n_epochs
 
     def on_validation_epoch_end(self, trainer, pl_module):

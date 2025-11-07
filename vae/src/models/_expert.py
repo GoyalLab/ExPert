@@ -573,20 +573,26 @@ class ExPert(
         if ctx_emb is not None:
             log.info(f'Using new context embedding: {ctx_emb.shape}')
             ctx_labels, ctx_emb = self.validate_ctx_emb(ctx_emb)
-        # Use model's context labels
+        # Use model's context labels and embedding
         else:
             ctx_labels = self.idx_to_batch
+            ctx_emb = self.module.ctx_emb.weight
         # Use new class embedding at inference
         if cls_emb is not None:
             log.info(f'Using new class embedding: {cls_emb.shape}')
             cls_labels, cls_emb = self.validate_cls_emb(cls_emb)
-        # Use model's class labels
+        # Use model's class labels and embedding
         else:
             cls_labels = self.idx_to_label
+            cls_emb = self.module.cls_emb.weight
+        # Register embedding interactions
+        self.module.aligner.precompute_joint_bank(ctx_emb, cls_emb)
+        log.info(f'Classifying.')
         
         # Collect batch logits
         ctx_logits = []
         cls_logits = []
+        joint_logits = []
         # Collect batch z shared
         z_shared = []
         ctx2z = []
@@ -619,20 +625,21 @@ class ExPert(
                 cls_output = self.module.classify(
                     x,
                     batch_index=batch,
+                    label=l,
                     g=self.gene_emb,
                     cat_covs=cat_covs,
                     cont_covs=cont_covs,
                     use_posterior_mean=use_posterior_mean,
                     inference_outputs=inference_outputs,
-                    ctx_emb=ctx_emb,
-                    cls_emb=cls_emb,
                 )
                 # Unpack context and perturbation classification output
                 _ctx_logits = cls_output[MODULE_KEYS.CTX_LOGITS_KEY]
                 _cls_logits = cls_output[MODULE_KEYS.CLS_LOGITS_KEY]
+                _joint_logits = cls_output[MODULE_KEYS.JOINT_LOGITS_KEY]
                 # Add batch predictions to overall predictions
                 ctx_logits.append(_ctx_logits.detach().cpu())
                 cls_logits.append(_cls_logits.detach().cpu())
+                joint_logits.append(_joint_logits.detach().cpu())
                 # Unpack shared latent spaces
                 _z_shared = cls_output[MODULE_KEYS.Z_SHARED_KEY]
                 _ctx2z = cls_output[MODULE_KEYS.CTX_PROJ_KEY]
@@ -643,37 +650,54 @@ class ExPert(
                 # Collect labels
                 data_ctx_labels.append(batch.detach().cpu())
                 data_cls_labels.append(l.detach().cpu())
+                del cls_output
         
         # Concatenate batch results
         ctx_logits = torch.cat(ctx_logits).numpy()
         cls_logits = torch.cat(cls_logits).numpy()
+        # Compute joint soft predictions
+        soft_joint = F.softmax(torch.cat(joint_logits), dim=-1).numpy()
         z_shared = torch.cat(z_shared).numpy()
         ctx2z = torch.stack(ctx2z, dim=0).mean(0).numpy()
         cls2z = torch.stack(cls2z, dim=0).mean(0).numpy()
         data_ctx_labels = torch.cat(data_ctx_labels).numpy()
         data_cls_labels = torch.cat(data_cls_labels).numpy()
-        # Get context predictions
-        n_ctx_labels = ctx_logits.shape[-1]
+        
+        # Create joint label list like ["ctx|cls", ...]
+        joint_labels = [f"{c}|{g}" for c in ctx_labels for g in cls_labels]
+
+        # Soft predictions DataFrame
+        joint_soft_predictions = pd.DataFrame(
+            soft_joint,
+            columns=joint_labels[:soft_joint.shape[-1]],
+            index=adata.obs_names[indices],
+        )
+        # Get hard predictions
+        joint_predictions = joint_soft_predictions.columns[np.argmax(joint_soft_predictions.values, axis=-1)]
+        # Add context predictions
         ctx_soft_predictions = pd.DataFrame(
             ctx_logits,
-            columns=ctx_labels[:n_ctx_labels],
+            columns=ctx_labels[:ctx_logits.shape[-1]],
             index=adata.obs_names[indices],
         )
-        ctx_predictions = ctx_soft_predictions.columns[np.argmax(ctx_soft_predictions, axis=-1)]
-        # Get actual class labels for predictions
-        n_cls_labels = cls_logits.shape[-1]
+        ctx_predictions = ctx_soft_predictions.columns[np.argmax(ctx_soft_predictions.values, axis=-1)]
+        # Add class predictions
         cls_soft_predictions = pd.DataFrame(
             cls_logits,
-            columns=cls_labels[:n_cls_labels],
+            columns=cls_labels[:cls_logits.shape[-1]],
             index=adata.obs_names[indices],
         )
-        cls_predictions = cls_soft_predictions.columns[np.argmax(cls_soft_predictions, axis=-1)]
+        cls_predictions = cls_soft_predictions.columns[np.argmax(cls_soft_predictions.values, axis=-1)]
+
         # Return all model predictions
         o = {
             PREDICTION_KEYS.CTX_PREDICTION_KEY: ctx_predictions,
             PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY: ctx_soft_predictions,
             PREDICTION_KEYS.PREDICTION_KEY: cls_predictions,
             PREDICTION_KEYS.SOFT_PREDICTION_KEY: cls_soft_predictions,
+            PREDICTION_KEYS.JOINT_PREDICTION_KEY: joint_predictions,
+            PREDICTION_KEYS.JOINT_SOFT_PREDICTION_KEY: joint_soft_predictions,
+            REGISTRY_KEYS.BATCH_KEY: data_ctx_labels,
             REGISTRY_KEYS.LABELS_KEY: data_cls_labels,
         }
         # Add latent spaces to prediction output
@@ -1191,7 +1215,7 @@ class ExPert(
             mean_split='val'
         )
         # Calculate UMAP for latent space based on latent mean
-        pl.calc_umap(self.adata, rep=self._LATENT_QZM_KEY, slot_key=self._LATENT_UMAP)
+        pl.calc_umap(self.adata, rep=self._LATENT_Z_SHARED_KEY, slot_key=self._LATENT_UMAP)
         # Plot full UMAP colored by data split
         umap_split_o = os.path.join(plt_dir, f'full_umap_{REGISTRY_KEYS.SPLIT_KEY}.png')
         pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=REGISTRY_KEYS.SPLIT_KEY, output_file=umap_split_o)
@@ -1207,7 +1231,7 @@ class ExPert(
         self._plot_eval_splits(plt_dir)
         return
     
-    def align_model_features(self, adata: AnnData) -> AnnData:
+    def align_model_features(self, adata: AnnData, inplace: bool = True) -> AnnData:
         # Subset test data features to the features the model has been trained on
         model_genes = self.adata.var_names
         v_mask = adata.var_names.isin(model_genes)
@@ -1231,7 +1255,14 @@ class ExPert(
             adata.obs = missing_obs
             adata.uns = uns
         # Sort .var to same order as observed in model's adata
-        return adata[:,self.adata.var_names].copy()
+        _adata = adata[:,self.adata.var_names]
+        # Inplace subset adata vars
+        if inplace:
+            adata = _adata.copy()
+            return
+        # Return updated adata
+        else:
+            return _adata
     
     def minify_query(self, adata: ad.AnnData) -> None:
         """Minify query test data."""
@@ -1300,7 +1331,7 @@ class ExPert(
         # Register new testing data with model
         self.setup_anndata(test_ad, labels_key=cls_label, batch_key=batch_label)
         # Make sure test adata's features are consistent with model
-        self.align_model_features(test_ad)
+        test_ad = self.align_model_features(test_ad, inplace=False).copy()
         # Get latent representation of model
         qzm, qzv = self.get_latent_representation(adata=test_ad, return_dist=True)
         test_ad.obsm[self._LATENT_QZM_KEY] = qzm
@@ -1362,7 +1393,7 @@ class ExPert(
         test_ad = ad.concat((self.adata, test_ad))
         test_ad.uns = test_uns
         # Always re-calculate umap
-        pl.calc_umap(test_ad, rep=self._LATENT_QZM_KEY, slot_key=self._LATENT_UMAP, force=True)
+        pl.calc_umap(test_ad, rep=self._LATENT_Z_SHARED_KEY, slot_key=self._LATENT_UMAP, force=True)
         # Determine result object
         return_obj = None
         if results_mode is not None:

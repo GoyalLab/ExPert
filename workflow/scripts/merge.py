@@ -38,6 +38,7 @@ def merge_datasets(
         OBS_KEYS.DATASET_KEY: meta_sheet.index.values,
         OBS_KEYS.PERTURBATION_TYPE_KEY: meta_sheet[DATA_SHEET_KEYS.PERTURBATION_TYPE].values,
         OBS_KEYS.CELL_TYPE_KEY: meta_sheet[DATA_SHEET_KEYS.CELL_TYPE].values,
+        OBS_KEYS.CONTEXT_KEY: meta_sheet[DATA_SHEET_KEYS.CONTEXT].values,
     })
     obs = obs.merge(meta, on=OBS_KEYS.DATASET_KEY)
     # reduce .var to the index

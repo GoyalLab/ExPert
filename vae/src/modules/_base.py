@@ -9,7 +9,7 @@ from typing import Literal, Iterable, Optional
 
 from torch.distributions import Normal
 
-from src.utils.constants import MODULE_KEYS
+from src.utils.constants import MODULE_KEYS, PREDICTION_KEYS
 from src.utils.io import to_tensor
 
 
@@ -209,7 +209,7 @@ class Block(nn.Module):
         self,
         n_input: int,
         n_output: int,
-        activation_fn: nn.Module = nn.LeakyReLU,
+        activation_fn: nn.Module = nn.GELU,
         dropout_rate: float = 0.1,
         use_batch_norm: bool = False,
         use_layer_norm: bool = True,
@@ -251,7 +251,7 @@ class TransformerBlock(nn.Module):
         use_batch_norm: bool = False,
         use_layer_norm: bool = True,
         dropout_rate: float = 0.1,
-        activation_fn: nn.Module = nn.LeakyReLU,
+        activation_fn: nn.Module = nn.GELU,
         bias: bool = True,
         noise_std: float = 0.0,
         **kwargs
@@ -334,7 +334,7 @@ class FunnelFCLayers(nn.Module):
         bias: bool = True,
         inverted: bool = False,
         inject_covariates: bool = False,
-        activation_fn: nn.Module = nn.LeakyReLU,
+        activation_fn: nn.Module = nn.GELU,
         noise_std: float = 0.0,
         skip_first: bool = True,
         **kwargs,
@@ -437,7 +437,7 @@ class AttentionLayers(nn.Module):
         n_head: int = 4,
         bias: bool = True,
         inject_covariates: bool = False,
-        activation_fn: nn.Module = nn.LeakyReLU,
+        activation_fn: nn.Module = nn.GELU,
         noise_std: float = 0.0,
         linear_encoder: bool = True,
         compress_emb_dim: int | None = None,
@@ -587,7 +587,8 @@ class FCLayers(nn.Module):
         use_activation: bool = True,
         bias: bool = True,
         inject_covariates: bool = True,
-        activation_fn: nn.Module = nn.LeakyReLU,
+        activation_fn: nn.Module = nn.GELU,
+        add_last_linear: bool = False,
         linear: bool = False,
         **kwargs
     ):
@@ -1328,7 +1329,50 @@ class DecoderSCVI(nn.Module):
         px_rate = torch.exp(library) * px_scale
         px_r = self.px_r_decoder(px) if dispersion == "gene-cell" else None
         return px_scale, px_r, px_rate, px_dropout
+    
 
+class LatentProjection(nn.Module):
+    """
+    Flexible projection MLP for mapping z to h (e.g. VAE latent → shared embedding space).
+    Allows dynamic number of layers, hidden size, and activation choice.
+    """
+
+    def __init__(
+        self,
+        n_in: int,
+        n_out: int,
+        n_hidden: int = 128,
+        n_layers: int = 2,
+        dropout_rate: float = 0.1,
+        activation_fn: nn.Module = nn.GELU,
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = True,
+    ):
+        super().__init__()
+
+        layers = []
+        in_dim = n_in
+
+        # Build hidden layers dynamically
+        for _ in range(n_layers - 1):
+            layers.append(nn.Linear(in_dim, n_hidden))
+            if use_batch_norm:
+                layers.append(nn.BatchNorm1d(n_hidden))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(n_hidden))
+            layers.append(activation_fn())
+            layers.append(nn.Dropout(dropout_rate))
+            in_dim = n_hidden
+
+        # Final layer to n_out
+        layers.append(nn.Linear(in_dim, n_out))
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(n_out))
+
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.model(z)
 
 class ContextClassAligner(nn.Module):
     """
@@ -1343,13 +1387,17 @@ class ContextClassAligner(nn.Module):
         ctx_emb_dim: int,
         cls_emb_dim: int,
         n_shared: int = 128,
+        n_hidden: int | None = None,
+        n_layers: int | None = None,
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = True,
         dropout_rate: float = 0.1,
         temperature: float = 0.1,
         noise_sigma: float | None = 1e-6,
         use_learnable_temperature: bool = True,
         use_learnable_sigma: bool = True,
-        use_cross_attention: bool = True,
-        use_joint_projection: bool = True,
+        linear_ctx_proj: bool = True,
+        linear_cls_proj: bool = False,
         unseen_buffer_prob: float = 0.1,
         return_projections: bool = True,
         n_heads: int = 1,
@@ -1359,77 +1407,114 @@ class ContextClassAligner(nn.Module):
         self.dropout_rate = dropout_rate
         self._temperature = temperature
         self.noise_sigma = noise_sigma
-        self.use_cross_attention = use_cross_attention
-        self.use_joint_projection = use_joint_projection
         self.return_projections = return_projections
         self.unseen_buffer_prob = unseen_buffer_prob
         self.n_heads = n_heads
+        # Joint c buffers
+        self.register_buffer("c_joint_bank", None, persistent=False)
+        self.register_buffer("n_ctx_cls", torch.zeros(2, dtype=torch.long), persistent=False)
 
         # --------- Temperature ---------
         if use_learnable_temperature:
             self._ctx_temperature = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
             self._cls_temperature = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
+            self._joint_temperature = nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
         else:
             self.register_buffer("_ctx_temperature", torch.tensor(math.log(1.0 / temperature)))
             self.register_buffer("_cls_temperature", torch.tensor(math.log(1.0 / temperature)))
+            self.register_buffer("_joint_temperature", torch.tensor(math.log(1.0 / temperature)))
 
         # --------- Sigma ---------
         if use_learnable_sigma and noise_sigma is not None:
             self.noise_sigma = nn.Parameter(torch.tensor(noise_sigma))
 
-        # --------- Latent projections ---------
-        if use_joint_projection:
+        # --------- Latent projection(s) ---------
+        if n_hidden is None and n_layers is None:
+            # Simple linear projection
             self.latent_projection = nn.Linear(n_input, n_shared)
         else:
-            self.z_ctx_projection = nn.Linear(n_input, n_shared)
-            self.z_cls_projection = nn.Linear(n_input, n_shared)
+            # Add a small fc network
+            self.latent_projection = LatentProjection(
+                n_input, n_shared, 
+                n_hidden=n_hidden, 
+                n_layers=n_layers,
+                dropout_rate=dropout_rate,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                activation_fn=nn.GELU,
+            )
 
         # --------- External embedding projections ---------
-        self.ctx_projection = nn.Linear(ctx_emb_dim, n_shared)
-        self.cls_projection = nn.Linear(cls_emb_dim, n_shared)
+        if linear_ctx_proj:
+            self.ctx_projection = nn.Linear(ctx_emb_dim, n_shared)
+        else:
+            self.ctx_projection = nn.Sequential(
+                nn.Linear(ctx_emb_dim, n_hidden),
+                nn.GELU(),
+                nn.Linear(n_hidden, n_shared)
+            )
+        if linear_cls_proj:
+            self.cls_projection = nn.Linear(cls_emb_dim, n_shared)
+        else:
+            self.cls_projection = nn.Sequential(
+                nn.Linear(cls_emb_dim, n_hidden),
+                nn.GELU(),
+                nn.Linear(n_hidden, n_shared)
+            )
+
+        # --------- FiLM ------------
+        self.film = FiLM(n_shared, context_dim=n_shared)
 
         # --------- Dropout ---------
         self.dropout = nn.Dropout(p=dropout_rate)
 
     @property
     def ctx_temperature(self) -> torch.Tensor:
-        return 1.0 / self._ctx_temperature.clamp(-1, 4.6).exp()
+        return 1.0 / self._ctx_temperature.clamp(0.7, 2.5).exp()
 
     @property
     def cls_temperature(self) -> torch.Tensor:
-        return 1.0 / self._cls_temperature.clamp(-1, 4.6).exp()
+        return 1.0 / self._cls_temperature.clamp(0.7, 2.5).exp()
+    
+    @property
+    def joint_temperature(self) -> torch.Tensor:
+        return 1.0 / self._joint_temperature.clamp(0.7, 2.5).exp()
 
     def forward(
         self,
         z: torch.Tensor,
+        ctx_idx: torch.Tensor,
         ctx_emb: torch.Tensor,
+        cls_idx: torch.Tensor,
         cls_emb: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """
         Parameters
         ----------
         z : Tensor, shape (B, latent_dim)
+        ctx_idx : Tensor, shape (B,)
         ctx_emb : Tensor, shape (N_ctx, ctx_emb_dim)
+        cls_idx : Tensor, shape (B,)
         cls_emb : Tensor, shape (N_cls, cls_emb_dim)
         """
         B = z.size(0)
         ctx_emb, cls_emb = ctx_emb.to(z.device), cls_emb.to(z.device)
 
         # ----- Latent projection -----
-        if self.use_joint_projection:
-            h = self.latent_projection(z)
-            h_ctx, h_cls = h, h
-        else:
-            h_ctx = self.z_ctx_projection(z)
-            h_cls = self.z_cls_projection(z)
+        h = self.latent_projection(z)
 
         if self.dropout_rate > 0:
-            h_ctx = self.dropout(h_ctx)
-            h_cls = self.dropout(h_cls)
+            h = self.dropout(h)
 
         # ----- External projections -----
-        c_ctx = self.ctx_projection(ctx_emb)
-        c_cls = self.cls_projection(cls_emb)
+        c_ctx = self.ctx_projection(ctx_emb)        # (N_ctx, D)
+        c_cls = self.cls_projection(cls_emb)        # (N_cls, D)
+        # Compute joint projection with batch representations
+        b_ctx = c_ctx[ctx_idx.squeeze(-1)]
+        b_cls = c_cls[cls_idx.squeeze(-1)]
+        c_joint = b_ctx + b_cls + (b_ctx * b_cls)   # (B, D)
+        # Use FiLM modulation for context
+        h_mod = self.film(h, b_ctx)
 
         # Optional noise regularization
         if self.noise_sigma is not None and self.noise_sigma > 0:
@@ -1439,55 +1524,121 @@ class ContextClassAligner(nn.Module):
             c_cls = c_cls + self.noise_sigma * noise_cls
 
         # Normalize
-        h_ctx_norm, h_cls_norm = F.normalize(h_ctx, dim=-1), F.normalize(h_cls, dim=-1)
-        c_ctx_norm, c_cls_norm = F.normalize(c_ctx, dim=-1), F.normalize(c_cls, dim=-1)
+        h_norm = F.normalize(h_mod, dim=-1)
+        c_ctx_norm = F.normalize(c_ctx, dim=-1)
+        c_cls_norm = F.normalize(c_cls, dim=-1)
+        c_joint_norm = F.normalize(c_joint, dim=-1)
 
-        # ---------------------------------------------------------------------
-        #  Alignment: Cross-attention or cosine
-        # ---------------------------------------------------------------------
-        if self.use_cross_attention:
-            # ---- Context attention ----
-            q_ctx = h_ctx.unsqueeze(1)                                # (B, 1, d)
-            k_ctx = c_ctx_norm.unsqueeze(0).expand(B, -1, -1)          # (B, N_ctx, d)
-            v_ctx = c_ctx.unsqueeze(0).expand(B, -1, -1)
-            scores_ctx = (q_ctx @ k_ctx.transpose(1, 2)) / math.sqrt(c_ctx.size(-1))
-            attn_ctx = F.softmax(scores_ctx, dim=-1)
-            z_ctx = (attn_ctx @ v_ctx).squeeze(1)
-            logits_ctx = attn_ctx.squeeze(1) / self.ctx_temperature
-
-            # ---- Class attention ----
-            q_cls = h_cls.unsqueeze(1)
-            k_cls = c_cls_norm.unsqueeze(0).expand(B, -1, -1)
-            v_cls = c_cls.unsqueeze(0).expand(B, -1, -1)
-            scores_cls = (q_cls @ k_cls.transpose(1, 2)) / math.sqrt(c_cls.size(-1))
-            attn_cls = F.softmax(scores_cls, dim=-1)
-            z_cls = (attn_cls @ v_cls).squeeze(1)
-            logits_cls = attn_cls.squeeze(1) / self.cls_temperature
-
-            # fused latent (optional)
-            z_proj = F.normalize(0.5 * (z_ctx + z_cls), dim=-1)
-        else:
-            # Cosine similarity
-            logits_ctx = (h_ctx_norm @ c_ctx_norm.T) / self.ctx_temperature
-            logits_cls = (h_cls_norm @ c_cls_norm.T) / self.cls_temperature
-            # Combine hs, works the same if joint encoder is used
-            z_proj = F.normalize(0.5 * (h_ctx_norm + h_cls_norm), dim=-1)
+        # Alignment via cosine similarity
+        logits_ctx = (h_norm @ c_ctx_norm.T) / self.ctx_temperature
+        logits_cls = (h_norm @ c_cls_norm.T) / self.cls_temperature
+        # Joint alignment
+        logits_joint = (h_norm @ c_joint_norm.T) / self.joint_temperature
 
         # Outputs
         outputs = {
-            MODULE_KEYS.Z_SHARED_KEY: z_proj,
+            MODULE_KEYS.Z_SHARED_KEY: h_norm,
             MODULE_KEYS.CTX_LOGITS_KEY: logits_ctx,
             MODULE_KEYS.CLS_LOGITS_KEY: logits_cls,
+            MODULE_KEYS.JOINT_LOGITS_KEY: logits_joint,
         }
 
         if self.return_projections:
             outputs.update({
                 MODULE_KEYS.CTX_PROJ_KEY: c_ctx,
                 MODULE_KEYS.CLS_PROJ_KEY: c_cls,
-                MODULE_KEYS.H_CTX_KEY: h_ctx,
-                MODULE_KEYS.H_CLS_KEY: h_cls,
+                MODULE_KEYS.JOINT_PROJ_KEY: c_joint,
             })
         return outputs
+    
+    @torch.no_grad()
+    def precompute_joint_bank(
+            self, 
+            ctx_emb: torch.Tensor, 
+            cls_emb: torch.Tensor, 
+            device: str = None,
+            cache: bool = True,
+        ):
+        import logging
+        logging.info('Precomputing joint embeddings.')
+        ctx_emb = ctx_emb.to(device or next(self.parameters()).device)
+        cls_emb = cls_emb.to(device or next(self.parameters()).device)
+
+        # Project to shared space
+        c_ctx = F.normalize(self.ctx_projection(ctx_emb), dim=-1)
+        c_cls = F.normalize(self.cls_projection(cls_emb), dim=-1)
+
+        # Build joint combinations
+        c_joint = c_ctx.unsqueeze(1) + c_cls.unsqueeze(0) + (c_ctx.unsqueeze(1) * c_cls.unsqueeze(0))
+        c_joint = F.normalize(c_joint.view(-1, c_joint.size(-1)), dim=-1)
+
+        # Cache on module
+        if cache:
+            self.c_joint_bank = c_joint.detach()
+            self.n_ctx_cls[:] = torch.tensor([c_ctx.size(0), c_cls.size(0)], device=self.n_ctx_cls.device)
+            return
+        else:
+            return c_joint
+    
+    @torch.no_grad()
+    def classify(
+        self,
+        z: torch.Tensor,
+        ctx_emb: torch.Tensor,
+        cls_emb: torch.Tensor,
+        temperature: float | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Compute cosine similarities between query latent(s) and all joint embeddings
+        for inference-time classification.
+
+        Parameters
+        ----------
+        z : Tensor, (B, latent_dim)
+            Query latent(s) to classify.
+        ctx_emb : Tensor, (N_ctx, ctx_emb_dim)
+            External context embeddings.
+        cls_emb : Tensor, (N_cls, cls_emb_dim)
+            External class embeddings.
+        temperature : Optional[float]
+            If given, overrides learned temperature.
+        topk : int
+            Number of top predictions to return.
+
+        Returns
+        -------
+        dict[str, Tensor]
+        """
+        # ---- Project ----
+        import pdb
+        pdb.set_trace()
+        z_proj = F.normalize(self.latent_projection(z), dim=-1)
+        
+        # ---- Compute all possible joint embeddings ----
+        # Cache embeddings if possible
+        diff_n = (self.n_ctx_cls != torch.tensor([ctx_emb.size(0), cls_emb.size(0)], device=self.n_ctx_cls.device)).any()
+        if getattr(self, 'c_joint_bank', None) is None or diff_n:
+            # Re-compute embeddings
+            self.precompute_joint_bank(ctx_emb, cls_emb)
+        # Get embeddings
+        c_joint = self.c_joint_bank
+        # ---- Similarity scores ----
+        T = temperature if temperature is not None else self.joint_temperature
+        logits = (z_proj @ c_joint.T) / T  # (B, N_ctx * N_cls)
+        # --- Compute joint softmax ---
+        logits = F.softmax(logits, dim=-1)  # (B, N_ctx * N_cls)
+        # --- Reshape into 3D (B, N_ctx, N_cls) ---
+        p_joint = logits.view(z.size(0), ctx_emb.size(0), cls_emb.size(0))
+        # --- Marginalize ---
+        ctx_logits = p_joint.sum(dim=-1)   # (B, N_ctx)
+        cls_logits = p_joint.sum(dim=-2)   # (B, N_cls)
+        # ---- Return result object ----
+        return {
+            MODULE_KEYS.Z_SHARED_KEY: z_proj,
+            MODULE_KEYS.JOINT_LOGITS_KEY: logits,
+            MODULE_KEYS.CTX_LOGITS_KEY: ctx_logits,
+            MODULE_KEYS.CLS_LOGITS_KEY: cls_logits,
+        }
 
 
 class EmbeddingAligner(nn.Module):
@@ -1506,7 +1657,7 @@ class EmbeddingAligner(nn.Module):
         funnel: bool = True,
         use_batch_norm: bool = False,
         use_layer_norm: bool = True,
-        activation_fn: nn.Module = nn.LeakyReLU,
+        activation_fn: nn.Module = nn.GELU,
         class_embed_dim: int = 128,
         shared_projection_dim: int | None = None,
         skip_projection: bool = False,

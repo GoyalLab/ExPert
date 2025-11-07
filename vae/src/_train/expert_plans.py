@@ -4,7 +4,7 @@ import torch
 import torchmetrics.functional as tmf
 import torch.nn.functional as F
 
-from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS
+from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS, PREDICTION_KEYS
 from src.utils.io import to_tensor
 from scvi.train import TrainingPlan
 from scvi.module.base import BaseModuleClass, LossOutput
@@ -220,14 +220,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Only cache every n epoch
         if self.full_log_every_n_epoch > 0 and self.current_epoch % self.full_log_every_n_epoch == 0:
             # Stop caching training steps after limit is reached
-            if mode == 'train' and len(self.epoch_cache[mode]['embeddings']) > self.n_train_step_cache:
+            if mode == 'train' and len(self.epoch_cache[mode][MODULE_KEYS.Z_KEY]) > self.n_train_step_cache:
                 return
-            self.epoch_cache[mode]['embeddings'].append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
-            self.epoch_cache[mode]['labels'].append(loss_output.true_labels.cpu())
-            self.epoch_cache[mode]['covs'].append(batch[REGISTRY_KEYS.BATCH_KEY].cpu())
+            self.epoch_cache[mode][MODULE_KEYS.Z_KEY].append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
+            self.epoch_cache[mode][MODULE_KEYS.Z_SHARED_KEY].append(inference_outputs[MODULE_KEYS.Z_SHARED_KEY].cpu())
+            self.epoch_cache[mode][REGISTRY_KEYS.LABELS_KEY].append(loss_output.true_labels.cpu())
+            self.epoch_cache[mode][REGISTRY_KEYS.BATCH_KEY].append(batch[REGISTRY_KEYS.BATCH_KEY].cpu())
             if loss_output.logits is not None:
-                self.epoch_cache[mode]['predicted_labels'].append(torch.argmax(loss_output.logits, dim=-1).cpu())
-                self.epoch_cache[mode]['logits'].append(loss_output.logits.cpu())
+                self.epoch_cache[mode][PREDICTION_KEYS.PREDICTION_KEY].append(torch.argmax(loss_output.logits, dim=-1).cpu())
+                self.epoch_cache[mode][MODULE_KEYS.CLS_LOGITS_KEY].append(loss_output.logits.cpu())
 
     def _process_epoch_cache(self, mode: str) -> dict[str, np.ndarray]:
         """Process and clear the epoch cache, returning concatenated arrays."""
@@ -237,14 +238,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             
         # Concatenate all cached tensors
         processed = {
-            'embeddings': torch.cat(cache['embeddings'], dim=0).numpy(),
-            'labels': torch.cat(cache['labels'], dim=0).numpy().squeeze(),
-            'covs': torch.cat(cache['covs'], dim=0).numpy().squeeze(),
+            MODULE_KEYS.Z_KEY: torch.cat(cache[MODULE_KEYS.Z_KEY], dim=0).numpy(),
+            MODULE_KEYS.Z_SHARED_KEY: torch.cat(cache[MODULE_KEYS.Z_SHARED_KEY], dim=0).numpy(),
+            REGISTRY_KEYS.LABELS_KEY: torch.cat(cache[REGISTRY_KEYS.LABELS_KEY], dim=0).numpy().squeeze(),
+            REGISTRY_KEYS.BATCH_KEY: torch.cat(cache[REGISTRY_KEYS.BATCH_KEY], dim=0).numpy().squeeze(),
         }
         
-        if cache.get('predicted_labels', []):
-            processed['predicted_labels'] = torch.cat(cache['predicted_labels'], dim=0).numpy().squeeze()
-            processed['logits'] = torch.cat(cache['logits'], dim=0).numpy().squeeze()
+        if cache.get(PREDICTION_KEYS.PREDICTION_KEY, []):
+            processed[PREDICTION_KEYS.PREDICTION_KEY] = torch.cat(cache[PREDICTION_KEYS.PREDICTION_KEY], dim=0).numpy().squeeze()
+            processed[MODULE_KEYS.CLS_LOGITS_KEY] = torch.cat(cache[MODULE_KEYS.CLS_LOGITS_KEY], dim=0).numpy().squeeze()
         
         # Add to historical cache
         for k, v in processed.items():
@@ -253,7 +255,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             if len(self.history_cache[mode][k]) > self.cache_n_epochs:
                 self.history_cache[mode][k].pop(0)
         # Add mode to output data
-        processed['mode'] = np.repeat(mode, processed['labels'].shape[0])
+        processed[REGISTRY_KEYS.SPLIT_KEY] = np.repeat(mode, processed[REGISTRY_KEYS.LABELS_KEY].shape[0])
         # Clear epoch cache
         self.epoch_cache[mode].clear()
         
@@ -573,6 +575,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Log model temperatures
         ctx_temp = getattr(self.module.aligner, 'ctx_temperature', None)
         cls_temp = getattr(self.module.aligner, 'cls_temperature', None)
+        joint_temperature = getattr(self.module.aligner, 'joint_temperature', None)
         sigma = getattr(self.module.aligner, 'noise_sigma', None)
 
         if ctx_temp:
@@ -587,6 +590,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.log(
                 "T_cls_logit",
                 cls_temp,
+                on_epoch=True,
+                batch_size=batch_size,
+                prog_bar=False,
+            )
+        if joint_temperature:
+            self.log(
+                "T_joint_logit",
+                joint_temperature,
                 on_epoch=True,
                 batch_size=batch_size,
                 prog_bar=False,
@@ -664,9 +675,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         with torch.no_grad():
             self._cache_step_data('val', batch, inference_outputs, loss_output)
 
-    def test_step(self, batch, batch_idx):
+    def _test_step(self, batch, batch_idx):
         """Test step for supervised training."""
-        pass
         # Perform full forward pass of model
         inference_outputs, _, loss_output = self.step(batch=batch, batch_idx=batch_idx)
         loss = loss_output.loss
@@ -738,13 +748,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         for mode in modes:
             # Get cached mode data
             mode_data = self._process_epoch_cache(mode)
-            if mode_data is None:
+            if mode_data is None or len(mode_data.keys()) == 0:
                 continue
-            # Save used mode
-            _modes.extend(mode)
             # Calculate performance metrics over entire set
-            if self.log_full:
-                self._log_full_metrics(mode, data)
+            self._log_full_metrics(mode, mode_data)
+            # Save used mode
+            _modes.extend([mode])
             # Combine modes only if we plot
             if len(data) == 0 or not self.plot_umap:
                 data = mode_data
@@ -757,7 +766,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             
         # If data is not empty and we want to plot
         if len(_modes) > 0 and self.plot_umap:
-            # Plot UMAP for all splits
+            # Plot UMAP for all splits TODO: fix full name label
             full_name = '-'.join(_modes) if len(_modes) > 1 else _modes[0]
             self._plt_umap(full_name, data)
 
@@ -769,10 +778,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                     
     def _log_full_metrics(self, mode: str, mode_data: dict[str, np.ndarray]) -> None:
         # Skip logging if no classification is available yet
-        if 'labels' not in mode_data:
+        if PREDICTION_KEYS.PREDICTION_KEY not in mode_data:
             return
-        true_labels = torch.tensor(mode_data.get('labels'))
-        predicted_labels = torch.tensor(mode_data.get('predicted_labels')).squeeze(-1)
+        true_labels = torch.tensor(mode_data.get(REGISTRY_KEYS.LABELS_KEY))
+        predicted_labels = torch.tensor(mode_data.get(PREDICTION_KEYS.PREDICTION_KEY)).squeeze(-1)
         n_classes = self.n_classes
  
         # Check if any classes are outside of training classes, i.e
@@ -809,7 +818,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         )
         # Include top k predictions as well
         if self.top_k > 1:
-            logits = torch.tensor(mode_data.get('logits'))
+            logits = torch.tensor(mode_data.get(MODULE_KEYS.CLS_LOGITS_KEY))
             top_k_acc_key = f'{mode}_full_accuracy_top_{self.top_k}'
             top_k_f1_key = f'{mode}_full_f1{self.top_k}'
             top_k_accuracy = tmf.classification.multiclass_accuracy(
@@ -839,13 +848,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 prog_bar=False,
             )
 
-    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray]):
+    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray], emb_key: str = MODULE_KEYS.Z_SHARED_KEY):
         """Plot umap of latent space in tensorboard logger"""
         import umap
         # Extract data from forward pass
-        embeddings = mode_data['embeddings']
-        labels = mode_data['labels']
-        covs = mode_data['covs']
+        embeddings = mode_data[emb_key]
+        labels = mode_data[REGISTRY_KEYS.LABELS_KEY]
+        covs = mode_data[REGISTRY_KEYS.BATCH_KEY]
         # Look for actual label encoding
         if "_code_to_label" in self.loss_kwargs:
             labels = [self.loss_kwargs["_code_to_label"][l] for l in labels]
@@ -853,7 +862,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             covs = self.batch_labels[covs]
         labels = pd.Categorical(labels)
         covs = pd.Categorical(covs)
-        modes = pd.Categorical(mode_data['mode'])
+        modes = pd.Categorical(mode_data[REGISTRY_KEYS.SPLIT_KEY])
         
         # Create cache structure if it doesn't exist
         if 'umap_cache' not in self.cache:
@@ -935,9 +944,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             bbox_to_anchor=(1.05, 1),
             loc='upper left',
             borderaxespad=0,
+            markerscale=2,
             title="Contexts",
         )
         # Make last plot invisible
         axes[1, 1].set_visible(False)
-        self.logger.experiment.add_figure(f"{mode}_z_umap", fig, self.current_epoch)
+        self.logger.experiment.add_figure(f"{mode}_{emb_key}_umap", fig, self.current_epoch)
         plt.close(fig)

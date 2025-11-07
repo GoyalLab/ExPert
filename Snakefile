@@ -284,7 +284,9 @@ rule add_gene_embedding:
     log:
         os.path.join(LOG, "add_emb.log")
     params:
-        embedding_file = config['gene_embedding'],
+        gene_embedding_file = config['gene_embedding'],
+        ctx_embedding_file = config['context_embedding'],
+        add_emb_for_features = config['add_emb_for_features'],
     resources:
         **get_job_resources(config['resources'], job_name='add_gene_embedding')
     script:

@@ -52,8 +52,10 @@ class _MODULE_KEYS(NamedTuple):
     H_CLS_KEY: str = "h_cls"
     CTX_LOGITS_KEY: str = "ctx_logits"
     CLS_LOGITS_KEY: str = "cls_logits"
+    JOINT_LOGITS_KEY: str = "joint_logits"
     CTX_PROJ_KEY: str = "ctx_proj"
     CLS_PROJ_KEY: str = "cls_proj"
+    JOINT_PROJ_KEY: str = "joint_proj"
     # inference (library)
     LIBRARY_KEY: str = "library"
     LABEL_KEY: str = "label"
@@ -96,6 +98,7 @@ class _LOSS_KEYS_NT(NamedTuple):
     ADV_LOSS: str = "adversial_context_loss"
     UNSCALED_LOSS: str = "unscaled_loss"
     CTX_CLS_LOSS: str = "ctx_loss"
+    JOINT_LOSS: str = "joint_loss"
     PSEUDO_Z_LOSS: str = "pseudo_z_loss"
     MANIFOLD_REG_LOSS: str = "manifold_reg_loss"
     # Data keys
@@ -120,6 +123,8 @@ class _PREDICTION_KEYS_NT(NamedTuple):
     SOFT_PREDICTION_KEY: str = "soft_predictions"
     CTX_PREDICTION_KEY: str = "ctx_prediction"
     CTX_SOFT_PREDICTION_KEY: str = "ctx_soft_prediction"
+    JOINT_PREDICTION_KEY: str = "joint_prediction"
+    JOINT_SOFT_PREDICTION_KEY: str = "joint_soft_prediction"
     ZS_KEY: str = "zs"
     WS_KEY: str = "Ws"
     ALIGN_PREDICTION_KEY: str = "aligned_prediction"
@@ -127,6 +132,8 @@ class _PREDICTION_KEYS_NT(NamedTuple):
     Z2C_KEY: str = "z2c"
     C2Z_KEY: str = "c2z"
     # Misc
+    TOP_N_KEY: str = "top_n"
+    TOP_N_COSINE_KEY: str = "top_n_cosine"
     TOP_N_PREDICTION_KEY: str = "top_n_prediction"
     REPORT_KEY: str = "cls_report"
     SUMMARY_KEY: str = "cls_report_summary"

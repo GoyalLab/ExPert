@@ -9,6 +9,7 @@ class _DATA_SHEET_NT(NamedTuple):
     CANCER: str = 'cancer'
     PERTURBATION_TYPE: str = 'perturbation_type'
     CELL_TYPE: str = 'cell type'
+    CONTEXT: str = 'context'
     BYTES: str = 'bytes'
     MEM: str = 'memory'
     MAX_MEM: str = 'max_memory'
@@ -22,6 +23,7 @@ class _OBS_KEYS_NT(NamedTuple):
     POOL_PERTURBATION_KEY: str = 'pool_perturbation'
     POOL_FEATURE_KEY: str = 'pool_feature'
     CTRL_KEY: str = 'control'
+    CONTEXT_KEY: str = 'context'
 
 class _SETTINGS(NamedTuple):
     MT_PERCENT_CANCER: int = 20
@@ -85,7 +87,8 @@ def _strings():
         'correction_method', 
         'merge_method',
         'var_merge',
-        'gene_embedding'
+        'gene_embedding',
+        'context_embedding'
     ]
 
 def _ints():
