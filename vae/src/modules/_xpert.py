@@ -303,6 +303,7 @@ class XPert(VAE):
         use_posterior_mean: bool | None = None,
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
+        inference: bool = False,
     ) -> dict[str, torch.Tensor | Distribution | None]:
         """Run the regular inference process."""
         x_ = x
@@ -367,11 +368,17 @@ class XPert(VAE):
         # Optionally use different embeddings, fall back to internals if none are given
         ctx_emb = ctx_emb if ctx_emb is not None else self.ctx_emb.weight
         cls_emb = cls_emb if cls_emb is not None else self.cls_emb.weight
-        align_out: dict[str, torch.Tensor] = self.aligner(
-            _z, 
-            ctx_emb=ctx_emb, cls_emb=cls_emb,
-            ctx_idx=batch_index, cls_idx=label
-        )
+        # Use regular alignment
+        if not inference:
+            align_out: dict[str, torch.Tensor] = self.aligner(
+                _z, 
+                ctx_emb=ctx_emb, cls_emb=cls_emb,
+                ctx_idx=batch_index, cls_idx=label
+            )
+        else:
+            align_out: dict[str, torch.Tensor] = self.aligner.classify(
+                z=_z, ctx_emb=ctx_emb, cls_emb=cls_emb,
+            )
         # Add alignment output to inference
         inference_out.update(align_out)
 
@@ -515,6 +522,7 @@ class XPert(VAE):
         inference_outputs: dict[str, torch.Tensor] | None = None,
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
+        inference: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass through the encoder and classifier.
@@ -539,21 +547,18 @@ class XPert(VAE):
         Before v1.1, this method by default returned probabilities per label,
         see #2301 for more details.
         """
-        # Try caching inference
+        # Try caching inference and recalculate if missing
         if inference_outputs is None:
-            inference_outputs = self.inference(x, batch_index, label, g, cont_covs, cat_covs, use_posterior_mean=use_posterior_mean)
-        # Set embeddings
-        ctx_emb = ctx_emb if ctx_emb is not None else self.ctx_emb.weight
-        cls_emb = cls_emb if cls_emb is not None else self.cls_emb.weight
-        # Use posterior mean or sampled z
-        qz = inference_outputs[MODULE_KEYS.QZ_KEY]
-        z = qz.loc if use_posterior_mean else inference_outputs[MODULE_KEYS.Z_KEY]
-        # Call alignment classification
-        cls_out = self.aligner.classify(
-            z=z, ctx_emb=ctx_emb, cls_emb=cls_emb
-        )
-        # Add alignment output to inference
-        inference_outputs.update(cls_out)
+            inference_outputs = self.inference(
+                x, 
+                batch_index, 
+                label, 
+                g, 
+                cont_covs, 
+                cat_covs, 
+                use_posterior_mean=use_posterior_mean, 
+                inference=inference
+            )
         return inference_outputs
     
     def _reduce_loss(self, loss: torch.Tensor, reduction: str) -> torch.Tensor:

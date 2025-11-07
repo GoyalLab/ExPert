@@ -1610,9 +1610,11 @@ class ContextClassAligner(nn.Module):
         dict[str, Tensor]
         """
         # ---- Project ----
-        import pdb
-        pdb.set_trace()
         z_proj = F.normalize(self.latent_projection(z), dim=-1)
+        # Project to shared space
+        c_ctx = F.normalize(self.ctx_projection(ctx_emb), dim=-1)
+        c_cls = F.normalize(self.cls_projection(cls_emb), dim=-1)
+
         
         # ---- Compute all possible joint embeddings ----
         # Cache embeddings if possible
@@ -1638,6 +1640,9 @@ class ContextClassAligner(nn.Module):
             MODULE_KEYS.JOINT_LOGITS_KEY: logits,
             MODULE_KEYS.CTX_LOGITS_KEY: ctx_logits,
             MODULE_KEYS.CLS_LOGITS_KEY: cls_logits,
+            MODULE_KEYS.CTX_PROJ_KEY: c_ctx,
+            MODULE_KEYS.CLS_PROJ_KEY: c_cls,
+            MODULE_KEYS.JOINT_PROJ_KEY: c_joint,
         }
 
 

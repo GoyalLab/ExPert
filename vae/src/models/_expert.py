@@ -535,6 +535,8 @@ class ExPert(
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         return_latents: bool = True,
+        inference: bool = True,
+        verbose: bool = True,
         **kwargs
     ) -> dict[str, pd.DataFrame | np.ndarray]:
         """Return cell label predictions.
@@ -552,6 +554,7 @@ class ExPert(
             labels. Otherwise, uses a sample from the posterior distribution - this
             means that the predictions will be stochastic.
         """
+        from tqdm import tqdm
         # Check if model has been trained
         self._check_if_trained(warn=False)
         # Log usage of gene embeddings
@@ -585,10 +588,13 @@ class ExPert(
         else:
             cls_labels = self.idx_to_label
             cls_emb = self.module.cls_emb.weight
-        # Register embedding interactions
-        self.module.aligner.precompute_joint_bank(ctx_emb, cls_emb)
-        log.info(f'Classifying.')
         
+        # Use aligner classify mode
+        if inference:
+            # Register embedding interactions
+            self.module.aligner.precompute_joint_bank(ctx_emb, cls_emb)
+        
+        log.info(f'Classifying.')
         # Collect batch logits
         ctx_logits = []
         cls_logits = []
@@ -600,9 +606,14 @@ class ExPert(
         # Collect batch labels
         data_ctx_labels = []
         data_cls_labels = []
+        # Add progress bar to classification if toggled
+        if verbose:
+            dl_it = tqdm(enumerate(scdl))
+        else:
+            dl_it = enumerate(scdl)
         # Run through each batch of data
         with torch.no_grad():
-            for _, tensors in enumerate(scdl):
+            for _, tensors in dl_it:
                 # Unpack batch tensor
                 x = tensors.get(REGISTRY_KEYS.X_KEY)
                 l = tensors[REGISTRY_KEYS.LABELS_KEY].squeeze(-1)
@@ -631,49 +642,38 @@ class ExPert(
                     cont_covs=cont_covs,
                     use_posterior_mean=use_posterior_mean,
                     inference_outputs=inference_outputs,
+                    inference=inference,
                 )
                 # Unpack context and perturbation classification output
-                _ctx_logits = cls_output[MODULE_KEYS.CTX_LOGITS_KEY]
-                _cls_logits = cls_output[MODULE_KEYS.CLS_LOGITS_KEY]
-                _joint_logits = cls_output[MODULE_KEYS.JOINT_LOGITS_KEY]
+                _ctx_logits = cls_output[MODULE_KEYS.CTX_LOGITS_KEY].cpu()
+                _cls_logits = cls_output[MODULE_KEYS.CLS_LOGITS_KEY].cpu()
                 # Add batch predictions to overall predictions
-                ctx_logits.append(_ctx_logits.detach().cpu())
-                cls_logits.append(_cls_logits.detach().cpu())
-                joint_logits.append(_joint_logits.detach().cpu())
+                ctx_logits.append(_ctx_logits)
+                cls_logits.append(_cls_logits)
                 # Unpack shared latent spaces
-                _z_shared = cls_output[MODULE_KEYS.Z_SHARED_KEY]
-                _ctx2z = cls_output[MODULE_KEYS.CTX_PROJ_KEY]
-                _cls2z = cls_output[MODULE_KEYS.CLS_PROJ_KEY]
-                z_shared.append(_z_shared.detach().cpu())
-                ctx2z.append(_ctx2z.detach().cpu())
-                cls2z.append(_cls2z.detach().cpu())
+                _z_shared = cls_output[MODULE_KEYS.Z_SHARED_KEY].cpu()
+                _ctx2z = cls_output[MODULE_KEYS.CTX_PROJ_KEY].cpu()
+                _cls2z = cls_output[MODULE_KEYS.CLS_PROJ_KEY].cpu()
+                z_shared.append(_z_shared)
+                ctx2z.append(_ctx2z)
+                cls2z.append(_cls2z)
                 # Collect labels
-                data_ctx_labels.append(batch.detach().cpu())
-                data_cls_labels.append(l.detach().cpu())
-                del cls_output
+                data_ctx_labels.append(batch.cpu())
+                data_cls_labels.append(l.cpu())
+                # ---- CLEANUP ----
+                del cls_output, x, l, batch
+                torch.cuda.empty_cache()
         
+        log.info(f'Aggregating predictions')
         # Concatenate batch results
         ctx_logits = torch.cat(ctx_logits).numpy()
         cls_logits = torch.cat(cls_logits).numpy()
-        # Compute joint soft predictions
-        soft_joint = F.softmax(torch.cat(joint_logits), dim=-1).numpy()
         z_shared = torch.cat(z_shared).numpy()
         ctx2z = torch.stack(ctx2z, dim=0).mean(0).numpy()
         cls2z = torch.stack(cls2z, dim=0).mean(0).numpy()
         data_ctx_labels = torch.cat(data_ctx_labels).numpy()
         data_cls_labels = torch.cat(data_cls_labels).numpy()
-        
-        # Create joint label list like ["ctx|cls", ...]
-        joint_labels = [f"{c}|{g}" for c in ctx_labels for g in cls_labels]
 
-        # Soft predictions DataFrame
-        joint_soft_predictions = pd.DataFrame(
-            soft_joint,
-            columns=joint_labels[:soft_joint.shape[-1]],
-            index=adata.obs_names[indices],
-        )
-        # Get hard predictions
-        joint_predictions = joint_soft_predictions.columns[np.argmax(joint_soft_predictions.values, axis=-1)]
         # Add context predictions
         ctx_soft_predictions = pd.DataFrame(
             ctx_logits,
@@ -695,8 +695,6 @@ class ExPert(
             PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY: ctx_soft_predictions,
             PREDICTION_KEYS.PREDICTION_KEY: cls_predictions,
             PREDICTION_KEYS.SOFT_PREDICTION_KEY: cls_soft_predictions,
-            PREDICTION_KEYS.JOINT_PREDICTION_KEY: joint_predictions,
-            PREDICTION_KEYS.JOINT_SOFT_PREDICTION_KEY: joint_soft_predictions,
             REGISTRY_KEYS.BATCH_KEY: data_ctx_labels,
             REGISTRY_KEYS.LABELS_KEY: data_cls_labels,
         }
@@ -1342,7 +1340,11 @@ class ExPert(
             self.minify_query(test_ad)
         # Get model predictions for test data
         use_full = None if not incl_unseen else True
-        prediction_output = self.predict(adata=test_ad, use_full_cls_emb=use_full, return_latents=True)
+        prediction_output = self.predict(
+            adata=test_ad, 
+            use_full_cls_emb=use_full, 
+            return_latents=True,
+        )
         # Save predictions to test adata
         predictions = prediction_output[PREDICTION_KEYS.PREDICTION_KEY]
         test_ad.obs[PREDICTION_KEYS.PREDICTION_KEY] = predictions
