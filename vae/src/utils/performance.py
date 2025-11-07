@@ -136,13 +136,14 @@ def calculate_metrics_for_group(
         random_max_idx: np.ndarray, 
         predictions: pd.DataFrame, 
         top_n: int, 
-        lib: dict | None
+        lib: dict | None,
+        cls_label: str = 'perturbation'
     ) -> pd.DataFrame:
     """Calculate metrics for a specific group and top_n value."""
     idx = np.where(tmp_mask)[0]
     tmp = adata[tmp_mask]
     y = y[idx]
-    labels = tmp.obs.cls_label.values
+    labels = tmp.obs[cls_label].values
     
     # Get top predictions and hits
     top_predictions = max_idx[idx,-top_n:]
@@ -190,7 +191,7 @@ def compute_top_n_predictions(
         labels_key: str = 'cls_label',
         ctrl_key: str | None = None,
         n: int = 20, 
-        lib: dict | None = None,
+        use_pathways: bool = False,
         train_perturbations: list[str] | None = None, 
         predictions_key: str = 'soft_predictions'
     ) -> pd.DataFrame:
@@ -200,6 +201,11 @@ def compute_top_n_predictions(
         _adata = adata[adata.obs[labels_key]!=ctrl_key]
     else:
         _adata = adata
+    # Create pathway library if toggled
+    if use_pathways:
+        lib = build_gene2pathways(genes=predictions.columns.values)
+    else:
+        lib = None
     # Extract soft predictions from adata
     predictions = _adata.obsm[predictions_key]
     # Match actual to prediction label indices
@@ -212,6 +218,7 @@ def compute_top_n_predictions(
     # Collect top n predictions for all groups
     top_n_predictions = []
     splits = [None] if split_key is None else _adata.obs[split_key].unique()
+
     # Process each data split individually
     for split in splits:
         split_mask = slice(None) if split is None else (_adata.obs[split_key] == split)
@@ -230,7 +237,8 @@ def compute_top_n_predictions(
                     random_max_idx=random_max_idx[split_mask], 
                     predictions=predictions, 
                     top_n=top_n,
-                    lib=lib
+                    lib=lib,
+                    cls_label=labels_key
                 )
                 metrics['top_n'] = top_n
                 metrics[context_key] = ct

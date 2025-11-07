@@ -442,8 +442,6 @@ class ExPert(
         from torch.distributions import Normal
         from torch.nn.functional import softmax
 
-        from scvi.module._constants import MODULE_KEYS
-
         # Check if model has been trained
         self._check_if_trained(warn=False)
         # Check if both adata and another dataloader are given
@@ -468,6 +466,7 @@ class ExPert(
             )
 
         zs: list[Tensor] = []
+        zs_shared: list[Tensor] = []
         qz_means: list[Tensor] = []
         qz_vars: list[Tensor] = []
         with torch.no_grad():
@@ -485,24 +484,30 @@ class ExPert(
                     qzm: Tensor = outputs.get(MODULE_KEYS.QZM_KEY)
                     qzv: Tensor = outputs.get(MODULE_KEYS.QZV_KEY)
                     qz: Distribution = Normal(qzm, qzv.sqrt())
-
-                if return_dist:
-                    qz_means.append(qzm.cpu())
-                    qz_vars.append(qzv.cpu())
-                    continue
-
+                # Collect distribution parameters
+                qz_means.append(qzm.cpu())
+                qz_vars.append(qzv.cpu())
+                # Get z latent space
                 z: Tensor = qzm if give_mean else outputs.get(MODULE_KEYS.Z_KEY)
-
+                # Get shared latent space
+                zshared: Tensor = outputs.get(MODULE_KEYS.Z_SHARED_KEY)
                 if give_mean and getattr(self.module, "latent_distribution", None) == "ln":
                     samples = qz.sample([mc_samples])
                     z = softmax(samples, dim=-1).mean(dim=0)
-
+                # Collect tensors
                 zs.append(z.cpu())
-
+                zs_shared.append(zshared.cpu())
+        # Return output dictionary
+        o = {
+            MODULE_KEYS.Z_KEY: torch.cat(zs).numpy(),
+            MODULE_KEYS.Z_SHARED_KEY: torch.cat(zs_shared).numpy()
+        }
         if return_dist:
-            return torch.cat(qz_means).numpy(), torch.cat(qz_vars).numpy()
-        else:
-            return torch.cat(zs).numpy()
+            o.update({
+                MODULE_KEYS.QZM_KEY: torch.cat(qz_means).numpy(), 
+                MODULE_KEYS.QZV_KEY: torch.cat(qz_vars).numpy()
+            })
+        return o 
         
     def validate_ctx_emb(self, ctx_emb: torch.Tensor):
         # Extract labels if it's a dataframe
@@ -591,6 +596,7 @@ class ExPert(
         
         # Use aligner classify mode
         if inference:
+            log.info(f'Using inference mode (joint prediction).')
             # Register embedding interactions
             self.module.aligner.precompute_joint_bank(ctx_emb, cls_emb)
         
@@ -598,7 +604,6 @@ class ExPert(
         # Collect batch logits
         ctx_logits = []
         cls_logits = []
-        joint_logits = []
         # Collect batch z shared
         z_shared = []
         ctx2z = []
@@ -1043,9 +1048,9 @@ class ExPert(
         if self._LATENT_QZM_KEY in self.adata.obsm and not force:
             return
         # Run inference and assign it to model adata
-        qzm, qzv = self.get_latent_representation(return_dist=True)
-        self.adata.obsm[self._LATENT_QZM_KEY] = qzm
-        self.adata.obsm[self._LATENT_QZV_KEY] = qzv
+        latent_out = self.get_latent_representation(return_dist=True)
+        self.adata.obsm[self._LATENT_QZM_KEY] = latent_out[MODULE_KEYS.QZM_KEY]
+        self.adata.obsm[self._LATENT_QZV_KEY] = latent_out[MODULE_KEYS.QZV_KEY]
 
     def _register_split_labels(self, force: bool = True) -> None:
         """Add split label to self.adata.obs"""
@@ -1282,6 +1287,7 @@ class ExPert(
         top_n: int = 10,
         ctrl_key: str | None = None,
         minify: bool = False,
+        use_pathways: bool = False,
         seed: int = 42,
         **kwargs
     ) -> None:
@@ -1298,9 +1304,9 @@ class ExPert(
         train_cls = set(self.get_training_classes())
         test_cls = set(test_ad.obs[cls_label].unique())
         available_cls = set(self.idx_to_label)
+        log.info(f'Available classes for prediction: {len(available_cls)}, #observed: {len(train_cls)}')
         # Look for shared classes between testing set and trained data
         shared_cls = test_cls.intersection(train_cls)
-        unseen_cls = test_cls.difference(train_cls)
         test_cls = test_cls.intersection(available_cls)
         # Check if any labels overlap
         if len(test_cls) == 0:
@@ -1317,13 +1323,7 @@ class ExPert(
         # Save original labels
         test_labels = test_ad.obs[cls_label].values
         # Set dataset labels for classification
-        if not use_fixed_dataset_label:
-            log.info('Randomly drawing dataset labels from training data.')
-            training_datasets = self.adata.obs[self.original_batch_key].unique()
-            np.random.seed(seed)
-            ds_names = np.random.choice(training_datasets, test_ad.shape[0])
-            test_ad.obs[batch_label] = pd.Categorical(ds_names)
-        else:
+        if use_fixed_dataset_label or batch_label not in test_ad.obs:
             log.info(f'Added {ds_name} as dataset key.')
             test_ad.obs[batch_label] = ds_name
         # Register new testing data with model
@@ -1331,9 +1331,9 @@ class ExPert(
         # Make sure test adata's features are consistent with model
         test_ad = self.align_model_features(test_ad, inplace=False).copy()
         # Get latent representation of model
-        qzm, qzv = self.get_latent_representation(adata=test_ad, return_dist=True)
-        test_ad.obsm[self._LATENT_QZM_KEY] = qzm
-        test_ad.obsm[self._LATENT_QZV_KEY] = qzv
+        latent_out = self.get_latent_representation(adata=test_ad, return_dist=True)
+        test_ad.obsm[self._LATENT_QZM_KEY] = latent_out[MODULE_KEYS.QZM_KEY]
+        test_ad.obsm[self._LATENT_QZV_KEY] = latent_out[MODULE_KEYS.QZV_KEY]
         # Minify test data
         if minify:
             log.info('Minifying test data.')
@@ -1382,7 +1382,8 @@ class ExPert(
             context_key=batch_label,
             labels_key=cls_label,
             ctrl_key=ctrl_key,
-            train_perturbations=list(train_cls)
+            train_perturbations=list(train_cls),
+            use_pathways=use_pathways
         )
         # Save top n predictions to test adata
         test_ad.uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY] = top_n_predictions
