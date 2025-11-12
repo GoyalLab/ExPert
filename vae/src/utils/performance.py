@@ -267,7 +267,7 @@ def collect_runs(base_dir: str):
     print(f"Found {len(runs)} runs.")
     return runs
 
-def parse_run(cfg_path, summ_path):
+def parse_run(cfg_path, summ_path, split="test", metric="f1-score"):
     # Parse config.yaml
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
@@ -288,30 +288,32 @@ def parse_run(cfg_path, summ_path):
     # Parse summary.csv
     df = pd.read_csv(summ_path)
     # Select validation F1-score
-    val_row = df[(df["split"] == "val") & (df.index == 4)]  # macro avg row (index may vary)
+    val_row = df[(df["split"] == split) & (df.index == 4)]  # macro avg row (index may vary)
     # safer alternative:
-    val_row = df[(df["split"] == "val") & (df.iloc[:,0].astype(str).str.contains("macro avg", case=False))]
-    f1_val = float(val_row["f1-score"].values[0]) if not val_row.empty else np.nan
+    val_row = df[(df["split"] == split) & (df.iloc[:,0].astype(str).str.contains("macro avg", case=False))]
+    f1_val = float(val_row[metric].values[0]) if not val_row.empty else np.nan
 
-    flat_cfg["f1_val"] = f1_val
+    split_metric_key = f"{metric}_{split}"
+    flat_cfg[split_metric_key] = f1_val
     return flat_cfg
 
-def build_dataframe(base_dir: str):
+def build_dataframe(base_dir: str, split: str = "test", metric: str = "f1-score"):
     data = []
     idx = []
+    metric_key = f"{metric}_{split}"
     for cfg_path, summ_path in tqdm(collect_runs(base_dir)):
         try:
-            row = parse_run(cfg_path, summ_path)
+            row = parse_run(cfg_path, summ_path, split=split, metric=metric)
             data.append(row)
             idx.extend([os.path.basename(os.path.dirname(cfg_path))])
         except Exception as e:
             print(f"Error parsing {cfg_path}: {e}")
     df = pd.DataFrame(data, index=idx)
-    df = df.dropna(subset=["f1_val"])
+    df = df.dropna(subset=[metric_key])
     print(f"Final dataset shape: {df.shape}")
     return df
 
-def prepare_features(df, target="f1_val"):
+def prepare_features(df, target="f1_test"):
     # Separate features and target
     X = df.drop(columns=[target])
     y = df[target]
@@ -402,12 +404,13 @@ def pca_plot(X, y):
     plt.tight_layout()
     plt.show()
 
-def analyse_grid_run(run_dir: str, pca: bool = False) -> dict:
+def analyse_grid_run(run_dir: str, pca: bool = False, split: str = "test", metric: str = "f1-score") -> dict:
     """Analyse main performance drivers in grid runs."""
-    df = build_dataframe(run_dir)
-    X, y, feature_names = prepare_features(df)
+    df = build_dataframe(run_dir, split=split, metric=metric)
+    metric_key = f"{metric}_{split}"
+    X, y, feature_names = prepare_features(df, target=metric_key)
     # Sort by performance
-    df.sort_values("f1_val", ascending=False, inplace=True)
+    df.sort_values(metric_key, ascending=False, inplace=True)
 
     # correlation screening
     corr = pd.DataFrame({"feature": feature_names, "corr": [np.corrcoef(X[:,i], y)[0,1] for i in range(X.shape[1])]})

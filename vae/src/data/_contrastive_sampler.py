@@ -30,6 +30,7 @@ class RandomContrastiveBatchSampler(Sampler):
         min_contexts_per_class: int = 2,
         ctrl_class: str | None = None,
         ctrl_frac: float = 1.0,
+        use_copy: bool = True,
     ):
         self.dataset = dataset
         self.epoch = 0
@@ -45,6 +46,8 @@ class RandomContrastiveBatchSampler(Sampler):
         self.ctrl_class = ctrl_class
         self.ctrl_frac = ctrl_frac
         self.batch_sampler_cls = ContrastiveBatchSampler
+        # Whether to always draw from full pool or exhaust indices per batch
+        self.use_copy = use_copy
         # Sample initial indices
         self._idc = self._sample_idc()
         # Determine full batch size if control cells were added
@@ -85,7 +88,7 @@ class RandomContrastiveBatchSampler(Sampler):
             ctrl_class=self.ctrl_class,
             ctrl_frac=self.ctrl_frac,
         )
-        batch_dict = self.sampler.sample(copy=True, return_details=False)
+        batch_dict = self.sampler.sample(copy=self.use_copy, return_details=False)
         # Return sampled class indices if no control cells are given
         return np.array(batch_dict[self.sampler.IDX_KEY])
 
@@ -256,6 +259,7 @@ class ContrastiveBatchSampler:
         self.min_contexts_per_class = min_contexts_per_class
         self.ctrl_class = ctrl_class
         self.ctrl_frac = ctrl_frac
+        self.ctrl_pools = {}
         self.kwargs = kwargs
 
         # Index and label setup

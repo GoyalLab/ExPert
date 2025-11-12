@@ -4,10 +4,12 @@ from src.modules._base import (
     Encoder, 
     DecoderSCVI, 
     ContextClassAligner, 
+    Classifier
 )
 import src.utils.io as io
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS, LOSS_KEYS, PREDICTION_KEYS
 import src.utils.embeddings as emb_utils
+from src.utils.common import grad_reverse
 
 from typing import Iterable
 
@@ -38,6 +40,8 @@ class XPert(VAE):
     """
     _cls_loss_strategies = ['ce', 'focal']
     _align_ext_emb_loss_strategies = ['kl', 'clip']
+    _ctx_key = 'ctx'
+    _cls_key = 'cls'
 
     def __init__(
         self,
@@ -51,6 +55,9 @@ class XPert(VAE):
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         cls_sim: torch.Tensor | None = None,
+        ctrl_class_idx: int | None = None,
+        use_reconstruction_control: bool = False,
+        use_kl_control: bool = True,
         n_continuous_cov: int = 0,
         n_cats_per_cov: Iterable[int] | None = None,
         dropout_rate: float = 0.2,
@@ -60,6 +67,7 @@ class XPert(VAE):
         gene_likelihood: Literal['zinb', 'nb', 'poisson', 'normal'] = 'zinb',
         latent_distribution: Literal['normal', 'ln'] = 'normal',
         decode_covariates: bool = True,
+        decode_context_projection: bool = True,
         decode_shared_space: bool = True,
         deeply_inject_covariates: bool = False,
         use_batch_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'none',
@@ -75,10 +83,16 @@ class XPert(VAE):
         non_elbo_reduction: Literal['mean', 'sum', 'batchmean'] = 'mean',
         use_feature_mask: bool = False,
         drop_prob: float = 1e-3,
+        decay_rate: float = 0.9,
+        use_ctx_adv_cls: bool = True,
+        use_ctrl_cls: bool = True,
         use_semantic_target_weights: bool = True,
-        extra_encoder_kwargs: dict | None = None,
-        extra_decoder_kwargs: dict | None = None,
-        extra_aligner_kwargs: dict | None = None,
+        extra_encoder_kwargs: dict | None = {},
+        extra_decoder_kwargs: dict | None = {},
+        extra_ctx_adv_classifier_kwargs: dict | None = {},
+        extra_aligner_kwargs: dict | None = {},
+        extra_cls_kwargs: dict | None = {},
+        pretrain: bool = False,
         **vae_kwargs
     ):
         # Initialize base model class
@@ -106,6 +120,13 @@ class XPert(VAE):
             **vae_kwargs
         )
 
+        # Setup control index
+        self.ctrl_class_idx = ctrl_class_idx
+        self.use_reconstruction_control = use_reconstruction_control
+        self.use_kl_control = use_kl_control
+        # Update labels, we don't predict control as a class
+        self.n_labels = n_labels if self.ctrl_class_idx is None else n_labels - 1
+
         # Setup l-norm params
         self.l1_lambda = l1_lambda
         self.l2_lambda = l2_lambda
@@ -118,9 +139,17 @@ class XPert(VAE):
         self.min_kl = min_kl
         self.use_posterior_mean = use_posterior_mean
 
+        # Remove control embedding if it exists
+        if self.ctrl_class_idx is not None:
+            no_ctrl_emb_mask = torch.arange(cls_emb.size(0)) != self.ctrl_class_idx
+            cls_emb = cls_emb[no_ctrl_emb_mask]
+
         # Setup embedding params
         self.n_ctx, self.n_ctx_dim = ctx_emb.shape
         self.n_cls, self.n_cls_dim = cls_emb.shape
+        # Save if we have unseen embeddings or not
+        self.has_unseen_ctx = self.n_ctx > n_batch
+        self.has_unseen_cls = self.n_cls > n_labels
         self.n_shared = n_shared
         self.use_semantic_target_weights = use_semantic_target_weights
 
@@ -165,12 +194,21 @@ class XPert(VAE):
         # Whether to decode from z or z_shared TODO: fix that we can actually decode from z_shared, currently does not work because of pz shape mismatch
         self.decode_shared_space = decode_shared_space
         self.decode_covariates = decode_covariates
+        self.decode_context_projection = decode_context_projection
         z_dim = n_shared if decode_shared_space else n_latent
         # Whether to decode covariates
         n_input_decoder = z_dim + n_continuous_cov * decode_covariates
         cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
         decoder_cat_list = cat_list if decode_covariates else None
-        n_ctx_dim_decoder = self.n_ctx_dim if decode_covariates else None
+        n_ctx_dim_decoder = None
+        # Whether to include covariates in decoder
+        if decode_covariates:
+            # Use projected context embedding
+            if decode_context_projection:
+                n_ctx_dim_decoder = self.n_shared
+            # Use raw context embedding
+            else:
+                n_ctx_dim_decoder = self.n_ctx_dim
         # Init actual decoder
         self.decoder = DecoderSCVI(
             n_input=n_input_decoder,
@@ -185,7 +223,24 @@ class XPert(VAE):
             **extra_decoder_kwargs,
         )
 
+        # Setup adversial context classifier
+        if use_ctx_adv_cls:
+            self.ctx_adv_classifier = Classifier(
+                n_input=n_latent,
+                n_labels=self.n_batch,
+                **extra_ctx_adv_classifier_kwargs,
+            )
+        else:
+            self.ctx_adv_classifier = None
+
         # ----- Setup external embedding aligner -----
+
+        # Setup an additional classifier on z, purely supervised
+        self.classifier = Classifier(
+            n_input=n_latent,
+            n_labels=self.n_labels,
+            **extra_cls_kwargs,
+        )
        
         # Setup aligner
         self.aligner = ContextClassAligner(
@@ -209,6 +264,11 @@ class XPert(VAE):
             self.ctx_targets = None
             self.cls_targets = None
 
+        # Set state
+        self.pretrain = pretrain
+
+        # Buffers
+        self.decay_rate = decay_rate
         # ----- Debug -----
         self._step = 0
 
@@ -222,9 +282,9 @@ class XPert(VAE):
     def compute_semantic_embedding_targets(
         self,
         emb: torch.Tensor,
-        eps: float = 1e-8,
         use_gpu: bool = True,
         batch_size: int = 512,
+        batched: bool = False,
     ) -> torch.Tensor:
         """
         Compute class similarity matrix for semantic label smoothing in batches.
@@ -233,7 +293,11 @@ class XPert(VAE):
         """
         device = torch.device("cuda:0" if (use_gpu and torch.cuda.is_available()) else "cpu")
         emb = F.normalize(emb.to(device), dim=-1)
-
+        # Do simple MM if tensor is not too large
+        if not batched:
+            return emb @ emb.T
+        
+        # Do batched version
         N, D = emb.shape
         targets = torch.zeros((N, N), device=device, dtype=emb.dtype)
 
@@ -241,10 +305,7 @@ class XPert(VAE):
             j_end = min(i + batch_size, N)
             # Compute cosine similarity for this batch vs all embeddings
             batch = emb[i:j_end]                       # (B, D)
-            sim = batch @ emb.T                        # (B, N) -> cosine since emb is normalized
-            sim = F.relu(sim)                          # keep positive similarities
-            sim = sim / (sim.sum(dim=-1, keepdim=True) + eps)
-            targets[i:j_end] = sim                     # fill in chunk
+            targets[i:j_end] = batch @ emb.T                       # fill in chunk
 
         return targets
 
@@ -300,10 +361,6 @@ class XPert(VAE):
         cont_covs: torch.Tensor | None = None,
         cat_covs: torch.Tensor | None = None,
         n_samples: int = 1,
-        use_posterior_mean: bool | None = None,
-        ctx_emb: torch.Tensor | None = None,
-        cls_emb: torch.Tensor | None = None,
-        inference: bool = False,
     ) -> dict[str, torch.Tensor | Distribution | None]:
         """Run the regular inference process."""
         x_ = x
@@ -351,39 +408,14 @@ class XPert(VAE):
             else:
                 library = ql.sample((n_samples,))
         # Construct output object
-        final_out = {
+        return {
             MODULE_KEYS.Z_KEY: z,
             MODULE_KEYS.QZ_KEY: qz,
             MODULE_KEYS.QL_KEY: ql,
             MODULE_KEYS.LIBRARY_KEY: library,
-            REGISTRY_KEYS.LABELS_KEY: label
+            REGISTRY_KEYS.LABELS_KEY: label,
+            REGISTRY_KEYS.BATCH_KEY: batch_index
         }
-        # Update initial inference outputs
-        inference_out.update(final_out)
-        
-        # Use model setting by default but overwrite if option is specified (e.g. during inference)
-        use_posterior_mean = self.use_posterior_mean if use_posterior_mean is None else use_posterior_mean
-        # Aligner forward pass using either qz mean or sampled z
-        _z = qz.loc if use_posterior_mean else z
-        # Optionally use different embeddings, fall back to internals if none are given
-        ctx_emb = ctx_emb if ctx_emb is not None else self.ctx_emb.weight
-        cls_emb = cls_emb if cls_emb is not None else self.cls_emb.weight
-        # Use regular alignment
-        if not inference:
-            align_out: dict[str, torch.Tensor] = self.aligner(
-                _z, 
-                ctx_emb=ctx_emb, cls_emb=cls_emb,
-                ctx_idx=batch_index, cls_idx=label
-            )
-        else:
-            align_out: dict[str, torch.Tensor] = self.aligner.classify(
-                z=_z, ctx_emb=ctx_emb, cls_emb=cls_emb,
-            )
-        # Add alignment output to inference
-        inference_out.update(align_out)
-
-        # Return inference outputs
-        return inference_out
     
     def _get_generative_input(
         self,
@@ -401,12 +433,12 @@ class XPert(VAE):
         return {
             MODULE_KEYS.Z_KEY: inference_outputs[z_key],
             MODULE_KEYS.LIBRARY_KEY: inference_outputs[MODULE_KEYS.LIBRARY_KEY],
-            MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
-            MODULE_KEYS.Y_KEY: tensors[REGISTRY_KEYS.LABELS_KEY],
+            MODULE_KEYS.BATCH_INDEX_KEY: inference_outputs[REGISTRY_KEYS.BATCH_KEY],
+            MODULE_KEYS.Y_KEY: inference_outputs[REGISTRY_KEYS.LABELS_KEY],
             MODULE_KEYS.CONT_COVS_KEY: tensors.get(REGISTRY_KEYS.CONT_COVS_KEY),
             MODULE_KEYS.CAT_COVS_KEY: tensors.get(REGISTRY_KEYS.CAT_COVS_KEY),
             MODULE_KEYS.SIZE_FACTOR_KEY: size_factor,
-            PREDICTION_KEYS.CTX_PREDICTION_KEY: tensors.get(PREDICTION_KEYS.CTX_PREDICTION_KEY)
+            MODULE_KEYS.CTX_PROJ_KEY: inference_outputs.get(MODULE_KEYS.CTX_PROJ_KEY),
         }
     
     @auto_move_data
@@ -419,7 +451,7 @@ class XPert(VAE):
         cat_covs: torch.Tensor | None = None,
         size_factor: torch.Tensor | None = None,
         y: torch.Tensor | None = None,
-        ctx_prediction: torch.Tensor | None = None,
+        ctx_proj: torch.Tensor | None = None,
         transform_batch: torch.Tensor | None = None,
     ) -> dict[str, Distribution | None]:
         """Run the generative process."""
@@ -454,8 +486,11 @@ class XPert(VAE):
             size_factor = library
         # Add context embedding to decoder
         if self.decode_covariates:
-            # Get inflated context embeddings for batch
-            ctx_emb = self.ctx_emb(batch_index).reshape(batch_index.shape[0], -1)
+            # Get inflated context embeddings for batch (either projected or raw)
+            if self.decode_context_projection:
+                ctx_emb = ctx_proj[batch_index.squeeze(-1)]
+            else:
+                ctx_emb = self.ctx_emb(batch_index).reshape(batch_index.shape[0], -1)
         else:
             ctx_emb = None
         # Perform decoder forward pass
@@ -518,11 +553,12 @@ class XPert(VAE):
         g: torch.Tensor | None = None,
         cont_covs: torch.Tensor | None = None,
         cat_covs: torch.Tensor | None = None,
-        use_posterior_mean: bool = True,
+        use_posterior_mean: bool | None = None,
         inference_outputs: dict[str, torch.Tensor] | None = None,
+        inference: bool = False,
+        return_logits: bool = True,
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
-        inference: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass through the encoder and classifier.
@@ -555,10 +591,33 @@ class XPert(VAE):
                 label, 
                 g, 
                 cont_covs, 
-                cat_covs, 
-                use_posterior_mean=use_posterior_mean, 
-                inference=inference
+                cat_covs,
             )
+        # Use model setting by default but overwrite if option is specified (e.g. during inference)
+        use_posterior_mean = self.use_posterior_mean if use_posterior_mean is None else use_posterior_mean
+        # Get inference outputs
+        qz = inference_outputs[MODULE_KEYS.QZ_KEY]
+        z = inference_outputs[MODULE_KEYS.Z_KEY]
+        # Aligner forward pass using either qz mean or sampled z
+        _z = qz.loc if use_posterior_mean else z
+        
+        # Optionally use different embeddings, fall back to internals if none are given
+        ctx_emb = ctx_emb if ctx_emb is not None else self.ctx_emb.weight
+        cls_emb = cls_emb if cls_emb is not None else self.cls_emb.weight
+        # Use regular alignment
+        if not inference:
+            align_out: dict[str, torch.Tensor] = self.aligner(
+                _z, 
+                ctx_emb=ctx_emb, cls_emb=cls_emb,
+                ctx_idx=batch_index, cls_idx=label,
+                return_logits=return_logits
+            )
+        else:
+            align_out: dict[str, torch.Tensor] = self.aligner.classify(
+                z=_z, ctx_emb=ctx_emb, ctx_idx=batch_index, cls_emb=cls_emb, return_logits=return_logits
+            )
+        # Add alignment output to inference
+        inference_outputs.update(align_out)
         return inference_outputs
     
     def _reduce_loss(self, loss: torch.Tensor, reduction: str) -> torch.Tensor:
@@ -575,15 +634,17 @@ class XPert(VAE):
     def _ce_semantic(
         self,
         logits: torch.Tensor,
-        target_weights: torch.Tensor,
+        target_sim: torch.Tensor,
+        T: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
         logits: (B, N)
         targets: (B,) integer class labels
-        target_weights: (N, N) semantic smoothing targets from embeddings
+        target_sim: (N, N) semantic smoothing targets from embeddings
         """
+        p = F.softmax(target_sim / T, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
-        return torch.sum(-target_weights * log_probs, dim=-1)
+        return torch.sum(-p * log_probs, dim=-1)
     
     def _clip_loss(
             self, 
@@ -608,9 +669,9 @@ class XPert(VAE):
         # Latent -> class loss, logits are already scaled by classifier
         if self.use_semantic_target_weights and weights is not None:
             # Subset weights
-            target_weights = weights.to(y.device)[y]
+            target_sim = weights.to(y.device)[y]
             # Use embedding similarities as reference for ce
-            loss_z2c = self._ce_semantic(logits, target_weights)
+            loss_z2c = self._ce_semantic(logits, target_sim, T=T)
         else:
             # Use hard one-hot labels as reference for ce
             loss_z2c = F.cross_entropy(logits, y, reduction='none')
@@ -640,16 +701,106 @@ class XPert(VAE):
         p: float = 0.1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Randomly replace some labels with unseen labels to keep zero-shot active.""" 
-        ctx_idx = emb_utils.replace_with_unseen_labels(ctx_idx, n_seen=self.n_batch, n_total=self.n_ctx, p=p)
-        cls_idx = emb_utils.replace_with_unseen_labels(cls_idx, n_seen=self.n_labels, n_total=self.n_cls, p=p)
+        if self.has_unseen_ctx:
+            ctx_idx = emb_utils.replace_with_unseen_labels(ctx_idx, n_seen=self.n_batch, n_total=self.n_ctx, p=p)
+        if self.has_unseen_cls:
+            cls_idx = emb_utils.replace_with_unseen_labels(cls_idx, n_seen=self.n_labels, n_total=self.n_cls, p=p)
         return ctx_idx, cls_idx
     
+    def _observable_bias_loss(self, random_logits: torch.Tensor, n_obs: int):
+        """Punish random predictions that are biased towards observed classes."""
+        # Get number of all available classes
+        # Calculate probabilities
+        probs = random_logits.softmax(dim=-1)
+        preds = random_logits.argmax(dim=-1)
+        # Get mean density in observed fraction
+        frac_prob_obs = probs[:, :n_obs].sum(dim=-1).mean()
+        frac_pred_obs = (preds < n_obs).float().mean()
+        # Mean expected density
+        expected_frac = n_obs / random_logits.size(-1)
+        # Return bias loss
+        soft_loss = (frac_prob_obs - expected_frac)**2
+        hard_loss = (frac_pred_obs - expected_frac)**2
+        return soft_loss + hard_loss
+    
+    def _logit_variance_loss(self, random_logits: torch.Tensor, m: float = 1e-2):
+        """Prevent model from pushing down values."""
+        var = random_logits.var(dim=-1)
+        # penalize too-flat logits
+        return torch.relu(m - var).mean()
+    
+    def get_ctx_buffer(self, reset: bool = False):
+        """Return and optionally clear the stored pseudo argmax buffer for context predictions."""
+        buffer_name = f"{self._ctx_key}_buffer"
+        if not hasattr(self, buffer_name):
+            return None
+
+        buf = getattr(self, buffer_name)
+
+        if reset:
+            # reset the existing buffer without re-registering
+            empty = torch.empty(0, dtype=buf.dtype, device=buf.device)
+            setattr(self, buffer_name, empty)
+
+        return buf
+
+
+    def get_cls_buffer(self, reset: bool = False):
+        """Return and optionally clear the stored pseudo argmax buffer for class predictions."""
+        buffer_name = f"{self._cls_key}_buffer"
+        if not hasattr(self, buffer_name):
+            return None
+
+        buf = getattr(self, buffer_name)
+
+        if reset:
+            empty = torch.empty(0, dtype=buf.dtype, device=buf.device)
+            setattr(self, buffer_name, empty)
+
+        return buf
+
+
+    def _update_pseudo_buffer(self, random_logits: torch.Tensor, name: str, T: float = 0.1):
+        """Append new argmax predictions to a named buffer."""
+        preds = random_logits.argmax(dim=-1).detach()
+        buf_name = f"{name}_buffer"
+
+        # create or update the buffer safely
+        if not hasattr(self, buf_name):
+            # register once (persistent, moves with .to(device))
+            self.register_buffer(buf_name, preds.clone())
+        else:
+            buf = getattr(self, buf_name)
+            preds = preds.to(buf.device)
+            new_buf = torch.cat((buf, preds), dim=0)
+            setattr(self, buf_name, new_buf)
+
+    def _grad_reversed_entropy_loss(self, logits: torch.Tensor, lam: float = 1.0) -> torch.Tensor:
+        """Maximize entropy via gradient reversal."""
+        logits_rev = grad_reverse(logits, lam)
+        p = torch.softmax(logits_rev, dim=-1)
+        return (p * p.log()).sum(dim=-1).mean()
+    
+    def _bias_bce(self, pseudo_rev_logits: torch.Tensor, n_obs: int, n: int) -> torch.Tensor:
+        """Compute binary cross entropy between observed and unobserved predictions on a grad reversed random alignment."""
+        B = pseudo_rev_logits.size(0)
+        device = pseudo_rev_logits.device
+        # Target: all predictions that are observable classes
+        is_obs = (pseudo_rev_logits.argmax(-1) < n_obs).float().unsqueeze(1).detach()
+        # Classify observed vs. not
+        obs_mask = torch.ones((B, n_obs), device=device)
+        no_obs_mask = torch.zeros((B, (n-n_obs)), device=device)
+        target_mask = torch.cat((obs_mask, no_obs_mask), dim=1)
+        target_one_hot = is_obs * target_mask
+        # Gradient-reversed logit bce to observation
+        return F.binary_cross_entropy_with_logits(pseudo_rev_logits, target_one_hot)
+
     def _pseudo_latent_loss(
         self,
         z: torch.Tensor,
         frac: float = 0.1,
-        alpha: float = 0.5,
-        eps: float = 1e-8,
+        alpha: float = 0.1,
+        T: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Ensure that a random latent alignment still has an unbiased distribution over all possible classes."""
         B, D = z.shape
@@ -657,29 +808,32 @@ class XPert(VAE):
         device = z.device
         # Sample random latents
         z_pseudo = torch.randn(B_pseudo, D, device=device)
+        # Revert gradient on pseudo z
+        pseudo_z_rev = grad_reverse(z_pseudo)
         # Sample random context and class indices
         ctx_idx = torch.randint(0, self.n_ctx, (B_pseudo,), device=z.device)
         cls_idx = torch.randint(0, self.n_cls, (B_pseudo,), device=z.device)
         # Align pseudo-latent to embeddings
         align_out = self.aligner(
-            z_pseudo, 
+            pseudo_z_rev, 
             ctx_emb=self.ctx_emb.weight, cls_emb=self.cls_emb.weight,
-            ctx_idx=ctx_idx, cls_idx=cls_idx
+            ctx_idx=ctx_idx, cls_idx=cls_idx,
+            return_logits=True,
+            T=T,
         )
         # Extract logits from pseudo-alignment
-        ctx_logits: torch.Tensor = align_out[MODULE_KEYS.CTX_LOGITS_KEY]
-        cls_logits: torch.Tensor = align_out[MODULE_KEYS.CLS_LOGITS_KEY]
-        # Compute probability distributions over random logits
-        p_ctx = ctx_logits.softmax(dim=-1).clamp(min=eps)
-        p_cls = cls_logits.softmax(dim=-1).clamp(min=eps)
-        # Calculate KL divergence to uniform target distributions
-        u_ctx = 1.0 / p_ctx.size(-1)
-        u_cls = 1.0 / p_cls.size(-1)
-        loss_ctx = (u_ctx * torch.log(u_ctx / p_ctx)).sum(dim=-1).mean()
-        loss_cls = (u_cls * torch.log(u_cls / p_cls)).sum(dim=-1).mean()
-        # Determine weight distribution between the two embeddings
-        beta = 1 - alpha
-        return alpha * loss_ctx + beta * loss_cls
+        z_pseudo_shared: torch.Tensor = align_out[MODULE_KEYS.Z_SHARED_KEY]
+        p_ctx_logits: torch.Tensor = align_out[MODULE_KEYS.CTX_LOGITS_KEY]
+        p_cls_logits: torch.Tensor = align_out[MODULE_KEYS.CLS_LOGITS_KEY]
+
+        # Save buffers of argmax predictions for epoch-level loss and monitoring during training
+        self._update_pseudo_buffer(p_ctx_logits, self._ctx_key)
+        self._update_pseudo_buffer(p_cls_logits, self._cls_key)
+
+        # Calculate BCE on prediciting observed class over unobserved
+        ctx_loss = self._bias_bce(p_ctx_logits, n_obs=self.n_batch, n=self.n_ctx)
+        cls_loss = self._bias_bce(p_cls_logits, n_obs=self.n_labels, n=self.n_cls)
+        return alpha * ctx_loss + (1-alpha) * cls_loss
     
     def _manifold_regularization_loss(
         self,
@@ -689,12 +843,50 @@ class XPert(VAE):
         alpha: float = 0.5,
     ) -> torch.Tensor:
         """Calculate manifold regularization loss to ensure projected embedding keeps geometry intact."""
-        n_ctx_sample = int(frac * self.n_ctx)
-        ctx_reg_loss = emb_utils.manifold_regularization(ext_emb=self.ctx_emb.weight, proj_emb=ctx_proj, n_sample=n_ctx_sample)
-        n_cls_sample = int(frac * self.n_cls)
-        cls_reg_loss = emb_utils.manifold_regularization(ext_emb=self.cls_emb.weight, proj_emb=cls_proj, n_sample=n_cls_sample)
+        ctx_reg_loss = torch.tensor(0.0)
+        if self.has_unseen_ctx:
+            n_ctx_sample = int(frac * self.n_ctx)
+            ctx_reg_loss = emb_utils.manifold_regularization(ext_emb=self.ctx_emb.weight, proj_emb=ctx_proj, n_sample=n_ctx_sample)
+        cls_reg_loss = torch.tensor(0.0)
+        if self.has_unseen_cls:
+            n_cls_sample = int(frac * self.n_cls)
+            cls_reg_loss = emb_utils.manifold_regularization(ext_emb=self.cls_emb.weight, proj_emb=cls_proj, n_sample=n_cls_sample)
         # Compute final regularization loss
         return alpha * ctx_reg_loss + (1-alpha) * cls_reg_loss
+    
+    def _ce_cls_loss(self, logits: torch.Tensor, y: torch.Tensor, T: float | None = None) -> torch.Tensor:
+        """Calculate additional simple classification loss on initial latent space."""
+        target_sim = self.cls_targets
+        # Return an CE loss
+        if self.use_semantic_target_weights and target_sim is not None:
+            # Subset weights
+            target_sim = target_sim.to(y.device)[y]
+            # Use embedding similarities as reference for ce
+            loss = self._ce_semantic(logits, target_sim, T=T)
+        else:
+            # Use hard one-hot labels as reference for ce
+            loss = F.cross_entropy(logits, y, reduction='none')
+        return loss
+    
+    def _adv_ctx_loss(self, z: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        """Calculate adversial context classification loss on z with reversed gradients."""
+        z_rev = grad_reverse(z)
+        adv_ctx_logits = self.ctx_adv_classifier(z_rev)
+        # Calculate loss
+        return F.cross_entropy(adv_ctx_logits, ctx.squeeze(-1), reduction='none')
+    
+    def _center_z_on_ctrl(self, z: torch.Tensor, y: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Center z on mean of control cells."""
+        if self.ctrl_class_idx is None:
+            return z, y, b
+        # Get control cell mask
+        ctrl_mask = (y == self.ctrl_class_idx).squeeze(-1)
+        # Center z on control cell mean TODO: optionally do this per context
+        z_centered = z[~ctrl_mask] - z[ctrl_mask].mean(dim=0, keepdim=True)
+        y = y[~ctrl_mask]
+        b = b[~ctrl_mask]
+        return z_centered, y, b
+
 
     def loss(
         self,
@@ -703,6 +895,7 @@ class XPert(VAE):
         generative_outputs: dict[str, Distribution | None],
         rl_weight: float = 1.0,
         kl_weight: float = 1.0,
+        cls_weight: float = 0.1,
         ctx_align_weight: float = 1.0,
         cls_align_weight: float = 1.0,
         joint_align_weight: float = 0.1,
@@ -711,6 +904,8 @@ class XPert(VAE):
         manifold_regularization_frac: float = 0.0,
         pseudo_latent_weight: float = 1.0,
         manifold_regularization_weight: float = 1.0,
+        align_temp_reg_weight: float = 1.0,
+        T_align: float | None = None,
         **kwargs,
     ) -> LossOutput:
         # ---- DEBUG ----
@@ -726,7 +921,6 @@ class XPert(VAE):
         px: Distribution = generative_outputs[MODULE_KEYS.PX_KEY]
         qz: Distribution = inference_outputs[MODULE_KEYS.QZ_KEY]
         pz: Distribution = generative_outputs[MODULE_KEYS.PZ_KEY]
-
         # Compute basic kl divergence between prior and posterior x distributions
         kl_divergence_z_mat = kl_divergence(qz, pz)
         # Calculate reconstruction loss over batch and all features
@@ -746,6 +940,9 @@ class XPert(VAE):
         else:
             raise ValueError(f'reduction has to be either "batchmean" or "mean", got {self.reduction}')
 
+        # Use full batch by default
+        n_obs_minibatch = x.shape[0]
+        
         # Weighted reconstruction and KL
         weighted_reconst_loss = rl_weight * reconst_loss
         weighted_kl_local = kl_weight * kl_divergence_z
@@ -755,34 +952,74 @@ class XPert(VAE):
         # Batch normalize elbo loss of reconstruction + kl --> batchmean reduction
         total_loss = torch.mean(weighted_reconst_loss + weighted_kl_local)
 
+        # Create extra metric container
+        extra_metrics = {MODULE_KEYS.KL_Z_PER_LATENT_KEY: kl_div_per_latent}
+        # Center z on control cell mean if control cells are encoded
+        z, cls, ctx = self._center_z_on_ctrl(z, cls, ctx)
+
         # Collect inital loss and extra parameters
         lo_kwargs = {
             'reconstruction_loss': reconst_loss,
             'kl_local': kl_locals,
             'true_labels': cls,
+            'n_obs_minibatch': n_obs_minibatch
         }
-        # Create extra metric container
-        extra_metrics = {MODULE_KEYS.KL_Z_PER_LATENT_KEY: kl_div_per_latent}
+
+        # Re-format labels
+        ctx = ctx.squeeze(-1)
+        cls = cls.squeeze(-1)
+
+        # Calculate classification loss on z
+        if cls_weight > 0:
+            z_cls_logits = self.classifier(z)
+            z_ce_loss = self._ce_cls_loss(z_cls_logits, y=cls, T=0.1)
+            z_ce_loss = self._reduce_loss(z_ce_loss, reduction=self.non_elbo_reduction)
+            # Add classification loss details
+            if torch.isnan(z_ce_loss):
+                import pdb
+                pdb.set_trace()
+            lo_kwargs.update({
+                'classification_loss': z_ce_loss,
+                'logits': z_cls_logits,
+            })
+            # Add to total loss
+            total_loss = total_loss + z_ce_loss * cls_weight
 
         # Only do alignment part if loss > 0
         if io.non_zero(ctx_align_weight) or io.non_zero(cls_align_weight):
+            # Do alignment
+            alignment_output = self.aligner(
+                z, 
+                ctx_idx=ctx, 
+                ctx_emb=self.ctx_emb.weight,
+                cls_idx=cls,
+                cls_emb=self.cls_emb.weight,
+                T=T_align
+            )
             # Randomly set some labels to unseen contexts and classes to keep these embeddings active
             if random_unseen_replacement_p > 0:
-                ctx, cls = self._random_unseen_replacement(ctx_idx=ctx, cls_idx=cls, p=random_unseen_replacement_p)
-            # Re-format labels
-            ctx = ctx.squeeze(-1)
-            cls = cls.squeeze(-1)
+                ctx, cls = self._random_unseen_replacement(ctx_idx=ctx.unsqueeze(0), cls_idx=cls.unsqueeze(0), p=random_unseen_replacement_p)
             # Extract shared latent space
-            z_shared = inference_outputs.get(MODULE_KEYS.Z_SHARED_KEY)
+            z_shared = alignment_output.get(MODULE_KEYS.Z_SHARED_KEY)
             # Extract the embedding projections to shared space
-            ctx2z = inference_outputs.get(MODULE_KEYS.CTX_PROJ_KEY)
-            cls2z = inference_outputs.get(MODULE_KEYS.CLS_PROJ_KEY)
+            ctx2z = alignment_output.get(MODULE_KEYS.CTX_PROJ_KEY)
+            cls2z = alignment_output.get(MODULE_KEYS.CLS_PROJ_KEY)
+            joint2z = alignment_output.get(MODULE_KEYS.JOINT_PROJ_KEY)
             # Extract context logits from aligner
-            ctx_logits = inference_outputs.get(MODULE_KEYS.CTX_LOGITS_KEY)
+            ctx_logits = alignment_output.get(MODULE_KEYS.CTX_LOGITS_KEY)
+            if ctx_logits is None:
+                # Calculate manually
+                ctx_logits = self.aligner.get_ctx_logits(z_shared, ctx2z, T=T_align)
             # Extract class logits from aligner
-            cls_logits = inference_outputs.get(MODULE_KEYS.CLS_LOGITS_KEY)
+            cls_logits = alignment_output.get(MODULE_KEYS.CLS_LOGITS_KEY)
+            if cls_logits is None:
+                # Calculate manually
+                cls_logits = self.aligner.get_cls_logits(z_shared, cls2z, T=T_align)
             # Extract shared logits from aligner (if given)
-            joint_logits = inference_outputs.get(MODULE_KEYS.JOINT_LOGITS_KEY)
+            joint_logits = alignment_output.get(MODULE_KEYS.JOINT_LOGITS_KEY)
+            if joint_logits is None:
+                # Calculate manually
+                joint_logits = self.aligner.get_joint_logits(z_shared, joint2z, T=T_align)
 
             # Calculate clip loss for context embedding
             ctx_loss_ps = self._clip_loss(
@@ -806,13 +1043,11 @@ class XPert(VAE):
             ctx_loss = self._reduce_loss(ctx_loss_ps, reduction=self.non_elbo_reduction)
             cls_loss = self._reduce_loss(cls_loss_ps, reduction=self.non_elbo_reduction)
             # Add to extra metrics
-            extra_metrics[LOSS_KEYS.CTX_CLS_LOSS] = ctx_loss
-            extra_metrics[LOSS_KEYS.CLS_LOSS] = cls_loss
-            # Add classification loss details
-            lo_kwargs.update({
-                'classification_loss': cls_loss,
-                'logits': cls_logits,
-            })
+            extra_metrics[LOSS_KEYS.CLIP_CTX_CLS_LOSS] = ctx_loss
+            extra_metrics[LOSS_KEYS.CLIP_CLS_LOSS] = cls_loss
+            # Add predictions to loss output
+            extra_metrics[PREDICTION_KEYS.PREDICTION_KEY] = torch.argmax(cls_logits, dim=-1).squeeze(-1).detach()
+            
             # Combine alignment losses
             align_loss = ctx_loss * ctx_align_weight + cls_loss * cls_align_weight
 
@@ -825,13 +1060,16 @@ class XPert(VAE):
                 # Add to overall alignment loss
                 align_loss = align_loss + joint_loss * joint_align_weight
             
-            # TODO: add weights Add additional regularization losses
-            if pseudo_latent_frac > 0:
-                pseudo_latent_loss = self._pseudo_latent_loss(z, frac=pseudo_latent_frac)
-                # Add to overall alignment loss
-                align_loss = align_loss + pseudo_latent_loss * pseudo_latent_weight
-                # Add to extra metrics for logging
-                extra_metrics[LOSS_KEYS.PSEUDO_Z_LOSS] = pseudo_latent_loss
+            # Add additional regularization losses
+            if pseudo_latent_frac > 0 and pseudo_latent_weight > 0:
+                # Enforce model to not be biased towards observed classes
+                pseudo_latent_loss = self._pseudo_latent_loss(z, frac=pseudo_latent_frac, T=T_align)
+                # Only add loss if not nan
+                if not torch.isnan(pseudo_latent_loss):
+                    # Add to overall alignment loss
+                    align_loss = align_loss + pseudo_latent_loss * pseudo_latent_weight
+                    # Add to extra metrics for logging
+                    extra_metrics[LOSS_KEYS.PSEUDO_Z_LOSS] = pseudo_latent_loss
             # Add a manifold regularization loss on all embedding projections
             if manifold_regularization_frac > 0:
                 mr_loss = self._manifold_regularization_loss(ctx_proj=ctx2z, cls_proj=cls2z, frac=manifold_regularization_frac, alpha=0.5)
@@ -839,6 +1077,11 @@ class XPert(VAE):
                 align_loss = align_loss + mr_loss * manifold_regularization_weight
                 # Add to extra metrics
                 extra_metrics[LOSS_KEYS.MANIFOLD_REG_LOSS] = mr_loss
+            # Add a small regularization on temperature
+            if align_temp_reg_weight > 0:
+                temp_reg_loss = self.aligner.get_temp_reg_loss()
+                align_loss = align_loss + temp_reg_loss * align_temp_reg_weight
+                extra_metrics[LOSS_KEYS.T_REG_LOSS] = temp_reg_loss
             # Add to extra metrics
             extra_metrics[LOSS_KEYS.ALIGN_LOSS] = align_loss
             # Add to total loss

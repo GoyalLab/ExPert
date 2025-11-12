@@ -106,6 +106,7 @@ class EmbeddingProcessor:
         self.assert_not_directional()
         if self.emb is None:
             raise ValueError('First initialize self.emb before adding rows.')
+        logging.info(f'Adding miscellaneous rows to embedding.')
         ctrl_row = self._get_misc_row(self.emb)
         unknown_row = self._get_misc_row(self.emb)
         zero_rows = pd.DataFrame(np.concatenate([ctrl_row, unknown_row], axis=0), index=[self.ctrl_key, self.unknown_key])
@@ -247,6 +248,8 @@ class EmbeddingProcessor:
         """Process and add class embedding key to adata."""
         logging.info('Reading embedding.')
         self.emb = self._read_embedding()
+        # Add control and unknown embeddings
+        self.emb = self._add_misc_rows()
         # Annotate adata features with embedding
         if self.add_emb_for_features:
             self._add_emb_to_varm(adata, raw_emb=self.emb)
@@ -260,8 +263,6 @@ class EmbeddingProcessor:
             if self.sim_cutoff > 0:
                 logging.info('Filtering adata for low interclass similarities.')
                 self._filter_classes_by_similarity(adata, sim_cutoff=self.sim_cutoff)
-        # Add control and unknown embeddings
-        self.emb = self._add_misc_rows()
         # Scale embedding values
         if self.scaling_factor > 0:
             self.emb *= self.scaling_factor

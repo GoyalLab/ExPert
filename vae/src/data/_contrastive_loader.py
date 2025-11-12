@@ -1,5 +1,5 @@
 from cProfile import label
-import copy
+from copy import deepcopy
 import logging
 
 import numpy as np
@@ -89,6 +89,7 @@ class ContrastiveAnnDataLoader(DataLoader):
         iter_ndarray: bool = False,
         distributed_sampler: bool = False,
         load_sparse_tensor: bool = False,
+        use_copy: bool = True,
         **kwargs,
     ):
         # Set or get indices from adata manager
@@ -118,7 +119,7 @@ class ContrastiveAnnDataLoader(DataLoader):
         if "persistent_workers" not in kwargs:
             kwargs["persistent_workers"] = settings.dl_persistent_workers
 
-        self.kwargs = copy.deepcopy(kwargs)
+        self.kwargs = deepcopy(kwargs)
 
         if sampler is not None and distributed_sampler:
             raise ValueError("Cannot specify both `sampler` and `distributed_sampler`.")
@@ -138,6 +139,7 @@ class ContrastiveAnnDataLoader(DataLoader):
                     ctrl_frac=ctrl_frac,
                     shuffle=shuffle,
                     drop_last=drop_last,
+                    use_copy=use_copy,
                 )
                 # Use updated batch size if control cells are added
                 sampler = BatchSampler(

@@ -13,8 +13,9 @@ import anndata as ad
 from src.utils.constants import PREDICTION_KEYS
 from src.utils.io import read_config
 from src.tune._statics import CONF_KEYS
-from src.models._jedvi import JEDVI
 from src.models._expert import ExPert
+
+from typing import Literal
 
 import logging
 log = logging.getLogger(__name__)
@@ -44,8 +45,10 @@ def _train(
         adata_p: str, 
         step_model_dir: str, 
         config: dict, 
+        ctrl_p: str | None = None,
+        ctrl_key: str = 'control',
         cls_label: str = 'cls_label',
-        batch_key: str = 'dataset',
+        batch_key: str = 'context',
         verbose: bool = False,
         **train_kwargs
     ) -> ExPert:
@@ -54,6 +57,11 @@ def _train(
     model_set = sc.read(adata_p)
     # Check if dataset is compatible
     assert cls_label in model_set.obs.columns and batch_key in model_set.obs.columns
+    if ctrl_p is not None:
+        # Read control data and add to model set
+        ctrl_set = sc.read(ctrl_p)
+        # Subset control set to observed batches
+        ctrl_mask = ctrl_set
   
     # Set precision
     torch.set_float32_matmul_precision('medium')
@@ -77,7 +85,7 @@ def _train(
     model.train(config, **train_kwargs)
     return model
 
-def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.Module | pd.DataFrame | ad.AnnData | str]:
+def train(adata_p: str, config_p: str, out_dir: str, ctrl_p: str | None = None, **kwargs) -> dict[str: nn.Module | pd.DataFrame | ad.AnnData | str]:
     """Train wrapper for use with config file."""
     # Load run config TODO: add model schema to check for invalid arguments
     config = read_config(config_p, do_setup=False, check_schema=False)
@@ -86,6 +94,7 @@ def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.M
     # Train the model
     model: ExPert = _train(
         adata_p=adata_p, 
+        ctrl_p=ctrl_p,
         step_model_dir=step_model_dir, 
         config=config,
         **kwargs
@@ -97,11 +106,13 @@ def full_run(
         train_p: str,
         model_dir: str,
         test_p: str,
+        ctrl_p: str | None = None,
         test_unseen: bool = True,
         load_checkpoint: bool = True,
-        cls_label: str = 'cls_label',
-        batch_label: str = 'dataset',
-        ctrl_key: str | None = 'neg;control',
+        cls_label: str = 'perturbation',
+        batch_label: str = 'context',
+        ctrl_key: str | None = 'control',
+        results_mode: Literal['return', 'save'] | None | list[str] = 'save',
         **kwargs
     ) -> pd.DataFrame:
     """Function to perform a full model training, evaluation, and testing process."""
@@ -110,9 +121,15 @@ def full_run(
     # Set default model output to config directory
     model_dir = model_dir if model_dir is not None else os.path.dirname(config_p)
     # Train model with loaded config file
-    model = train(adata_p=train_p, config_p=config_p, out_dir=model_dir, **kwargs)
+    model = train(
+        adata_p=train_p, 
+        config_p=config_p, 
+        out_dir=model_dir,
+        ctrl_p=ctrl_p 
+        **kwargs
+    )
     # Evaluate model
-    model.evaluate()
+    model.evaluate(results_mode=results_mode)
     # Save output dir
     output_dir = model.model_log_dir
     # Try to load best checkpoint, otherwise stick to final model
@@ -134,15 +151,13 @@ def full_run(
         output_dir=test_out,
         incl_unseen=False,
         plot=True,
-        results_mode='return',
+        results_mode=results_mode,
         cls_label=cls_label,
         batch_label=batch_label,
         ctrl_key=ctrl_key,
     )
     # Unpack output
     top_n_predictions = test_output.uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY]
-    # TODO save summary
-    summary = test_output.uns[PREDICTION_KEYS.SUMMARY_KEY]
     top_n_predictions['incl_unseen'] = False
     # Test model with unseen perturbations if option is given
     if test_unseen:
@@ -151,7 +166,7 @@ def full_run(
             output_dir=test_out,
             incl_unseen=True,
             plot=True,
-            results_mode='return',
+            results_mode=results_mode,
             cls_label=cls_label,
             batch_label=batch_label,
             ctrl_key=ctrl_key,

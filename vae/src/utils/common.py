@@ -117,6 +117,9 @@ class GradientReversalFn(torch.autograd.Function):
     def backward(ctx, grad_output):
         # Reverse the gradient sign
         return grad_output.neg() * ctx.lambda_, None
+    
+def grad_reverse(x: torch.Tensor, lamba_=1.0):
+    return GradientReversalFn.apply(x, lamba_)
 
 
 def run_hyperparameter_search(

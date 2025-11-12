@@ -93,14 +93,16 @@ class _TRAINING_KEYS_NT(NamedTuple):
 class _LOSS_KEYS_NT(NamedTuple):
     # Loss keys
     LOSS: str = "loss"
-    CLS_LOSS: str = "cls_loss"
     ALIGN_LOSS: str = "align_loss"
+    CTRL_CLS_LOSS: str = "ctrl_cls_loss"
     ADV_LOSS: str = "adversial_context_loss"
     UNSCALED_LOSS: str = "unscaled_loss"
-    CTX_CLS_LOSS: str = "ctx_loss"
+    CLIP_CLS_LOSS: str = "clip_cls_loss"
+    CLIP_CTX_CLS_LOSS: str = "clip_ctx_loss"
     JOINT_LOSS: str = "joint_loss"
     PSEUDO_Z_LOSS: str = "pseudo_z_loss"
     MANIFOLD_REG_LOSS: str = "manifold_reg_loss"
+    T_REG_LOSS: str = "T_reg_loss"
     # Data keys
     DATA: str = "data"
     LOGITS: str = "logits"

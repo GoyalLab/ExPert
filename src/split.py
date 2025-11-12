@@ -1,13 +1,8 @@
 # All relevant code to split full dataset into different training sets
 
 import os
-import yaml
-import pickle
 import logging
-import numpy as np
-import pandas as pd
 import anndata as ad
-import scanpy as sc
 
 from itertools import product
 
@@ -22,9 +17,11 @@ def filter_adata(
         context_col: str = 'context',
         cls_col: str = 'cls_label',
         eff_col: str = 'mixscale_score',
+        ctrl_key: str = 'control',
         min_mixscale_score: float = 0.0,
         min_cells: int = 100,
         min_contexts: int = 2,
+        keep_ctrl: bool = True,
         inplace: bool = True,
     ) -> None:
     """Filter training adata"""
@@ -57,7 +54,11 @@ def filter_adata(
     # Create final filter mask
     p_mask = adata.obs[cls_col].isin(filtered_perturbations)
     mask = ms_mask & p_mask
-    n_filtered_cells = mask.sum()
+    # Keep controls
+    if keep_ctrl and ctrl_key in adata.obs[cls_col].unique():
+        logging.info(f'Keeping control indices.')
+        ctrl_mask = adata.obs[cls_col] == ctrl_key
+        mask |= ctrl_mask
     # Subset adata
     if inplace:
         adata._inplace_subset_obs(mask)

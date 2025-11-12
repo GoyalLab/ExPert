@@ -1,5 +1,7 @@
-from pytorch_lightning import Callback, Trainer
+from lightning.pytorch.callbacks import Callback
 from scvi.train._callbacks import LoudEarlyStopping
+
+import logging
 
 
 class DelayedEarlyStopping(LoudEarlyStopping):
@@ -18,18 +20,8 @@ class PeriodicTestCallback(Callback):
         super().__init__()
         self.every_n_epochs = every_n_epochs
 
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if trainer.current_epoch % self.every_n_epochs == 0:
-            # detach test from active loop
-            test_trainer = Trainer(
-                accelerator=trainer.accelerator.state.accelerator,
-                devices=trainer.devices,
-                logger=trainer.logger,
-                enable_checkpointing=False,
-                enable_model_summary=False,
-            )
-            test_trainer.test(
-                model=pl_module,
-                dataloaders=trainer.datamodule.test_dataloader(),
-                verbose=False,
-            )
+    def on_train_epoch_end(self, trainer, pl_module, **kwargs):
+        # TODO: debug this
+        return
+        if trainer.current_epoch % self.every_n_epochs == 0 and trainer.is_global_zero:
+            trainer.test(model=pl_module, ckpt_path=None)

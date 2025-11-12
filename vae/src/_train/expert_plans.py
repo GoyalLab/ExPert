@@ -14,6 +14,8 @@ from scvi.train._constants import METRIC_KEYS
 from typing import Literal, Any
 from collections import defaultdict
 
+import logging
+
 
 def _sigmoid_schedule(t, T, k):
     if T == 0:
@@ -92,6 +94,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         top_k: int = 1,
         use_posterior_mean: Literal["train", "val", "both"] | None = "val",
         log_class_distribution: bool = False,
+        freeze_modules: list[str] | None = None,
+        soft_freeze_lr: float | None = None,
         freeze_encoder_epoch: int | None = None,
         freeze_decoder_epoch: int | None = None,
         gene_emb: torch.Tensor | None = None,
@@ -106,12 +110,20 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         full_log_every_n_epoch: int = 10,
         # Plotting options
         plot_kl_distribution: bool = True,
+        log_random_predictions: bool = True,            # Monitor zero-shot capability
         plot_umap: bool = False,
+        plot_umap_key: str = 'z_shared',
         # Caching options
         cache_n_epochs: int | None = 1,
         n_train_step_cache: int = 64,
         **loss_kwargs,
     ):
+        # Get custom optimizer for soft freezing if argument is provided
+        optimizer, optimizer_fn = self._optimizer_creator_fn_custom(freeze_modules=freeze_modules, freeze_lr=soft_freeze_lr)
+        if optimizer == 'Custom':
+            loss_kwargs['optimizer'] = optimizer
+            loss_kwargs['optimizer_creator'] = optimizer_fn
+        # Init parent
         super().__init__(
             module=module,
             lr=lr,
@@ -155,10 +167,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.average = average                                                      # How to reduce the classification metrics
         self.top_k = top_k                                                          # How many top predictions to consider for metrics
         self.plot_umap = plot_umap
+        self.plot_umap_key = plot_umap_key
         self.plot_kl_distribution = plot_kl_distribution
         self.log_full = log_full
         self.full_log_every_n_epoch = full_log_every_n_epoch
         self.batch_labels = batch_labels
+        self.log_random_predictions = log_random_predictions
         # Save classes that have been seen during training
         self.train_class_counts = []
         self.class_batch_counts = defaultdict(list)
@@ -184,6 +198,67 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Setup test metrics
         self._n_obs_test = None
         self.initialize_test_metrics()
+
+
+    def _optimizer_creator_fn_custom(
+        self,
+        optimizer_cls: torch.optim.Adam | torch.optim.AdamW = torch.optim.Adam,
+        freeze_modules: list[str] | None = None,
+        freeze_lr: float | None = 1e-5,
+    ):
+        """
+        Create an optimizer for the model, applying a reduced LR to any parameter
+        belonging to a module whose name matches entries in `freeze_modules`.
+
+        Parameters
+        ----------
+        optimizer_cls : torch.optim.Optimizer class
+            e.g., torch.optim.Adam or torch.optim.AdamW
+        freeze_modules : list of str, optional
+            Names (substrings) of modules to 'soft freeze' (e.g. ["encoder", "decoder"])
+        freeze_lr : float
+            Learning rate for frozen modules; default 1e-5
+        """
+        # Create a custom optimizer if modules should be soft frozen
+        if freeze_modules is None or freeze_lr is None or not float(freeze_lr) > 0:
+            return "Adam", None
+
+        # Ensure it's cast to float
+        freeze_lr = float(freeze_lr)
+        
+        logging.info(f'Creating custom optimizer.')
+
+        def _creator(params):
+            # collect all parameters (params is usually a generator)
+            params_list = list(params)
+            if not hasattr(self, "module"):
+                # fallback: no module context, behave normally
+                return optimizer_cls(params_list, lr=self.lr, eps=self.eps, weight_decay=self.weight_decay)
+
+            # map parameter -> module name for filtering
+            param_to_name = {}
+            for module_name, module in self.module.named_modules():
+                for p in module.parameters(recurse=False):
+                    param_to_name[p] = module_name
+
+            # build param groups
+            param_groups = []
+            for p in params_list:
+                name = param_to_name.get(p, "")
+                if any(fm in name for fm in freeze_modules):
+                    param_groups.append({"params": [p], "lr": freeze_lr})
+                else:
+                    param_groups.append({"params": [p], "lr": self.lr})
+
+            return optimizer_cls(
+                param_groups,
+                lr=self.lr,
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+            )
+
+        return "Custom", _creator
+
 
     @property
     def n_obs_test(self):
@@ -223,12 +298,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             if mode == 'train' and len(self.epoch_cache[mode][MODULE_KEYS.Z_KEY]) > self.n_train_step_cache:
                 return
             self.epoch_cache[mode][MODULE_KEYS.Z_KEY].append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
-            self.epoch_cache[mode][MODULE_KEYS.Z_SHARED_KEY].append(inference_outputs[MODULE_KEYS.Z_SHARED_KEY].cpu())
             self.epoch_cache[mode][REGISTRY_KEYS.LABELS_KEY].append(loss_output.true_labels.cpu())
-            self.epoch_cache[mode][REGISTRY_KEYS.BATCH_KEY].append(batch[REGISTRY_KEYS.BATCH_KEY].cpu())
+            self.epoch_cache[mode][REGISTRY_KEYS.BATCH_KEY].append(inference_outputs[REGISTRY_KEYS.BATCH_KEY].cpu())
             if loss_output.logits is not None:
                 self.epoch_cache[mode][PREDICTION_KEYS.PREDICTION_KEY].append(torch.argmax(loss_output.logits, dim=-1).cpu())
                 self.epoch_cache[mode][MODULE_KEYS.CLS_LOGITS_KEY].append(loss_output.logits.cpu())
+            if MODULE_KEYS.Z_SHARED_KEY in inference_outputs:
+                self.epoch_cache[mode][MODULE_KEYS.Z_SHARED_KEY].append(inference_outputs[MODULE_KEYS.Z_SHARED_KEY].cpu())
 
     def _process_epoch_cache(self, mode: str) -> dict[str, np.ndarray]:
         """Process and clear the epoch cache, returning concatenated arrays."""
@@ -239,10 +315,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Concatenate all cached tensors
         processed = {
             MODULE_KEYS.Z_KEY: torch.cat(cache[MODULE_KEYS.Z_KEY], dim=0).numpy(),
-            MODULE_KEYS.Z_SHARED_KEY: torch.cat(cache[MODULE_KEYS.Z_SHARED_KEY], dim=0).numpy(),
             REGISTRY_KEYS.LABELS_KEY: torch.cat(cache[REGISTRY_KEYS.LABELS_KEY], dim=0).numpy().squeeze(),
             REGISTRY_KEYS.BATCH_KEY: torch.cat(cache[REGISTRY_KEYS.BATCH_KEY], dim=0).numpy().squeeze(),
         }
+
+        if MODULE_KEYS.Z_SHARED_KEY in cache:
+            processed[MODULE_KEYS.Z_SHARED_KEY] = torch.cat(cache.get(MODULE_KEYS.Z_SHARED_KEY), dim=0).numpy()
         
         if cache.get(PREDICTION_KEYS.PREDICTION_KEY, []):
             processed[PREDICTION_KEYS.PREDICTION_KEY] = torch.cat(cache[PREDICTION_KEYS.PREDICTION_KEY], dim=0).numpy().squeeze()
@@ -503,15 +581,19 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             METRIC_KEYS.CLASSIFICATION_LOSS_KEY: np.inf,
             METRIC_KEYS.ACCURACY_KEY: 0.0,
             METRIC_KEYS.F1_SCORE_KEY: 0.0,
+            f'clip_{METRIC_KEYS.ACCURACY_KEY}': 0.0,
+            f'clip_{METRIC_KEYS.F1_SCORE_KEY}': 0.0,
         }
+        # Get number of classes
+        n_classes = self.n_classes
+        # Get true class labels
+        true_labels = loss_output.true_labels.squeeze(-1)
         # Add classification-based metrics if they exist
         if loss_output.classification_loss is not None:
             classification_loss = loss_output.classification_loss
-            true_labels = loss_output.true_labels.squeeze(-1)
             logits = loss_output.logits
             # Take argmax of logits to get highest predicted label
             predicted_labels = torch.argmax(logits, dim=-1).squeeze(-1)
-            n_classes = self.n_classes
 
             # Check if any classes are outside of training classes, i.e
             unknown_mask = (predicted_labels >= n_classes)
@@ -559,7 +641,35 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 )
                 metrics_dict[top_k_acc_key] = top_k_accuracy
                 metrics_dict[top_k_f1_key] = top_k_f1
-        
+        # Add clip classification metrics
+        # Get predcitions if they exist
+        clip_cls_pred = loss_output.extra_metrics.pop(PREDICTION_KEYS.PREDICTION_KEY, None)
+        if clip_cls_pred is not None:
+            # Check if any classes are outside of training classes, i.e
+            unknown_mask = (clip_cls_pred >= n_classes)
+            if unknown_mask.any():
+                # Assign unknown to classes that are outside of the training classes
+                clip_cls_pred = clip_cls_pred.masked_fill(unknown_mask, n_classes)
+                n_classes += 1
+            # Assign unknown to classes that are outside of the training classes
+            clip_cls_pred = clip_cls_pred.masked_fill((clip_cls_pred >= n_classes), n_classes)
+            # Calculate accuracy over predicted and true labels
+            accuracy = tmf.classification.multiclass_accuracy(
+                clip_cls_pred,
+                true_labels,
+                n_classes,
+                average=self.average
+            )
+            # Calculate F1 score over predicted and true labels
+            f1 = tmf.classification.multiclass_f1_score(
+                clip_cls_pred,
+                true_labels,
+                n_classes,
+                average=self.average,
+            )
+            # Update metrics
+            metrics_dict[f'clip_{METRIC_KEYS.ACCURACY_KEY}'] = accuracy
+            metrics_dict[f'clip_{METRIC_KEYS.F1_SCORE_KEY}'] = f1
         # Add metrics to extra metrics for internal logging
         loss_output.extra_metrics.update(metrics_dict)
         # Compute and log all metrics
@@ -618,6 +728,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
+        
         # TODO: move to model, Add external gene embedding to batch
         if self.gene_emb is not None:
             # Add gene embedding matrix to batch
@@ -675,7 +786,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         with torch.no_grad():
             self._cache_step_data('val', batch, inference_outputs, loss_output)
 
-    def _test_step(self, batch, batch_idx):
+    def test_step(self, batch, batch_idx):
         """Test step for supervised training."""
         # Perform full forward pass of model
         inference_outputs, _, loss_output = self.step(batch=batch, batch_idx=batch_idx)
@@ -698,8 +809,64 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.module.freeze_module('z_encoder')
         if self.freeze_decoder_epoch is not None and self.current_epoch >= self.freeze_decoder_epoch and not getattr(self.module.decoder, 'frozen', False):
             self.module.freeze_module('decoder')
-    
+
+    def _plt_random_ctx_predictions(self, random_predictions: torch.Tensor):
+        if random_predictions is None:
+            return
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        # Detach and move to cpu
+        random_predictions = random_predictions.detach().cpu()
+
+        # Get number of observed and total labels from module
+        n = self.module.n_ctx
+        n_obs = self.module.n_batch
+        # Plot
+        fig = plt.figure(dpi=120, figsize=(8,6))
+        ax = sns.histplot(random_predictions)
+        plt.axvline(n_obs, linestyle='--', color='red')
+        plt.xlim((0,n))
+        ax.set_xlabel("")
+        ax.set_ylabel("Number of classes in Batch")
+        ax.set_title("Distribution of Number of Classes per Batch")
+        self.logger.experiment.add_figure("pseudo_argmax_ctx", fig, self.current_epoch)
+        plt.close(fig)
+
+    def _plt_random_cls_predictions(self, random_predictions: torch.Tensor):
+        if random_predictions is None:
+            return
+        
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        # Detach and move to cpu
+        random_predictions = random_predictions.detach().cpu()
+
+        # Get number of classes etc
+        n = self.module.n_cls
+        n_obs = self.module.n_labels
+        # Plot
+        fig = plt.figure(dpi=120, figsize=(8,6))
+        ax = sns.histplot(random_predictions)
+        plt.axvline(n_obs, linestyle='--', color='red')
+        plt.xlim((0,n))
+        ax.set_xlabel("")
+        ax.set_ylabel("Number of classes in Batch")
+        ax.set_title("Distribution of Number of Classes per Batch")
+        self.logger.experiment.add_figure("pseudo_argmax_cls", fig, self.current_epoch)
+        plt.close(fig)
+
     def on_train_epoch_end(self):
+        # Get random prediction buffer from module and reset buffer
+        random_ctx_predictions = self.module.get_ctx_buffer(reset=True)
+        random_cls_predictions = self.module.get_cls_buffer(reset=True)
+        # Plot random prediction distributions
+        if self.log_random_predictions:
+            # Plot the distributions
+            self._plt_random_ctx_predictions(random_ctx_predictions)
+            self._plt_random_cls_predictions(random_cls_predictions)
+        # Plot class distribution in batches
         if self.log_class_distribution:
             import matplotlib.pyplot as plt
             # Convert counter to dataframe and pad missing values with nan
@@ -848,9 +1015,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 prog_bar=False,
             )
 
-    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray], emb_key: str = MODULE_KEYS.Z_SHARED_KEY):
+    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray]):
         """Plot umap of latent space in tensorboard logger"""
         import umap
+        
+        emb_key = self.plot_umap_key
         # Extract data from forward pass
         embeddings = mode_data[emb_key]
         labels = mode_data[REGISTRY_KEYS.LABELS_KEY]

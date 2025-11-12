@@ -67,6 +67,7 @@ class ExPert(
     _training_plan_cls = ContrastiveSupervisedTrainingPlan
     _LATENT_QZM_KEY = f"{__qualname__}_latent_qzm"
     _LATENT_QZV_KEY = f"{__qualname__}_latent_qzv"
+    _LATENT_Z_KEY = f"{__qualname__}_latent_z"
     _LATENT_Z_SHARED_KEY = f"{__qualname__}_latent_z_shared"
     _LATENT_CTX_PROJ_KEY = f"{__qualname__}_latent_ctx_proj"
     _LATENT_CLS_PROJ_KEY = f"{__qualname__}_latent_cls_proj"
@@ -85,6 +86,7 @@ class ExPert(
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         use_full_cls_emb: bool = False,
+        ctrl_class: str | None = None,
         **model_kwargs,
     ):
         super().__init__(adata)
@@ -96,7 +98,7 @@ class ExPert(
         self.use_full_cls_emb = use_full_cls_emb
         # Create placeholder for log directory
         self.model_log_dir = None
-        self.ctrl_class = None
+        self.ctrl_class = ctrl_class
 
         # Initialize indices and labels for this VAE
         self._setup()
@@ -112,7 +114,7 @@ class ExPert(
         n_hidden = self.summary_stats.n_vars if n_hidden < 0 else n_hidden
         # Get class embeddings
         cls_emb, cls_sim = self.get_cls_emb()
-        # Initialize genevae
+        # Initialize model
         self.module = self._module_cls(
             n_input=self.summary_stats.n_vars,
             n_batch=n_batch,
@@ -123,6 +125,8 @@ class ExPert(
             n_shared=n_shared,
             cls_emb=cls_emb,
             cls_sim=cls_sim,
+            use_ctrl_cls=self.ctrl_class_idx is not None,
+            ctrl_class_idx=self.ctrl_class_idx,
             ctx_emb=self.ctx_emb,
             dropout_rate=dropout_rate,
             n_continuous_cov=self.summary_stats.get('n_extra_continuous_covs', 0),
@@ -146,9 +150,13 @@ class ExPert(
             f"n_unseen_contexts: {self.n_unobs_ctx}, \n" if self.n_unobs_ctx > 0 else "\n"
             f"use_gene_emb: {self.use_gene_emb}"
         )
+        # Include control class information
+        if self.ctrl_class is not None and self.ctrl_class_idx is not None:
+            self._model_summary_string += f"\nctrl_class: {self.ctrl_class}"
+
         
     def _setup(self):
-        """Setup adata for training. Prepare embeddings"""
+        """Setup adata for training. Prepare embeddings."""
         # Initialize both embeddings as None
         self.gene_emb, self.cls_emb = None, None
         # Assign gene embedding
@@ -230,6 +238,9 @@ class ExPert(
                 self.train_cls_sim = None
             # Set indices
             self.idx_to_label = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.LABELS_KEY])
+            # Set control class index
+            self.ctrl_class = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.CTRL_CLASS_KEY]
+            self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY]
         else:
             # Register adata's class embedding with this model
             cls_emb: pd.DataFrame = self.adata.uns[cls_emb_key]
@@ -240,6 +251,35 @@ class ExPert(
             _label_overlap = _label_series.isin(cls_emb.index)
             _shared_labels = _label_series[_label_overlap].values
             _unseen_labels = cls_emb.index.difference(_shared_labels)
+
+            # Remove control embedding if given
+            ctrl_class_idx_matches = np.where(_label_series==self.ctrl_class)[0]
+            ctrl_exists_in_data = len(ctrl_class_idx_matches) > 0
+            if not ctrl_exists_in_data:
+                log.warning(f'Specified control label {self.ctrl_class} is not in adata class labels, ignoring parameter.')
+            if self.ctrl_class is not None and ctrl_exists_in_data:
+                # Find control index
+                self.ctrl_class_idx = ctrl_class_idx_matches[0]
+                # Create empty embedding for control
+                if self.ctrl_class not in _shared_labels:
+                    log.info(f'Adding empty control external class embedding, will be learned by model.')
+                    # Create empty embedding at last slot
+                    dummy_emb = pd.DataFrame(np.zeros((1, cls_emb.shape[-1])), index=[self.ctrl_class], columns=cls_emb.columns)
+                    # Add dummy embedding as 
+                    _shared_cls_emb = cls_emb.loc[_shared_labels]
+                    _unseen_cls_emb = cls_emb.loc[_unseen_labels]
+                    cls_emb = pd.concat((_shared_cls_emb, dummy_emb, _unseen_cls_emb), axis=0)
+                    # Set control index to first embedding index
+                    _shared_labels = np.concatenate((
+                        np.array(_shared_labels), np.array([self.ctrl_class])
+                    ))
+                else:
+                    log.info(f'Overwriting existing external control class embedding, will be learned by model.')
+                # Reset label overlap
+                _label_overlap = _label_series.isin(_shared_labels)
+            else:
+                # Set no label as control class
+                self.ctrl_class_idx = None
             
             self.n_train_labels = _shared_labels.shape[0]
             self.n_unseen_labels = _unseen_labels.shape[0]
@@ -264,6 +304,8 @@ class ExPert(
                 EXT_CLS_EMB_INIT.LABELS_KEY: self.idx_to_label,
                 EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY: self.n_train_labels, 
                 EXT_CLS_EMB_INIT.N_UNSEEN_LABELS_KEY: self.n_unseen_labels,
+                EXT_CLS_EMB_INIT.CTRL_CLASS_KEY: self.ctrl_class,
+                EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY: self.ctrl_class_idx,
             }
         # Set embedding dimension
         self.ext_class_embed_dim = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
@@ -278,16 +320,36 @@ class ExPert(
         """Draw """
         pass
 
-    def get_cls_emb(self, use_full_cls_emb: bool | None = None) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def get_ctx_emb(self, return_dataframe: bool = False):
+        """Getter function for context embedding"""
+        ctx_emb = self.ctx_emb
+        if ctx_emb is None:
+            return None
+        if return_dataframe:
+            return io.tensor_to_df(ctx_emb, index=self.idx_to_batch)
+        else:
+            return ctx_emb
+
+    def get_cls_emb(self, use_full_cls_emb: bool | None = None, return_dataframe: bool = False) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Helper getter to return either training or full class embedding"""
         if self.cls_emb is None:
             return None, None
         # Check if we want to train on full or observed embedding only
         use_full_cls_emb = use_full_cls_emb if use_full_cls_emb is not None else self.use_full_cls_emb
         if use_full_cls_emb:
-            return self.cls_emb, self.cls_sim
+            cls_emb, cls_sim = self.cls_emb, self.cls_sim
         else:
-            return self.train_cls_emb, self.train_cls_sim
+            cls_emb, cls_sim = self.train_cls_emb, self.train_cls_sim
+        # Return copy of tensor as dataframe
+        if return_dataframe:
+            return io.tensor_to_df(cls_emb, index=self.idx_to_label), None
+        else:
+            return cls_emb, cls_sim
+        
+    def reset_emb_to_df(self) -> None:
+        """Reset model's embeddings from tensors to dataframes"""
+        self.ctx_emb = self.get_ctx_emb(return_dataframe=True)
+        self.cls_emb, _ = self.get_cls_emb(return_dataframe=True)
     
     @classmethod
     def from_base_model(
@@ -298,6 +360,7 @@ class ExPert(
         excl_setup_keys: list[str] = ['class_emb_uns_key'],
         excl_states: list[str] | None = None,
         freeze_modules: list[str] | None = ['z_encoder', 'decoder'],
+        hard_freeze: bool = False,
         check_model_kwargs: bool = True,
         **model_kwargs,
     ):
@@ -355,6 +418,8 @@ class ExPert(
             adata,
             **pretrained_setup_args,
         )
+        # Switch pre-training stage off
+        model_params['pretrain'] = False
         # Create fine-tune model
         model = cls(adata, **model_params)
         # Load pre-trained model weights
@@ -386,8 +451,11 @@ class ExPert(
         model.test_indices = pretrained_model.test_indices
         # Freeze pre-trained models for next stage
         if freeze_modules is not None and isinstance(freeze_modules, list):
-            for module in freeze_modules:
-                model.module.freeze_module(module)
+            model.freeze_modules = freeze_modules
+            # Hard freeze
+            if hard_freeze:
+                for module in freeze_modules:
+                    model.module.freeze_module(module)
         # Return loaded pre-trained model
         return model
     
@@ -496,18 +564,22 @@ class ExPert(
                     z = softmax(samples, dim=-1).mean(dim=0)
                 # Collect tensors
                 zs.append(z.cpu())
-                zs_shared.append(zshared.cpu())
+                if zs_shared is not None:
+                    zs_shared.append(zshared.cpu())
         # Return output dictionary
         o = {
             MODULE_KEYS.Z_KEY: torch.cat(zs).numpy(),
-            MODULE_KEYS.Z_SHARED_KEY: torch.cat(zs_shared).numpy()
         }
+        # Add shared latent space if aligner is on
+        if len(zs_shared) > 0:
+            o[MODULE_KEYS.Z_SHARED_KEY] = torch.cat(zs_shared).numpy()
+        # Return latent distributions if possible
         if return_dist:
             o.update({
                 MODULE_KEYS.QZM_KEY: torch.cat(qz_means).numpy(), 
                 MODULE_KEYS.QZV_KEY: torch.cat(qz_vars).numpy()
             })
-        return o 
+        return o
         
     def validate_ctx_emb(self, ctx_emb: torch.Tensor):
         # Extract labels if it's a dataframe
@@ -536,11 +608,11 @@ class ExPert(
         adata: AnnData | None = None,
         indices: Sequence[int] | None = None,
         batch_size: int | None = None,
-        use_posterior_mean: bool = True,
+        use_posterior_mean: bool | None = None,
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         return_latents: bool = True,
-        inference: bool = True,
+        inference: bool = False,
         verbose: bool = True,
         **kwargs
     ) -> dict[str, pd.DataFrame | np.ndarray]:
@@ -605,6 +677,7 @@ class ExPert(
         ctx_logits = []
         cls_logits = []
         # Collect batch z shared
+        zs = []
         z_shared = []
         ctx2z = []
         cls2z = []
@@ -648,6 +721,7 @@ class ExPert(
                     use_posterior_mean=use_posterior_mean,
                     inference_outputs=inference_outputs,
                     inference=inference,
+                    return_logits=True
                 )
                 # Unpack context and perturbation classification output
                 _ctx_logits = cls_output[MODULE_KEYS.CTX_LOGITS_KEY].cpu()
@@ -656,9 +730,11 @@ class ExPert(
                 ctx_logits.append(_ctx_logits)
                 cls_logits.append(_cls_logits)
                 # Unpack shared latent spaces
+                _z = cls_output[MODULE_KEYS.Z_KEY].cpu()
                 _z_shared = cls_output[MODULE_KEYS.Z_SHARED_KEY].cpu()
                 _ctx2z = cls_output[MODULE_KEYS.CTX_PROJ_KEY].cpu()
                 _cls2z = cls_output[MODULE_KEYS.CLS_PROJ_KEY].cpu()
+                zs.append(_z)
                 z_shared.append(_z_shared)
                 ctx2z.append(_ctx2z)
                 cls2z.append(_cls2z)
@@ -673,6 +749,7 @@ class ExPert(
         # Concatenate batch results
         ctx_logits = torch.cat(ctx_logits).numpy()
         cls_logits = torch.cat(cls_logits).numpy()
+        zs = torch.cat(zs).numpy()
         z_shared = torch.cat(z_shared).numpy()
         ctx2z = torch.stack(ctx2z, dim=0).mean(0).numpy()
         cls2z = torch.stack(cls2z, dim=0).mean(0).numpy()
@@ -706,6 +783,7 @@ class ExPert(
         # Add latent spaces to prediction output
         if return_latents:
             o.update({
+                MODULE_KEYS.Z_KEY: zs,
                 MODULE_KEYS.Z_SHARED_KEY: z_shared,
                 MODULE_KEYS.CTX_PROJ_KEY: ctx2z,
                 MODULE_KEYS.CLS_PROJ_KEY: cls2z,
@@ -713,10 +791,17 @@ class ExPert(
         return o
         
     def get_training_plan(self, **plan_kwargs):
+        # If fine-tune stage, set lower lr for encoder and decoder
+        soft_freeze_lr = plan_kwargs.pop('soft_freeze_lr', None)
+        freeze_modules = getattr(self, 'freeze_modules', None)
+            
+        # Create training plan
         return self._training_plan_cls(
             module=self.module, 
             n_classes=self.n_labels, 
             gene_emb=self.gene_emb,
+            freeze_modules=freeze_modules,
+            soft_freeze_lr=soft_freeze_lr,
             **plan_kwargs
         )
     
@@ -787,6 +872,9 @@ class ExPert(
         # Look for test contexts
         if 'test_context_labels' in data_params:
             log.info(f'Using {data_params.get("test_context_labels")} as test context(s).')
+        
+        # Add control class index to data params
+        data_params['ctrl_class'] = self.ctrl_class
 
         # Cache indices if model was pre-trained
         if self.was_pretrained and cache_data_splitter:
@@ -1084,6 +1172,7 @@ class ExPert(
         self.adata.obs[PREDICTION_KEYS.PREDICTION_KEY] = po[PREDICTION_KEYS.PREDICTION_KEY]
         self.adata.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.SOFT_PREDICTION_KEY]          # (cells, classes)
         # Register aligned latent spaces with model's adata
+        self.adata.obsm[self._LATENT_Z_KEY] = po[MODULE_KEYS.Z_KEY]
         self.adata.obsm[self._LATENT_Z_SHARED_KEY] = po[MODULE_KEYS.Z_SHARED_KEY]
         self.adata.uns[self._LATENT_CTX_PROJ_KEY] = po[MODULE_KEYS.CTX_PROJ_KEY]
         self.adata.uns[self._LATENT_CLS_PROJ_KEY] = po[MODULE_KEYS.CLS_PROJ_KEY]
@@ -1100,11 +1189,15 @@ class ExPert(
             results_mode: Literal['return', 'save'] | None | list[str] = 'save',
             force: bool = True,
             ignore_ctrl: bool = True,
+            z_shared: bool = True,
         ) -> dict[pd.DataFrame] | None:
         """Run model evaluation for all available data splits registered with the model."""
         if self.is_evaluated and not force:
             log.info('This model has already been evaluated, pass force=True to re-evaluate.')
             return
+        # Set z shared to false if model is in pretrain mode
+        if self.module.pretrain:
+            z_shared = False
         # Refactor results mode to always be a list of options or None
         results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
         # Run full prediction for all registered data
@@ -1129,7 +1222,7 @@ class ExPert(
         # Plot evalutation results if specified
         log.info('Plotting evaluation results.')
         if plot:
-            self._plot_evalutation(output_dir=base_output_dir)
+            self._plot_evalutation(output_dir=base_output_dir, z_shared=z_shared)
         # Save model only if we have an output directory
         if model_output_dir is not None:
             # Always save anndata if its minified else fall back to parameter
@@ -1196,7 +1289,7 @@ class ExPert(
         for split in self._get_available_splits():
             self._plot_eval_split(split, plt_dir=plt_dir)
     
-    def _plot_evalutation(self, output_dir: str | None, metric: str = 'f1-score') -> None:
+    def _plot_evalutation(self, output_dir: str | None, z_shared: bool = True, metric: str = 'f1-score') -> None:
         """Save plots associated to model evaluation."""
         if output_dir is None:
             log.warning('Evalutaion output directory is not available. Skipping plots.')
@@ -1215,10 +1308,11 @@ class ExPert(
             self.adata.uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY],
             output_file=top_n_o,
             metric=metric,
-            mean_split='val'
+            mean_split='test'
         )
+        z_key = self._LATENT_Z_SHARED_KEY if z_shared else self._LATENT_Z_KEY
         # Calculate UMAP for latent space based on latent mean
-        pl.calc_umap(self.adata, rep=self._LATENT_Z_SHARED_KEY, slot_key=self._LATENT_UMAP)
+        pl.calc_umap(self.adata, rep=z_key, slot_key=self._LATENT_UMAP)
         # Plot full UMAP colored by data split
         umap_split_o = os.path.join(plt_dir, f'full_umap_{REGISTRY_KEYS.SPLIT_KEY}.png')
         pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=REGISTRY_KEYS.SPLIT_KEY, output_file=umap_split_o)
@@ -1288,7 +1382,6 @@ class ExPert(
         ctrl_key: str | None = None,
         minify: bool = False,
         use_pathways: bool = False,
-        seed: int = 42,
         **kwargs
     ) -> None:
         """Function to evaluate model on unseen data."""

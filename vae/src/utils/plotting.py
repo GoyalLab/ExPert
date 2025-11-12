@@ -39,7 +39,7 @@ def get_pal(n: int, seed: int | None = None) -> list:
     # Large: generate evenly spaced hues (HLS) for arbitrary n
     return sns.color_palette('hls', n)
 
-def calc_umap(adata: ad.AnnData, rep: str = 'X_pca', slot_key: str | None = None, force: bool = False, return_umap: bool = False) -> None | umap.UMAP:
+def calc_umap(adata: ad.AnnData, rep: str = 'X_pca', slot_key: str | None = None, force: bool = True, return_umap: bool = False) -> None | umap.UMAP:
     # Create default slot name if none is given, else use the specified key
     slot_key = f'{rep}_umap' if slot_key is None else slot_key
     # Cache umap generation

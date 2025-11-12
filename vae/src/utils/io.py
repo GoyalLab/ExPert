@@ -36,6 +36,12 @@ def to_tensor(m: sp.csr_matrix | torch.Tensor | np.ndarray | pd.DataFrame | None
         return m
     raise ValueError(f'{m.__class__} is not compatible. Should be either sp.csr_matrix, np.ndarray, or torch.Tensor.')
 
+def tensor_to_df(x: torch.Tensor, index: list, columns: list | None = None, prefix: str = 'dim_') -> pd.DataFrame:
+    """Convert tensor to pandas dataframe"""
+    if columns is None:
+        columns = prefix + pd.Series(np.arange(x.size(1)), dtype=str)
+    return pd.DataFrame(x.cpu().numpy(), index=index, columns=columns)
+
 # Recursive function to replace "nn.*" strings with actual torch.nn classes
 def replace_nn_modules(d):
     if isinstance(d, dict):
@@ -151,7 +157,7 @@ def setup_config(config: dict) -> None:
     # Add aligner args to model
     config[CONF_KEYS.MODEL][NESTED_CONF_KEYS.ALIGN_KEY] = config[CONF_KEYS.ALIGNER]
 
-def read_config(config_p: str, do_setup: bool = True, check_schema: bool = False) -> dict:
+def read_config(config_p: str, do_setup: bool = False, check_schema: bool = False) -> dict:
     """Read hyperparameter yaml file"""
     log.info(f'Loading config file: {config_p}')
     with open(config_p, 'r') as f:

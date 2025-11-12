@@ -261,6 +261,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         last_first: bool = True,
         shuffle_classes: bool = True,
         pin_memory: bool = False,
+        use_copy: bool = True,
         use_contrastive_loader: Literal['train', 'val', 'both'] | None = 'train',
         use_control: Literal['train', 'val', 'both'] | None = 'train',
         test_context_labels: np.ndarray | None = None,
@@ -285,6 +286,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
         self.use_contrastive_loader = use_contrastive_loader
         self.use_control = use_control
         self.test_context_labels = test_context_labels
+        self.use_copy = use_copy
         # Fall back to product of max cells per batch * max classes per batch
         _bs = self.data_loader_kwargs.get("batch_size")
         if _bs is None:
@@ -330,18 +332,9 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
                 base_idx = self.indices
                 test_idx = []
 
-            # Only split non-control cells into train and validation
-            ctrl_mask = self.labels[base_idx] == self.ctrl_class
-            # Split control cells beforehand
-            if ctrl_mask.sum() > 0:
-                class_indices = self.indices[~ctrl_mask]
-                class_labels = self.labels[~ctrl_mask]
-                ctrl_indices = np.array(self.indices[ctrl_mask])
-            else:
-                # Use all available indices if no control cells are given
-                class_indices = self.indices[base_idx]
-                class_labels = self.labels[base_idx]
-                ctrl_indices = None
+            # Don't use test indices for train/val splits
+            class_indices = self.indices[base_idx]
+            class_labels = self.labels[base_idx]
             # Split dataset into train and validation set
             train_idx, val_idx = train_test_split(
                 class_indices,
@@ -351,19 +344,10 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
                 random_state=settings.seed
             )
             
-            # Split indices are stratified, TODO: add test split logic
+            # Split indices are stratified
             indices_train = np.array(train_idx)
             indices_val = np.array(val_idx)
             indices_test = np.array(test_idx)
-
-            # Add control indices to train pool
-            if ctrl_indices is not None:
-                indices_train = np.concatenate((indices_train, ctrl_indices))
-
-            # Don't validate on control cells if we have any registered
-            if self.ctrl_class is not None and self.use_control not in ['val', 'both']:
-                # Only keep non-control validation indices
-                indices_val = np.setdiff1d(indices_val, ctrl_indices, assume_unique=True)
         else:
             # Cache indices from pre-training
             indices_train = np.array(self.cache_indices.get('train'))
@@ -393,7 +377,8 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
                 'max_cells_per_batch': self.max_cells_per_batch,
                 'max_classes_per_batch': self.max_classes_per_batch,
                 'ctrl_class': self.ctrl_class,
-                'ctrl_frac': self.ctrl_frac
+                'ctrl_frac': self.ctrl_frac,
+                'use_copy': self.use_copy
             })
         # Set validation loader
         self.val_loader_class = AnnDataLoader
@@ -407,7 +392,8 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
                 'max_cells_per_batch': self.max_cells_per_batch,
                 'max_classes_per_batch': self.max_classes_per_batch,
                 'ctrl_class': self.ctrl_class,
-                'ctrl_frac': self.ctrl_frac
+                'ctrl_frac': self.ctrl_frac,
+                'use_copy': self.use_copy
             })
 
     def train_dataloader(self):
@@ -436,6 +422,7 @@ class ContrastiveDataSplitter(pl.LightningDataModule):
             pass
 
     def test_dataloader(self):
+        logging.info(f'Test loader with {len(self.test_idx)} test indices.')
         """Create the test data loader."""
         if len(self.test_idx) > 0:
             return self.val_loader_class(
