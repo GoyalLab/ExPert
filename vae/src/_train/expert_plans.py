@@ -298,7 +298,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             if mode == 'train' and len(self.epoch_cache[mode][MODULE_KEYS.Z_KEY]) > self.n_train_step_cache:
                 return
             self.epoch_cache[mode][MODULE_KEYS.Z_KEY].append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
-            self.epoch_cache[mode][REGISTRY_KEYS.LABELS_KEY].append(loss_output.true_labels.cpu())
+            self.epoch_cache[mode][REGISTRY_KEYS.LABELS_KEY].append(inference_outputs[REGISTRY_KEYS.LABELS_KEY].cpu())
             self.epoch_cache[mode][REGISTRY_KEYS.BATCH_KEY].append(inference_outputs[REGISTRY_KEYS.BATCH_KEY].cpu())
             if loss_output.logits is not None:
                 self.epoch_cache[mode][PREDICTION_KEYS.PREDICTION_KEY].append(torch.argmax(loss_output.logits, dim=-1).cpu())
@@ -372,6 +372,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     ) -> float:
         # Pull current epoch
         epoch = self.current_epoch
+        
         # Set undefined weights to
         if min_weight is None:
             min_weight = 0.0
@@ -948,6 +949,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         if PREDICTION_KEYS.PREDICTION_KEY not in mode_data:
             return
         true_labels = torch.tensor(mode_data.get(REGISTRY_KEYS.LABELS_KEY))
+        # Remove control labels from true labels for metrics
+        if self.module.ctrl_class_idx is not None:
+            no_ctrl_mask = (true_labels != self.module.ctrl_class_idx)
+            true_labels = true_labels[no_ctrl_mask]
         predicted_labels = torch.tensor(mode_data.get(PREDICTION_KEYS.PREDICTION_KEY)).squeeze(-1)
         n_classes = self.n_classes
  
@@ -1018,12 +1023,20 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray]):
         """Plot umap of latent space in tensorboard logger"""
         import umap
-        
+
         emb_key = self.plot_umap_key
         # Extract data from forward pass
         embeddings = mode_data[emb_key]
         labels = mode_data[REGISTRY_KEYS.LABELS_KEY]
         covs = mode_data[REGISTRY_KEYS.BATCH_KEY]
+        modes = pd.Categorical(mode_data[REGISTRY_KEYS.SPLIT_KEY])
+        # Subset z to no control cells
+        if self.module.ctrl_class_idx is not None:
+            no_ctrl_mask = (labels != self.module.ctrl_class_idx)
+            embeddings = embeddings[no_ctrl_mask]
+            labels = labels[no_ctrl_mask]
+            covs = covs[no_ctrl_mask]
+            modes = modes[no_ctrl_mask]
         # Look for actual label encoding
         if "_code_to_label" in self.loss_kwargs:
             labels = [self.loss_kwargs["_code_to_label"][l] for l in labels]
@@ -1031,7 +1044,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             covs = self.batch_labels[covs]
         labels = pd.Categorical(labels)
         covs = pd.Categorical(covs)
-        modes = pd.Categorical(mode_data[REGISTRY_KEYS.SPLIT_KEY])
         
         # Create cache structure if it doesn't exist
         if 'umap_cache' not in self.cache:

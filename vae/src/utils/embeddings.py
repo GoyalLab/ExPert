@@ -11,7 +11,7 @@ def replace_with_unseen_labels(
     """Randomly replace label indices with unseen indices."""
     mask = torch.rand_like(labels.float()) < p
     unseen_idx = torch.randint(n_seen, n_total, labels.shape, device=labels.device)
-    return torch.where(mask, unseen_idx, labels)
+    return torch.where(mask, unseen_idx, labels)[0]
 
 def manifold_regularization(
         ext_emb: torch.Tensor, 

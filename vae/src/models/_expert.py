@@ -125,7 +125,6 @@ class ExPert(
             n_shared=n_shared,
             cls_emb=cls_emb,
             cls_sim=cls_sim,
-            use_ctrl_cls=self.ctrl_class_idx is not None,
             ctrl_class_idx=self.ctrl_class_idx,
             ctx_emb=self.ctx_emb,
             dropout_rate=dropout_rate,
@@ -364,7 +363,7 @@ class ExPert(
         check_model_kwargs: bool = True,
         **model_kwargs,
     ):
-        """Initialize jedVI model with weights from pretrained :class:`~src.models.JEDVI` model.
+        """Initialize ExPert model with weights from pretrained :class:`~src.models.JEDVI` model.
 
         Parameters
         ----------
@@ -564,7 +563,7 @@ class ExPert(
                     z = softmax(samples, dim=-1).mean(dim=0)
                 # Collect tensors
                 zs.append(z.cpu())
-                if zs_shared is not None:
+                if zshared is not None:
                     zs_shared.append(zshared.cpu())
         # Return output dictionary
         o = {
@@ -639,10 +638,10 @@ class ExPert(
             log.info(f'Using model gene embeddings ({self.gene_emb.shape})')
         # validate adata or get it from model
         adata = self._validate_anndata(adata)
-
+        # Take all cells by default
         if indices is None:
             indices = np.arange(adata.n_obs)
-
+        # Create dataloader
         scdl = self._make_data_loader(
             adata=adata,
             indices=indices,
@@ -652,7 +651,7 @@ class ExPert(
         # Use new context embedding at inference
         if ctx_emb is not None:
             log.info(f'Using new context embedding: {ctx_emb.shape}')
-            ctx_labels, ctx_emb = self.validate_ctx_emb(ctx_emb)
+            ctx_labels, ctx_emb = self.validate_ctx_emb(ctx_emb).to(self.device)
         # Use model's context labels and embedding
         else:
             ctx_labels = self.idx_to_batch
@@ -660,12 +659,22 @@ class ExPert(
         # Use new class embedding at inference
         if cls_emb is not None:
             log.info(f'Using new class embedding: {cls_emb.shape}')
-            cls_labels, cls_emb = self.validate_cls_emb(cls_emb)
+            cls_labels, cls_emb = self.validate_cls_emb(cls_emb).to(self.device)
         # Use model's class labels and embedding
         else:
             cls_labels = self.idx_to_label
             cls_emb = self.module.cls_emb.weight
-        
+
+        # Add control embedding
+        if self.module.ctrl_class_idx is not None:
+            log.info('Adding control embedding')
+            if self.module.ctrl_class_idx >= cls_emb.size(0):
+                pad = torch.zeros((1, cls_emb.size(-1)), device=cls_emb.device)
+                cls_emb = torch.cat((cls_emb, pad), dim=0)
+            else:
+                # Reset index to 0s
+                cls_emb[self.module.ctrl_class_idx] = torch.tensor(0.0)
+   
         # Use aligner classify mode
         if inference:
             log.info(f'Using inference mode (joint prediction).')
@@ -676,6 +685,7 @@ class ExPert(
         # Collect batch logits
         ctx_logits = []
         cls_logits = []
+        z_cls_logits = []
         # Collect batch z shared
         zs = []
         z_shared = []
@@ -721,12 +731,17 @@ class ExPert(
                     use_posterior_mean=use_posterior_mean,
                     inference_outputs=inference_outputs,
                     inference=inference,
+                    ctx_emb=ctx_emb,
+                    cls_emb=cls_emb,
                     return_logits=True
                 )
+                # Get regular classifier logits
+                _z_cls_logits = cls_output['logits'].cpu()
                 # Unpack context and perturbation classification output
                 _ctx_logits = cls_output[MODULE_KEYS.CTX_LOGITS_KEY].cpu()
                 _cls_logits = cls_output[MODULE_KEYS.CLS_LOGITS_KEY].cpu()
                 # Add batch predictions to overall predictions
+                z_cls_logits.append(_z_cls_logits)
                 ctx_logits.append(_ctx_logits)
                 cls_logits.append(_cls_logits)
                 # Unpack shared latent spaces
@@ -747,6 +762,7 @@ class ExPert(
         
         log.info(f'Aggregating predictions')
         # Concatenate batch results
+        z_cls_logits = torch.cat(z_cls_logits).numpy()
         ctx_logits = torch.cat(ctx_logits).numpy()
         cls_logits = torch.cat(cls_logits).numpy()
         zs = torch.cat(zs).numpy()
@@ -755,6 +771,18 @@ class ExPert(
         cls2z = torch.stack(cls2z, dim=0).mean(0).numpy()
         data_ctx_labels = torch.cat(data_ctx_labels).numpy()
         data_cls_labels = torch.cat(data_cls_labels).numpy()
+
+        # Set nans to 0s
+        ctx_logits = np.nan_to_num(ctx_logits, -np.inf)
+        cls_logits = np.nan_to_num(cls_logits, -np.inf)
+
+        # Add classifier predictions
+        z_cls_soft_predictions = pd.DataFrame(
+            z_cls_logits,
+            columns=cls_labels[:z_cls_logits.shape[-1]],
+            index=adata.obs_names[indices],
+        )
+        z_cls_predictions = z_cls_soft_predictions.columns[np.argmax(z_cls_soft_predictions.values, axis=-1)]
 
         # Add context predictions
         ctx_soft_predictions = pd.DataFrame(
@@ -770,15 +798,18 @@ class ExPert(
             index=adata.obs_names[indices],
         )
         cls_predictions = cls_soft_predictions.columns[np.argmax(cls_soft_predictions.values, axis=-1)]
-
+        
         # Return all model predictions
         o = {
+            PREDICTION_KEYS.Z_PREDICTION_KEY: z_cls_predictions,
+            PREDICTION_KEYS.Z_SOFT_PREDICTION_KEY: z_cls_soft_predictions,
             PREDICTION_KEYS.CTX_PREDICTION_KEY: ctx_predictions,
             PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY: ctx_soft_predictions,
             PREDICTION_KEYS.PREDICTION_KEY: cls_predictions,
             PREDICTION_KEYS.SOFT_PREDICTION_KEY: cls_soft_predictions,
             REGISTRY_KEYS.BATCH_KEY: data_ctx_labels,
             REGISTRY_KEYS.LABELS_KEY: data_cls_labels,
+            'indices': indices,
         }
         # Add latent spaces to prediction output
         if return_latents:
@@ -1152,7 +1183,7 @@ class ExPert(
             split_indices = self._get_split_indices(split)
             split_labels[split_indices] = split
         # Add split labels to adata.obs
-        self.adata.obs[REGISTRY_KEYS.SPLIT_KEY] = split_labels
+        self.adata.obs[REGISTRY_KEYS.SPLIT_KEY] = pd.Categorical(split_labels)
     
     def _register_model_predictions(self, force: bool = True) -> None:
         """Add detailed model classification outputs to internal self.adata object"""
@@ -1169,8 +1200,16 @@ class ExPert(
         self.adata.obs[PREDICTION_KEYS.CTX_PREDICTION_KEY] = po[PREDICTION_KEYS.CTX_PREDICTION_KEY]
         self.adata.obsm[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY]
         # Save regular classification predictions to model adata
-        self.adata.obs[PREDICTION_KEYS.PREDICTION_KEY] = po[PREDICTION_KEYS.PREDICTION_KEY]
-        self.adata.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.SOFT_PREDICTION_KEY]          # (cells, classes)
+        if self.module.align_ext_emb_loss_strategies is None:
+            # Use classifier predictions
+            predictions = pd[PREDICTION_KEYS.Z_PREDICTION_KEY]
+            soft_predictions = po[PREDICTION_KEYS.Z_SOFT_PREDICTION_KEY]
+        else:
+            # Use aligner predictions
+            predictions = po[PREDICTION_KEYS.PREDICTION_KEY]
+            soft_predictions = po[PREDICTION_KEYS.SOFT_PREDICTION_KEY]
+        self.adata.obs[PREDICTION_KEYS.PREDICTION_KEY] = predictions
+        self.adata.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = soft_predictions
         # Register aligned latent spaces with model's adata
         self.adata.obsm[self._LATENT_Z_KEY] = po[MODULE_KEYS.Z_KEY]
         self.adata.obsm[self._LATENT_Z_SHARED_KEY] = po[MODULE_KEYS.Z_SHARED_KEY]
@@ -1372,14 +1411,13 @@ class ExPert(
         self,
         test_adata_p: str,
         cls_label: str = 'cls_label',
-        batch_label: str = 'dataset',
+        batch_label: str = 'context',
         output_dir: str | None = None,
         incl_unseen: bool = False,
-        use_fixed_dataset_label: bool = True,
         plot: bool = True,
         results_mode: Literal['return', 'save'] | None | list[str] = 'save',
         top_n: int = 10,
-        ctrl_key: str | None = None,
+        ctrl_key: str | None = 'control',
         minify: bool = False,
         use_pathways: bool = False,
         **kwargs
@@ -1415,10 +1453,6 @@ class ExPert(
         test_ad.obs[orig_batch_key] = test_ad.obs[batch_label].values
         # Save original labels
         test_labels = test_ad.obs[cls_label].values
-        # Set dataset labels for classification
-        if use_fixed_dataset_label or batch_label not in test_ad.obs:
-            log.info(f'Added {ds_name} as dataset key.')
-            test_ad.obs[batch_label] = ds_name
         # Register new testing data with model
         self.setup_anndata(test_ad, labels_key=cls_label, batch_key=batch_label)
         # Make sure test adata's features are consistent with model

@@ -5,26 +5,30 @@ data:
   pin_memory: false
   max_cells_per_batch: null
   max_classes_per_batch: null
+  ctrl_frac: 1
   shuffle_classes: true
   use_contrastive_loader: null
-  # Specify test contexts
+  use_control: null
+  use_copy: False
+  # Specify test contexts, will be excluded from training
   test_context_labels:
     - "CD4-positive, alpha-beta T cell"
 train:
-  max_epochs: 200
-  early_stopping: false
+  max_epochs: 800
+  early_stopping: true
   early_stopping_monitor: f1_score_validation
   early_stopping_mode: max
-  early_stopping_patience: 20
-  early_stopping_start_epoch: 0
-  checkpoint: true
-  checkpoint_monitor: f1_score_validation
+  early_stopping_patience: 40
+  early_stopping_start_epoch: 100
+  checkpoint: false
+  checkpoint_monitor: clip_f1_score_validation
   checkpoint_mode: max
   check_val_every_n_epoch: 1
   check_test_every_n_epoch: null
-  gradient_clip_val: 1.0
+  gradient_clip_val: null
+  # Plan args
   plan_kwargs:
-    lr: 0.001
+    lr: 0.0001
     lr_patience: 20
     weight_decay: 1.0e-05
     n_epochs_warmup: 400
@@ -32,8 +36,6 @@ train:
     freeze_decoder_epoch: null
     multistage_kl_frac: 0.5
     use_local_stage_warmup: false
-    target_scale: 2.0
-    n_negatives: 128
     scale_by_temp: false
     observed_only: false
     use_posterior_mean: val
@@ -41,11 +43,11 @@ train:
     log_class_distribution: false
     log_full:
       - val
-      - test
     full_log_every_n_epoch: 10
     plot_umap: true
-    plot_kl_distribution: true
-    average: weighted
+    plot_umap_key: z
+    plot_kl_distribution: false
+    average: macro
     top_k: 1
     anneal_schedules:
       rl_weight:
@@ -59,57 +61,88 @@ train:
         anneal_k: 10
         n_epochs_stall: 0
         min_weight: 0.0
-        max_weight: 0.1
+        max_weight: 1
+      # Control contrastive loss
+      ctrl_contrastive_weight:
+        schedule: sigmoid
+        anneal_k: 10
+        n_epochs_stall: 0
+        min_weight: 0.0
+        max_weight: 0.0
+        n_epochs_warmup: 200
+      # Z classification weight
+      cls_weight:
+        schedule: sigmoid
+        anneal_k: 10
+        n_epochs_stall: 0
+        min_weight: 1.0
+        max_weight: 1.0
+        n_epochs_warmup: 300
       # Context alignment weight
       ctx_align_weight:
         schedule: sigmoid
         anneal_k: 10
         n_epochs_stall: 0
         min_weight: 0.0
-        max_weight: 0.2
-        n_epochs_warmup: 100
+        max_weight: 0.0
+        n_epochs_warmup: 200
       # Class alignment weight
       cls_align_weight:
         schedule: sigmoid
         anneal_k: 10
         n_epochs_stall: 0
-        min_weight: 0.0
-        max_weight: 0.3
-        n_epochs_warmup: 100
+        min_weight: 10.0
+        max_weight: 10.0
+        n_epochs_warmup: 300
       # Joint embedding alignment weight
       joint_align_weight:
         schedule: sigmoid
         anneal_k: 10
         n_epochs_stall: 0
         min_weight: 0.0
-        max_weight: 0.5
+        max_weight: 0.0
         n_epochs_warmup: 100
       # Randomly replace some labels in clip loss with unseen labels
       random_unseen_replacement_p:
-        min_weight: 0.05
-        max_weight: 0.05
-      # Random pseudo latent should give random alignments
-      pseudo_latent_frac:
         min_weight: 0.1
         max_weight: 0.1
+      # Random pseudo latent should give random alignments
+      pseudo_latent_frac:
+        min_weight: 0.5
+        max_weight: 0.5
+        n_epochs_warmup: 100
+      pseudo_latent_weight:
+        min_weight: 0.1
+        max_weight: 1
+        n_epochs_stall: 0
+        n_epochs_warmup: 300
       # Enforce same similarities between external embedding and embedding projections
       # Choose what fraction of embeddings should be checked each step
       manifold_regularization_frac:
+        min_weight: 0.1
+        max_weight: 0.1
+      align_temp_reg_weight:
         min_weight: 0.05
-        max_weight: 0.05
+        max_weight: 0.01
+        n_epochs_warmup: 300
+
 model:
-  n_latent: 128
-  n_shared: 128
-  n_hidden: 1024
+  n_latent: 64
+  n_shared: 2048
+  n_hidden: -1
   dropout_rate: 0.2
+  ctrl_class: null
+  use_reconstruction_control: false
+  use_kl_control: false
   dispersion: gene
   use_batch_norm: none
   use_layer_norm: both
   gene_likelihood: zinb
-  decode_shared_space: false
-  decode_covariates: false
+  decode_shared_space: false                # TODO: integrate that
+  decode_covariates: true
+  decode_context_projection: false
   use_full_cls_emb: true
-  use_semantic_target_weights: true         # Base CE on class similarities instead of raw one-hot for label
+  use_semantic_target_weights: false         # Base CE on class similarities instead of raw one-hot for label
   log_variational: true
   use_cpm: false
   l1_lambda: 0.001
@@ -117,36 +150,48 @@ model:
   l_mask:
   - attn
   align_ext_emb_loss_strategy: clip
-  use_posterior_mean: true
-  min_kl: 0.5
+  use_posterior_mean: false
+  min_kl: 0.25
   reduction: mean
   non_elbo_reduction: mean
-  use_feature_mask: true
+  use_feature_mask: false
   drop_prob: 0.001
   batch_representation: embedding
   extra_encoder_kwargs:
-    encoder_type: funnel
+    encoder_type: transformer
     linear_encoder: false
-    n_layers: 3
+    n_layers: 2
     use_attention: false
+    context_integration_method: null
     n_head: 4
-    n_attn_layers: 3
-    ff_mult: 2
+    n_attn_layers: 2
+    ff_mult: 4
     activation_fn: nn.GELU
-    noise_std: 0.0
+    noise_std: 0.001
+  extra_cls_kwargs:
+    dropout_rate: 0.2
+    n_layers: 1
+    n_hidden: 128
+    temperature: 1.0
+    use_learnable_temperature: false
   extra_decoder_kwargs:
     linear_decoder: false
+    use_funnel: true
     n_layers: 1
-    use_attention: false
+    n_context_compression: 0              # Compress context embedding dimensions before adding it to decoder input
     use_film: false
-    activation_fn: nn.LeakyReLU
+    activation_fn: nn.GELU
   extra_aligner_kwargs:
     dropout_rate: 0.2
-    temperature: 0.1
-    n_hidden: 256
-    n_layers: 2
+    min_temperature: 0.1
+    max_temperature: 1.0
+    n_hidden: -1
+    n_layers: 3
+    use_film: false
+    linear_ctx_proj: true             # Context embedding is much simpler, linear projection is usually fine
+    linear_cls_proj: false              # Class embedding is complex >3k dimensions --> non-linear layer should help
     use_learnable_temperature: true    # True allows for learnable logit scaling, mostly leads to v. fast convergence & overfitting
-    noise_sigma: 0.05
+    noise_sigma: 0.0001
     use_learnable_sigma: false        # Mostly just collapses to 0 in the first couple of epochs
 model_setup:
   batch_key: context

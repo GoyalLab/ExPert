@@ -57,7 +57,7 @@ class XPert(VAE):
         cls_sim: torch.Tensor | None = None,
         ctrl_class_idx: int | None = None,
         use_reconstruction_control: bool = False,
-        use_kl_control: bool = True,
+        use_kl_control: bool = False,
         n_continuous_cov: int = 0,
         n_cats_per_cov: Iterable[int] | None = None,
         dropout_rate: float = 0.2,
@@ -85,7 +85,6 @@ class XPert(VAE):
         drop_prob: float = 1e-3,
         decay_rate: float = 0.9,
         use_ctx_adv_cls: bool = True,
-        use_ctrl_cls: bool = True,
         use_semantic_target_weights: bool = True,
         extra_encoder_kwargs: dict | None = {},
         extra_decoder_kwargs: dict | None = {},
@@ -184,7 +183,7 @@ class XPert(VAE):
             'var_activation': var_activation,
             'use_feature_mask': use_feature_mask,
             'drop_prob': drop_prob,
-            'n_dim_context_emb': None,
+            'n_dim_context_emb': self.n_ctx_dim,
             'use_context_inference': None,
         }
         extra_encoder_kwargs.update(self.default_encoder_kwargs)
@@ -311,6 +310,8 @@ class XPert(VAE):
 
     def set_align_ext_emb_strategies(self, align_ext_emb_loss_strategy) -> None:
         """Set alignment strategies."""
+        if align_ext_emb_loss_strategy is None:
+            self.align_ext_emb_loss_strategies = None
         # Make sure the resulting type is a list
         self.align_ext_emb_loss_strategies: list[str] = align_ext_emb_loss_strategy if isinstance(align_ext_emb_loss_strategy, list) else [align_ext_emb_loss_strategy]
         # Check for allowed options
@@ -383,8 +384,10 @@ class XPert(VAE):
         else:
             categorical_input = ()
 
+        # Add context embedding
+        b_ctx_emb = self.ctx_emb(batch_index).reshape(batch_index.shape[0], -1)
         # Perform forward pass through encoder
-        inference_out: dict[str, torch.Tensor] = self.z_encoder(encoder_input, *categorical_input, g=g)
+        inference_out: dict[str, torch.Tensor] = self.z_encoder(encoder_input, *categorical_input, g=g, context_emb=b_ctx_emb)
         # Unpack encoder output
         qz = inference_out[MODULE_KEYS.QZ_KEY]
         z = inference_out[MODULE_KEYS.Z_KEY]
@@ -604,18 +607,23 @@ class XPert(VAE):
         # Optionally use different embeddings, fall back to internals if none are given
         ctx_emb = ctx_emb if ctx_emb is not None else self.ctx_emb.weight
         cls_emb = cls_emb if cls_emb is not None else self.cls_emb.weight
+        # Add z classifier output
+        z_cls_logits = self.classifier(_z)
+        inference_outputs['logits'] = z_cls_logits
         # Use regular alignment
         if not inference:
             align_out: dict[str, torch.Tensor] = self.aligner(
                 _z, 
                 ctx_emb=ctx_emb, cls_emb=cls_emb,
                 ctx_idx=batch_index, cls_idx=label,
-                return_logits=return_logits
+                return_logits=return_logits,
+                ctrl_idx=self.ctrl_class_idx
             )
         else:
             align_out: dict[str, torch.Tensor] = self.aligner.classify(
                 z=_z, ctx_emb=ctx_emb, ctx_idx=batch_index, cls_emb=cls_emb, return_logits=return_logits
             )
+
         # Add alignment output to inference
         inference_outputs.update(align_out)
         return inference_outputs
@@ -655,6 +663,8 @@ class XPert(VAE):
             T: torch.Tensor,
             weights: torch.Tensor | None = None,
         ) -> torch.Tensor:
+        # Ensure y is a vector
+        y = y.flatten()
         # Normalize z and embedding
         z = F.normalize(z, dim=-1)
         emb = F.normalize(emb, dim=-1)
@@ -744,7 +754,6 @@ class XPert(VAE):
 
         return buf
 
-
     def get_cls_buffer(self, reset: bool = False):
         """Return and optionally clear the stored pseudo argmax buffer for class predictions."""
         buffer_name = f"{self._cls_key}_buffer"
@@ -758,7 +767,6 @@ class XPert(VAE):
             setattr(self, buffer_name, empty)
 
         return buf
-
 
     def _update_pseudo_buffer(self, random_logits: torch.Tensor, name: str, T: float = 0.1):
         """Append new argmax predictions to a named buffer."""
@@ -882,11 +890,81 @@ class XPert(VAE):
         # Get control cell mask
         ctrl_mask = (y == self.ctrl_class_idx).squeeze(-1)
         # Center z on control cell mean TODO: optionally do this per context
-        z_centered = z[~ctrl_mask] - z[ctrl_mask].mean(dim=0, keepdim=True)
+        zs = []
+        for ctx in torch.unique(b):
+            mask_ctx = (b == ctx).squeeze(-1)
+            mask_ctrl = ctrl_mask & mask_ctx
+            mask_no_ctrl = ~ctrl_mask & mask_ctx
+            if mask_ctrl.any():
+                z_centered = z[mask_no_ctrl] - z[mask_ctrl].mean(0, keepdim=True)
+                zs.append(z_centered)
+        zs = torch.cat(zs, dim=0)
         y = y[~ctrl_mask]
         b = b[~ctrl_mask]
-        return z_centered, y, b
+        return zs, y, b
+    
+    def _split_batch(self, x: torch.Tensor, y: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split batch into class and control."""
+        if self.ctrl_class_idx is None:
+            return x, None, y, b
+        # Get control cell mask
+        ctrl_mask = (y == self.ctrl_class_idx).squeeze(-1)
+        if not ctrl_mask.any():
+            return x, None, y, b
+        # Split batch
+        return {
+            'ctrl': {
+                MODULE_KEYS.X_KEY: x[ctrl_mask],
+                MODULE_KEYS.LABEL_KEY: y[ctrl_mask],
+                REGISTRY_KEYS.BATCH_KEY: b[ctrl_mask]
+            },
+            'class': {
+                MODULE_KEYS.X_KEY: x[~ctrl_mask],
+                MODULE_KEYS.LABEL_KEY: y[~ctrl_mask],
+                REGISTRY_KEYS.BATCH_KEY: b[~ctrl_mask]
+            }
+        }
 
+    def _contr_ctrl_loss(self, z: torch.Tensor, y: torch.Tensor, b: torch.Tensor, T: torch.Tensor = 1.0) -> torch.Tensor:
+        """Apply a contrastive loss from z to control z."""
+        if self.ctrl_class_idx is None:
+            return z, y, b, torch.tensor(0.0)
+        # Calculate control mask
+        ctrl_mask = (y == self.ctrl_class_idx).squeeze(-1)
+        if not ctrl_mask.any():
+            return z, y, b, torch.tensor(0.0)
+        # Split batch labels into z and z ctrl
+        _y = y[~ctrl_mask]
+        _b = b[~ctrl_mask]
+        # Normalize embeddings
+        z = F.normalize(z, dim=-1)
+
+        # Masks
+        ctrl_mask = (y == self.ctrl_class_idx).flatten()
+        if not ctrl_mask.any() or (~ctrl_mask).sum() < 2:
+            return torch.tensor(0.0, device=z.device)
+        # Split latent into z and control z
+        z_ctrl, z_noctrl = z[ctrl_mask], z[~ctrl_mask]
+        ctx_ctrl, ctx_noctrl = b[ctrl_mask], b[~ctrl_mask]
+
+        # global positive similarities among non-controls
+        sim_pos = z_noctrl @ z_noctrl.T / T
+        mask_self = torch.eye(sim_pos.size(0), device=z.device)
+        # Class mask
+        same_class = (_y == _y.T).float()
+        pos_mask = same_class * (1 - mask_self)
+
+        # local negatives = control samples from same context only
+        sim_neg = z_noctrl @ z_ctrl.T / T
+        same_ctx = (ctx_ctrl.flatten() == ctx_noctrl).float()
+
+        # InfoNCE: positives (other perturbations) vs context-matched controls
+        pos = torch.exp(sim_pos).sum(dim=-1)
+        neg = torch.exp(sim_neg * same_ctx).sum(dim=-1)
+        log_probs = sim_pos - torch.log(neg + 1e-8)
+        loss_ps = -(log_probs * pos_mask).sum(dim=1) / (pos_mask.sum(dim=1) + 1e-08)
+        loss = self._reduce_loss(loss_ps, reduction=self.non_elbo_reduction)
+        return z_noctrl, _y, _b, loss
 
     def loss(
         self,
@@ -895,6 +973,7 @@ class XPert(VAE):
         generative_outputs: dict[str, Distribution | None],
         rl_weight: float = 1.0,
         kl_weight: float = 1.0,
+        ctrl_contrastive_weight: float = 1.0,
         cls_weight: float = 0.1,
         ctx_align_weight: float = 1.0,
         cls_align_weight: float = 1.0,
@@ -942,6 +1021,32 @@ class XPert(VAE):
 
         # Use full batch by default
         n_obs_minibatch = x.shape[0]
+        # Use full batch as default
+        ctrl_mask = None
+        n_obs_minibatch = x.shape[0]
+        # Handle control cells for elbo loss
+        if self.ctrl_class_idx is not None:
+            # Calculate control mask
+            ctrl_mask = (cls == self.ctrl_class_idx).reshape(-1)
+            # Check if there are any control cells in the batch
+            if ctrl_mask.sum() > 0:
+                # Calculate fraction of control cells in batch
+                ctrl_frac = x.shape[0] / max(ctrl_mask.sum(), 1)    # avoid div/0
+                # Divide elbo sum by class cells only
+                n_obs_minibatch = (~ctrl_mask).sum()
+                # Disregard elbo for control cells
+                if not self.use_reconstruction_control and not self.use_kl_control:
+                    reconst_loss[ctrl_mask] = 0.0
+                    kl_divergence_z[ctrl_mask] = 0.0
+                elif not self.use_reconstruction_control:
+                    reconst_loss[ctrl_mask] = 0.0
+                    kl_weight = kl_weight * ctrl_frac
+                elif not self.use_kl_control:
+                    kl_divergence_z[ctrl_mask] = 0.0
+                    rl_weight = rl_weight * ctrl_frac
+                else:
+                    # Use full batch
+                    n_obs_minibatch = x.shape[0]
         
         # Weighted reconstruction and KL
         weighted_reconst_loss = rl_weight * reconst_loss
@@ -954,8 +1059,14 @@ class XPert(VAE):
 
         # Create extra metric container
         extra_metrics = {MODULE_KEYS.KL_Z_PER_LATENT_KEY: kl_div_per_latent}
-        # Center z on control cell mean if control cells are encoded
-        z, cls, ctx = self._center_z_on_ctrl(z, cls, ctx)
+        # Center z on control cell mectrl_class_idxan if control cells are encoded
+        #z, cls, ctx = self._center_z_on_ctrl(z, cls, ctx)
+        # Split batch into z and z control
+        z, cls, ctx, contr_ctrl_loss = self._contr_ctrl_loss(z, cls, ctx)
+        # Add contrastive loss to control
+        if contr_ctrl_loss > 0 and ctrl_contrastive_weight:
+            total_loss = total_loss + contr_ctrl_loss * ctrl_contrastive_weight
+            extra_metrics[LOSS_KEYS.CTRL_CONTR_LOSS] = contr_ctrl_loss
 
         # Collect inital loss and extra parameters
         lo_kwargs = {
@@ -975,9 +1086,6 @@ class XPert(VAE):
             z_ce_loss = self._ce_cls_loss(z_cls_logits, y=cls, T=0.1)
             z_ce_loss = self._reduce_loss(z_ce_loss, reduction=self.non_elbo_reduction)
             # Add classification loss details
-            if torch.isnan(z_ce_loss):
-                import pdb
-                pdb.set_trace()
             lo_kwargs.update({
                 'classification_loss': z_ce_loss,
                 'logits': z_cls_logits,
@@ -1020,12 +1128,11 @@ class XPert(VAE):
             if joint_logits is None:
                 # Calculate manually
                 joint_logits = self.aligner.get_joint_logits(z_shared, joint2z, T=T_align)
-
             # Calculate clip loss for context embedding
             ctx_loss_ps = self._clip_loss(
                 z_shared, 
                 logits=ctx_logits, 
-                y=ctx, 
+                y=ctx.squeeze(-1), 
                 emb=ctx2z, 
                 weights=self.ctx_targets,
                 T=self.aligner.ctx_temperature
@@ -1034,7 +1141,7 @@ class XPert(VAE):
             cls_loss_ps = self._clip_loss(
                 z_shared, 
                 logits=cls_logits, 
-                y=cls, 
+                y=cls.squeeze(-1), 
                 emb=cls2z, 
                 weights=self.cls_targets,
                 T=self.aligner.cls_temperature
@@ -1088,7 +1195,6 @@ class XPert(VAE):
             total_loss = total_loss + align_loss
         # Add extra metrics to loss output
         lo_kwargs['extra_metrics'] = extra_metrics
-
         # Set total loss
         lo_kwargs[LOSS_KEYS.LOSS] = total_loss
         return LossOutput(**lo_kwargs)

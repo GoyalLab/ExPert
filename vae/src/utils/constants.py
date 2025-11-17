@@ -94,7 +94,7 @@ class _LOSS_KEYS_NT(NamedTuple):
     # Loss keys
     LOSS: str = "loss"
     ALIGN_LOSS: str = "align_loss"
-    CTRL_CLS_LOSS: str = "ctrl_cls_loss"
+    CTRL_CONTR_LOSS: str = "ctrl_contr_loss"
     ADV_LOSS: str = "adversial_context_loss"
     UNSCALED_LOSS: str = "unscaled_loss"
     CLIP_CLS_LOSS: str = "clip_cls_loss"
@@ -121,6 +121,8 @@ class _EXT_CLS_EMB_INIT_NT(NamedTuple):
     CTRL_CLASS_IDX_KEY: str = "ctrl_class_idx"
 
 class _PREDICTION_KEYS_NT(NamedTuple):
+    Z_PREDICTION_KEY: str = "z_prediction"
+    Z_SOFT_PREDICTION_KEY: str = "z_soft_predictions"
     PREDICTION_KEY: str = "prediction"
     SOFT_PREDICTION_KEY: str = "soft_predictions"
     CTX_PREDICTION_KEY: str = "ctx_prediction"

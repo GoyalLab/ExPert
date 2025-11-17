@@ -1192,7 +1192,6 @@ class Encoder(nn.Module):
         else:
             return self._temperature
     
-
     def forward(self, x: torch.Tensor, *cat_list: int, g: torch.Tensor | None = None, context_emb: torch.Tensor | None = None):
         # Optional feature masking
         if self.training and self.use_feature_mask and self.drop_prob > 0:
@@ -1553,6 +1552,7 @@ class ContextClassAligner(nn.Module):
         cls_emb: torch.Tensor,
         return_logits: bool = True,
         T: torch.Tensor | None = None,
+        ctrl_idx: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Parameters
@@ -1563,7 +1563,6 @@ class ContextClassAligner(nn.Module):
         cls_idx : Tensor, shape (B,)
         cls_emb : Tensor, shape (N_cls, cls_emb_dim)
         """
-        B = z.size(0)
         ctx_emb, cls_emb = ctx_emb.to(z.device), cls_emb.to(z.device)
 
         # ----- Latent projection -----
@@ -1575,6 +1574,9 @@ class ContextClassAligner(nn.Module):
         # ----- External projections -----
         c_ctx = self.ctx_projection(ctx_emb)        # (N_ctx, D)
         c_cls = self.cls_projection(cls_emb)        # (N_cls, D)
+        # Set control index to -inf if given
+        if ctrl_idx is not None:
+            c_cls[torch.as_tensor(ctrl_idx, device=c_cls.device, dtype=torch.long)] = -float('inf')
         # Compute joint projection with batch representations
         b_ctx = c_ctx[ctx_idx.squeeze(-1)]
         b_cls = c_cls[cls_idx.squeeze(-1)]

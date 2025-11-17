@@ -45,11 +45,10 @@ def _train(
         adata_p: str, 
         step_model_dir: str, 
         config: dict, 
-        ctrl_p: str | None = None,
-        ctrl_key: str = 'control',
         cls_label: str = 'cls_label',
         batch_key: str = 'context',
         verbose: bool = False,
+        context_filter: list[str] | None = None,
         **train_kwargs
     ) -> ExPert:
     """Train wrapper for ExPert.train()"""
@@ -57,12 +56,11 @@ def _train(
     model_set = sc.read(adata_p)
     # Check if dataset is compatible
     assert cls_label in model_set.obs.columns and batch_key in model_set.obs.columns
-    if ctrl_p is not None:
-        # Read control data and add to model set
-        ctrl_set = sc.read(ctrl_p)
-        # Subset control set to observed batches
-        ctrl_mask = ctrl_set
-  
+    
+    # Subset model to only the include specified datasets
+    if context_filter is not None:
+        log.info(f'Subsetting to context keys: {context_filter}')
+        model_set._inplace_subset_obs(model_set.obs[batch_key].isin(context_filter))
     # Set precision
     torch.set_float32_matmul_precision('medium')
 
@@ -85,7 +83,7 @@ def _train(
     model.train(config, **train_kwargs)
     return model
 
-def train(adata_p: str, config_p: str, out_dir: str, ctrl_p: str | None = None, **kwargs) -> dict[str: nn.Module | pd.DataFrame | ad.AnnData | str]:
+def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.Module | pd.DataFrame | ad.AnnData | str]:
     """Train wrapper for use with config file."""
     # Load run config TODO: add model schema to check for invalid arguments
     config = read_config(config_p, do_setup=False, check_schema=False)
@@ -94,7 +92,6 @@ def train(adata_p: str, config_p: str, out_dir: str, ctrl_p: str | None = None, 
     # Train the model
     model: ExPert = _train(
         adata_p=adata_p, 
-        ctrl_p=ctrl_p,
         step_model_dir=step_model_dir, 
         config=config,
         **kwargs
@@ -106,7 +103,6 @@ def full_run(
         train_p: str,
         model_dir: str,
         test_p: str,
-        ctrl_p: str | None = None,
         test_unseen: bool = True,
         load_checkpoint: bool = True,
         cls_label: str = 'perturbation',
@@ -125,7 +121,6 @@ def full_run(
         adata_p=train_p, 
         config_p=config_p, 
         out_dir=model_dir,
-        ctrl_p=ctrl_p 
         **kwargs
     )
     # Evaluate model
