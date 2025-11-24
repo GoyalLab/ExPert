@@ -100,7 +100,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         freeze_decoder_epoch: int | None = None,
         gene_emb: torch.Tensor | None = None,
         anneal_schedules: dict[str, dict[str | float]] | None = None,
-        use_contrastive_loader: Literal["train", "val", "both"] | None = "train",
         multistage_kl_frac: float = 0.1,
         multistage_kl_min: float = 1e-2,
         use_local_stage_warmup: bool = False,
@@ -116,6 +115,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Caching options
         cache_n_epochs: int | None = 1,
         n_train_step_cache: int = 64,
+        save_cache: bool = False,
         **loss_kwargs,
     ):
         # Get custom optimizer for soft freezing if argument is provided
@@ -162,7 +162,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.log_class_distribution = log_class_distribution
         self.freeze_encoder_epoch = freeze_encoder_epoch
         self.freeze_decoder_epoch = freeze_decoder_epoch
-        self.use_contrastive_loader = use_contrastive_loader
         # Misc
         self.average = average                                                      # How to reduce the classification metrics
         self.top_k = top_k                                                          # How many top predictions to consider for metrics
@@ -180,6 +179,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # ----- Cache -----
         self.cache = {}
         self.n_train_step_cache = n_train_step_cache
+        self.save_cache = save_cache
         # Cache for embeddings and metadata within epoch
         self.epoch_cache = {
             'train': defaultdict(list),
@@ -303,25 +303,31 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             if loss_output.logits is not None:
                 self.epoch_cache[mode][PREDICTION_KEYS.PREDICTION_KEY].append(torch.argmax(loss_output.logits, dim=-1).cpu())
                 self.epoch_cache[mode][MODULE_KEYS.CLS_LOGITS_KEY].append(loss_output.logits.cpu())
-            if MODULE_KEYS.Z_SHARED_KEY in inference_outputs:
-                self.epoch_cache[mode][MODULE_KEYS.Z_SHARED_KEY].append(inference_outputs[MODULE_KEYS.Z_SHARED_KEY].cpu())
+            # Add shared latent space to cache
+            if MODULE_KEYS.Z_SHARED_KEY in loss_output.extra_metrics['extra_outputs']:
+                self.epoch_cache[mode][MODULE_KEYS.Z_SHARED_KEY].append(loss_output.extra_metrics['extra_outputs'][MODULE_KEYS.Z_SHARED_KEY].cpu())
+            # Add class projection to cache
+            if MODULE_KEYS.CLS_PROJ_KEY in loss_output.extra_metrics['extra_outputs']:
+                self.epoch_cache[mode][MODULE_KEYS.CLS_PROJ_KEY].append(loss_output.extra_metrics['extra_outputs'][MODULE_KEYS.CLS_PROJ_KEY].cpu())
 
     def _process_epoch_cache(self, mode: str) -> dict[str, np.ndarray]:
         """Process and clear the epoch cache, returning concatenated arrays."""
-        cache = self.epoch_cache[mode]
+        cache = self.epoch_cache.get(mode, None)
         if not cache:
             return {}
-            
         # Concatenate all cached tensors
         processed = {
             MODULE_KEYS.Z_KEY: torch.cat(cache[MODULE_KEYS.Z_KEY], dim=0).numpy(),
             REGISTRY_KEYS.LABELS_KEY: torch.cat(cache[REGISTRY_KEYS.LABELS_KEY], dim=0).numpy().squeeze(),
             REGISTRY_KEYS.BATCH_KEY: torch.cat(cache[REGISTRY_KEYS.BATCH_KEY], dim=0).numpy().squeeze(),
         }
-
+        # Add cached shared latent space to output
         if MODULE_KEYS.Z_SHARED_KEY in cache:
             processed[MODULE_KEYS.Z_SHARED_KEY] = torch.cat(cache.get(MODULE_KEYS.Z_SHARED_KEY), dim=0).numpy()
-        
+        # Add mean cached class projections to outuput
+        if MODULE_KEYS.CLS_PROJ_KEY in cache:
+            processed[MODULE_KEYS.CLS_PROJ_KEY] = torch.stack(cache.get(MODULE_KEYS.CLS_PROJ_KEY), dim=0).mean(dim=0).numpy()
+
         if cache.get(PREDICTION_KEYS.PREDICTION_KEY, []):
             processed[PREDICTION_KEYS.PREDICTION_KEY] = torch.cat(cache[PREDICTION_KEYS.PREDICTION_KEY], dim=0).numpy().squeeze()
             processed[MODULE_KEYS.CLS_LOGITS_KEY] = torch.cat(cache[MODULE_KEYS.CLS_LOGITS_KEY], dim=0).numpy().squeeze()
@@ -643,8 +649,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 metrics_dict[top_k_acc_key] = top_k_accuracy
                 metrics_dict[top_k_f1_key] = top_k_f1
         # Add clip classification metrics
-        # Get predcitions if they exist
-        clip_cls_pred = loss_output.extra_metrics.pop(PREDICTION_KEYS.PREDICTION_KEY, None)
+        clip_cls_pred = loss_output.extra_metrics['extra_outputs'].pop(PREDICTION_KEYS.PREDICTION_KEY, None)
         if clip_cls_pred is not None:
             # Check if any classes are outside of training classes, i.e
             unknown_mask = (clip_cls_pred >= n_classes)
@@ -673,6 +678,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             metrics_dict[f'clip_{METRIC_KEYS.F1_SCORE_KEY}'] = f1
         # Add metrics to extra metrics for internal logging
         loss_output.extra_metrics.update(metrics_dict)
+        # Remove all extra outputs from metrics for super logging
+        loss_output.extra_metrics.pop('extra_outputs')
         # Compute and log all metrics
         super().compute_and_log_metrics(loss_output, metrics, mode)
 
@@ -735,8 +742,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             # Add gene embedding matrix to batch
             batch[REGISTRY_KEYS.GENE_EMB_KEY] = self.gene_emb
         # Perform full forward pass of model
-        inference, generative, loss_output = self.forward(batch, loss_kwargs=input_kwargs)
-        return inference, generative, loss_output
+        return self.forward(batch, loss_kwargs=input_kwargs)
         
     def training_step(self, batch, batch_idx):
         """Training step for supervised training."""
@@ -755,6 +761,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.log(k, w, on_epoch=True, prog_bar=False)
         # Log learnable temperatures if given
         self._log_temperatures()
+        # Save in cache
+        with torch.no_grad():
+            self._cache_step_data('train', batch, inference_outputs, loss_output)
         # Log other metrics
         self.compute_and_log_metrics(loss_output, self.train_metrics, "train")
         y = loss_output.true_labels.squeeze(-1)
@@ -764,9 +773,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.class_batch_counts[u].append(c)
         # Save number of classes / batch
         self.train_class_counts.append(len(unique))
-        # Save in cache
-        with torch.no_grad():
-            self._cache_step_data('train', batch, inference_outputs, loss_output)
         # Return final loss value
         return loss
 
@@ -782,10 +788,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
             prog_bar=True,
         )
-        self.compute_and_log_metrics(loss_output, self.val_metrics, "validation")
         # Cache the data
         with torch.no_grad():
             self._cache_step_data('val', batch, inference_outputs, loss_output)
+        # Log metrics
+        self.compute_and_log_metrics(loss_output, self.val_metrics, "validation")
 
     def test_step(self, batch, batch_idx):
         """Test step for supervised training."""
@@ -799,10 +806,11 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             batch_size=loss_output.n_obs_minibatch,
             prog_bar=True,
         )
-        self.compute_and_log_metrics(loss_output, self.test_metrics, "test")
         # Cache the data
         with torch.no_grad():
             self._cache_step_data('test', batch, inference_outputs, loss_output)
+        # Log metrics
+        self.compute_and_log_metrics(loss_output, self.test_metrics, "test")
 
     def on_train_epoch_start(self):        
         # Freeze module encoder at a certain epoch if option is enabled
@@ -1021,114 +1029,155 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             )
 
     def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray]):
-        """Plot umap of latent space in tensorboard logger"""
+        """Plot UMAP of latent space (with proxies) into TensorBoard."""
+        import os
         import umap
+        import numpy as np
+        import pandas as pd
+        import seaborn as sns
+        import matplotlib.pyplot as plt
 
-        emb_key = self.plot_umap_key
-        # Extract data from forward pass
+        # Get shared latent embedding and annotation data, fall back to z if not in cached data
+        emb_key = self.plot_umap_key if self.plot_umap_key in mode_data else MODULE_KEYS.Z_KEY
         embeddings = mode_data[emb_key]
         labels = mode_data[REGISTRY_KEYS.LABELS_KEY]
         covs = mode_data[REGISTRY_KEYS.BATCH_KEY]
         modes = pd.Categorical(mode_data[REGISTRY_KEYS.SPLIT_KEY])
-        # Subset z to no control cells
+
+        # --- Subset: remove control cells
         if self.module.ctrl_class_idx is not None:
-            no_ctrl_mask = (labels != self.module.ctrl_class_idx)
-            embeddings = embeddings[no_ctrl_mask]
-            labels = labels[no_ctrl_mask]
-            covs = covs[no_ctrl_mask]
-            modes = modes[no_ctrl_mask]
-        # Look for actual label encoding
-        if "_code_to_label" in self.loss_kwargs:
-            labels = [self.loss_kwargs["_code_to_label"][l] for l in labels]
+            mask = labels != self.module.ctrl_class_idx
+            embeddings, labels, covs, modes = embeddings[mask], labels[mask], covs[mask], modes[mask]
+        # Add batch annotation
         if self.batch_labels is not None:
             covs = self.batch_labels[covs]
-        labels = pd.Categorical(labels)
-        covs = pd.Categorical(covs)
-        
-        # Create cache structure if it doesn't exist
-        if 'umap_cache' not in self.cache:
-            self.cache['umap_cache'] = {}
-        
-        # Check if we have a cached UMAP transformer for this mode
-        transformer_key = f'{mode}_umap_transformer'
-        embedding_key = f'{mode}_umap_reference'
-        
-        if transformer_key not in self.cache['umap_cache']:
-            # First time - fit UMAP and cache the transformer and reference embedding
-            self.cache['umap_cache'][transformer_key] = umap.UMAP(n_components=2)
-            embeddings_2d = self.cache['umap_cache'][transformer_key].fit_transform(embeddings)
-            self.cache['umap_cache'][embedding_key] = embeddings  # Store reference embedding
+        # --- Add class proxies if they exist (no alignment yet)
+        if MODULE_KEYS.CLS_PROJ_KEY in mode_data:
+            cls_proxies = mode_data[MODULE_KEYS.CLS_PROJ_KEY]
+            n_proxies = cls_proxies.shape[0]
+
+            # proxy label ids
+            proxy_labels = np.arange(n_proxies)
+            proxy_covs = np.repeat("proxy", n_proxies)
+            proxy_modes = np.repeat("proxy", n_proxies)
+            proxy_is_obs = np.array(
+                [True] * self.module.n_labels + [False] * (self.module.n_cls - self.module.n_labels)
+            )[:n_proxies]
+
+            # --- combine into a unified DataFrame
+            df = pd.DataFrame({
+                "UMAP_input_idx": np.arange(len(labels) + n_proxies),
+                "label_id": np.concatenate((labels, proxy_labels)),
+                "cov": np.concatenate((covs, proxy_covs)),
+                "mode": np.concatenate((modes, proxy_modes)),
+                "is_proxy": np.concatenate((np.zeros(len(labels), dtype=bool), np.ones(n_proxies, dtype=bool))),
+                "is_observed": np.concatenate((np.ones(len(labels), dtype=bool), proxy_is_obs))
+            })
+            # Combine latent embeddings with class proxies
+            embeddings_all = np.concatenate((embeddings, cls_proxies), axis=0)
         else:
-            # Check if embeddings have changed significantly
-            ref_embeddings = self.cache['umap_cache'][embedding_key]
-            if embeddings.shape == ref_embeddings.shape:
-                # Calculate relative difference
-                rel_diff = np.mean(np.abs(embeddings - ref_embeddings)) / (np.mean(np.abs(ref_embeddings)) + 1e-6)
-                if rel_diff > 0.1:  # Refit if embeddings have changed significantly (10% threshold)
-                    self.cache['umap_cache'][transformer_key] = umap.UMAP(n_components=2)
-                    embeddings_2d = self.cache['umap_cache'][transformer_key].fit_transform(embeddings)
-                    self.cache['umap_cache'][embedding_key] = embeddings
+            # --- combine into a unified DataFrame
+            df = pd.DataFrame({
+                "UMAP_input_idx": np.arange(len(labels)),
+                "label_id": labels,
+                "cov": covs,
+                "mode": modes,
+                "is_proxy": np.zeros(len(labels), dtype=bool),
+                "is_observed": np.ones(len(labels), dtype=bool)
+            })
+            # Combine latent embeddings with class proxies
+            embeddings_all = embeddings
+
+        # --- optional label mapping
+        if "_code_to_label" in self.loss_kwargs:
+            df["label"] = self.loss_kwargs["_code_to_label"][df['label_id']]
+        else:
+            df["label"] = df["label_id"].astype(str)
+
+        # --- cached UMAP transform
+        cache = self.cache.setdefault("umap_cache", {})
+        transformer_key = f"{mode}_umap_transformer"
+        ref_key = f"{mode}_umap_reference"
+
+        if transformer_key not in cache:
+            reducer = umap.UMAP(n_components=2)
+            emb_2d = reducer.fit_transform(embeddings_all)
+            cache[transformer_key] = reducer
+            cache[ref_key] = embeddings_all
+        else:
+            ref = cache[ref_key]
+            if embeddings_all.shape == ref.shape:
+                rel_diff = np.mean(np.abs(embeddings_all - ref)) / (np.mean(np.abs(ref)) + 1e-6)
+                if rel_diff > 0.1:
+                    reducer = umap.UMAP(n_components=2)
+                    emb_2d = reducer.fit_transform(embeddings_all)
+                    cache[transformer_key] = reducer
+                    cache[ref_key] = embeddings_all
                 else:
-                    # Use cached transformer for similar embeddings
-                    embeddings_2d = self.cache['umap_cache'][transformer_key].transform(embeddings)
+                    reducer = cache[transformer_key]
+                    emb_2d = reducer.transform(embeddings_all)
             else:
-                # Refit if embedding dimensions have changed
-                self.cache['umap_cache'][transformer_key] = umap.UMAP(n_components=2)
-                embeddings_2d = self.cache['umap_cache'][transformer_key].fit_transform(embeddings)
-                self.cache['umap_cache'][embedding_key] = embeddings
-    
-        """Plots a UMAP projection of Z latent space."""
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-    
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=150)
-        # Plot modes
-        sns.scatterplot(
-            x=embeddings_2d[:, 0],
-            y=embeddings_2d[:, 1],
-            hue=modes,
-            alpha=0.7,
-            s=4,
-            ax=axes[0,0],
-            legend=True
-        )
-        axes[0,0].set_title(f"Splits @ Epoch: {self.current_epoch}")
-        axes[0,0].set_xlabel("UMAP1")
-        axes[0,0].set_ylabel("UMAP2")
-        axes[0,0].legend(title="Split")
-        # Plot classes
-        sns.scatterplot(
-            x=embeddings_2d[:, 0],
-            y=embeddings_2d[:, 1],
-            hue=labels,
-            alpha=0.7,
-            s=4,
-            ax=axes[0,1],
-            legend=False
-        )
-        axes[0,1].set_title(f"Classes @ Epoch: {self.current_epoch}")
-        axes[0,1].set_xlabel("UMAP1")
-        axes[0,1].set_ylabel("UMAP2")
-        # Plot batch keys
-        sns.scatterplot(
-            x=embeddings_2d[:, 0],
-            y=embeddings_2d[:, 1],
-            hue=covs,
-            alpha=0.7,
-            s=4,
-            ax=axes[1,0],
-        )
-        axes[1,0].set_title(f"Contexts @ Epoch: {self.current_epoch}")
-        axes[1,0].set_xlabel("UMAP1")
-        axes[1,0].set_ylabel("UMAP2")
-        axes[1,0].legend(
-            bbox_to_anchor=(1.05, 1),
-            loc='upper left',
-            borderaxespad=0,
-            markerscale=2,
-            title="Contexts",
-        )
-        # Make last plot invisible
-        axes[1, 1].set_visible(False)
+                reducer = umap.UMAP(n_components=2)
+                emb_2d = reducer.fit_transform(embeddings_all)
+                cache[transformer_key] = reducer
+                cache[ref_key] = embeddings_all
+
+        # Add umap coordinates to dataframe
+        df["UMAP1"], df["UMAP2"] = emb_2d[:, 0], emb_2d[:, 1]
+
+        # --- plotting helper
+        def _scatter_base(ax, data, hue, title, legend=True, plot_proxy=True, proxy_color="black", proxy_legend=True):
+            sns.scatterplot(
+                data=data[~data.is_proxy],
+                x="UMAP1", y="UMAP2", hue=hue,
+                s=6, alpha=0.6, ax=ax, legend=legend
+            )
+            # overlay proxies as crosses
+            if plot_proxy:
+                sns.scatterplot(
+                    data=data[data.is_proxy],
+                    x="UMAP1", y="UMAP2", hue=hue,
+                    s=40, marker="X", ax=ax, legend=proxy_legend,
+                    edgecolor=proxy_color, linewidth=0.5
+                )
+            ax.set_title(title)
+            ax.set_xlabel("UMAP1")
+            ax.set_ylabel("UMAP2")
+            # Adjust legend
+            if legend or proxy_legend:
+                ax.legend(
+                    bbox_to_anchor=(1.05, 1),
+                    loc="upper left",
+                    borderaxespad=0,
+                    markerscale=2,
+                    fontsize="small"
+                )
+
+        # --- create figure grid
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9), dpi=150)
+
+        # 1. by modes (splits)
+        _scatter_base(axes[0, 0], df, "mode", f"Splits @ Epoch {self.current_epoch}")
+
+        # 2. by class (overlay proxies)
+        _scatter_base(axes[0, 1], df, "label", f"Classes @ Epoch {self.current_epoch}", legend=False, plot_proxy=False, proxy_legend=False)
+
+        # 3. by observed vs unseen
+        df_obs = df.copy()
+        df_obs["obs_label"] = np.where(df_obs.is_observed, "Observed proxy", "Unseen proxy")
+        _scatter_base(axes[1, 0], df_obs, "obs_label", f"Observed vs Unseen @ Epoch {self.current_epoch}")
+
+        # 4. by covariates (contexts)
+        _scatter_base(axes[1, 1], df, "cov", f"Contexts @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False)
+
+        plt.tight_layout()
         self.logger.experiment.add_figure(f"{mode}_{emb_key}_umap", fig, self.current_epoch)
         plt.close(fig)
+
+        # Save data to file
+        if self.save_cache:
+            umap_dir = os.path.join(self.logger.log_dir, 'data')
+            os.makedirs(umap_dir, exist_ok=True)
+            csv_path = os.path.join(umap_dir, f"{mode}_umap_data_epoch{self.current_epoch}.csv")
+            df.to_csv(csv_path, index=False)
+

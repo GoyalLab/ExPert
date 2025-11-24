@@ -1433,6 +1433,7 @@ class ContextClassAligner(nn.Module):
         linear_cls_proj: bool = False,
         unseen_buffer_prob: float = 0.1,
         return_projections: bool = True,
+        use_z: bool = True,
         n_heads: int = 1,
         **kwargs,
     ):
@@ -1466,7 +1467,10 @@ class ContextClassAligner(nn.Module):
 
         # Set number of hidden to inp
         # --------- Latent projection(s) ---------
-        if n_hidden is None and n_layers is None:
+        # Use z as shared dimension
+        if use_z and n_input == n_shared:
+            self.latent_projection = nn.Identity()
+        elif n_hidden is None and n_layers is None:
             # Simple linear projection
             self.latent_projection = nn.Linear(n_input, n_shared)
         else:
@@ -1508,7 +1512,8 @@ class ContextClassAligner(nn.Module):
             )
 
         # --------- FiLM ------------
-        self.film = FiLM(n_shared, context_dim=n_shared)
+        if use_film:
+            self.film = FiLM(n_shared, context_dim=n_shared)
 
         # --------- Dropout ---------
         self.dropout = nn.Dropout(p=dropout_rate)
@@ -1535,6 +1540,8 @@ class ContextClassAligner(nn.Module):
             return self.T_min
         
     def get_temp_reg_loss(self) -> torch.Tensor:
+        if not self.use_learnable_temperature:
+            return torch.tensor(0.0)
         m = (self.T_max - self.T_min)
         loss = (
             (self.ctx_temperature - m)**2 +
@@ -1553,6 +1560,7 @@ class ContextClassAligner(nn.Module):
         return_logits: bool = True,
         T: torch.Tensor | None = None,
         ctrl_idx: int | None = None,
+        n_negatives: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Parameters
@@ -1564,6 +1572,8 @@ class ContextClassAligner(nn.Module):
         cls_emb : Tensor, shape (N_cls, cls_emb_dim)
         """
         ctx_emb, cls_emb = ctx_emb.to(z.device), cls_emb.to(z.device)
+        
+        C = cls_emb.size(0)
 
         # ----- Latent projection -----
         h = self.latent_projection(z)
@@ -1574,12 +1584,14 @@ class ContextClassAligner(nn.Module):
         # ----- External projections -----
         c_ctx = self.ctx_projection(ctx_emb)        # (N_ctx, D)
         c_cls = self.cls_projection(cls_emb)        # (N_cls, D)
+        # Get batch-specific embeddings
+        b_ctx = c_ctx[ctx_idx.squeeze(-1)]
+        b_cls = c_cls[cls_idx.squeeze(-1)]
         # Set control index to -inf if given
         if ctrl_idx is not None:
             c_cls[torch.as_tensor(ctrl_idx, device=c_cls.device, dtype=torch.long)] = -float('inf')
+
         # Compute joint projection with batch representations
-        b_ctx = c_ctx[ctx_idx.squeeze(-1)]
-        b_cls = c_cls[cls_idx.squeeze(-1)]
         b_joint = b_ctx + b_cls + (b_ctx * b_cls)   # (B, D)
         # Use FiLM modulation for context
         if self.use_film:

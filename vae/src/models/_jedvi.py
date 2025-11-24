@@ -6,7 +6,7 @@ from src.utils.preprocess import scale_1d_array
 from src.utils._callbacks import DelayedEarlyStopping
 import src.utils.plotting as pl
 from src.modules._jedvae import JEDVAE
-from src.modules._splitter import ContrastiveDataSplitter
+from src.modules._splitter import DataSplitter
 from src._train.plan import ContrastiveSupervisedTrainingPlan
 from src.data._manager import EmbAnnDataManager
 
@@ -801,19 +801,14 @@ class JEDVI(
             data_params['cache_indices'] = cache_indices
 
         # Create data splitter
-        data_splitter = ContrastiveDataSplitter(
+        data_splitter = DataSplitter(
             adata_manager=self.adata_manager,
             train_size=train_size,
             **data_params,
         )
         # Setup training plan
         plan_kwargs: dict = train_params.pop('plan_kwargs', {})
-        # Specify which splits use contrastive loading
-        plan_kwargs['use_contrastive_loader'] = data_splitter.use_contrastive_loader
 
-        # Use contrastive loss in validation if that set uses the same splitter
-        if data_params.get('use_contrastive_loader', None) in ['val', 'both']:
-            plan_kwargs['use_contr_in_val'] = True
         # Share code to label mapping with training plan
         plan_kwargs['_code_to_label'] = self._code_to_label.copy()
         # Share batch labels with training plan

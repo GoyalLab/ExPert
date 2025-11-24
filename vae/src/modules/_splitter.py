@@ -1,437 +1,231 @@
 import lightning.pytorch as pl
 import numpy as np
 from typing import Literal
-from src.data._contrastive_loader import ContrastiveAnnDataLoader
 from sklearn.model_selection import train_test_split
 
+from src.data import BalancedAnnDataLoader
 from scvi import REGISTRY_KEYS, settings
 from scvi.data import AnnDataManager
 from scvi.data._utils import get_anndata_attribute
 from scvi.dataloaders._ann_dataloader import AnnDataLoader
-from scvi.dataloaders._semi_dataloader import SemiSupervisedDataLoader
-from scvi.dataloaders._data_splitting import validate_data_split, validate_data_split_with_external_indexing
 
 import logging
 log = logging.getLogger(__name__)
 
 
-class SemiSupervisedDataSplitter(pl.LightningDataModule):
-    """Creates data loaders ``train_set``, ``validation_set``, ``test_set``.
+class DataSplitter(pl.LightningDataModule):
+    """
+    General data splitter supporting both supervised and contrastive training setups.
 
-    If ``train_size + validation_set < 1`` then ``test_set`` is non-empty.
-    The ratio between labeled and unlabeled data in adata will be preserved
-    in the train/test/val sets.
-
-    Parameters
-    ----------
-    adata_manager
-        :class:`~scvi.data.AnnDataManager` object that has been created via ``setup_anndata``.
-    train_size
-        float, or None (default is None, which is practicaly 0.9 and potentially adding small last
-        batch to validation cells)
-    validation_size
-        float, or None (default is None)
-    shuffle_set_split
-        Whether to shuffle indices before splitting. If `False`, the val, train, and test set
-        are split in the sequential order of the data according to `validation_size` and
-        `train_size` percentages.
-    n_samples_per_label
-        Number of subsamples for each label class to sample per epoch
-    pin_memory
-        Whether to copy tensors into device-pinned memory before returning them. Passed
-        into :class:`~scvi.data.AnnDataLoader`.
-    external_indexing
-        A list of data split indices in the order of training, validation, and test sets.
-        Validation and test set are not required and can be left empty.
-        Note that per group (train,valid,test) it will cover both the labeled and unlebeled parts
-    **kwargs
-        Keyword args for data loader. If adata has labeled data, data loader
-        class is :class:`~scvi.dataloaders.SemiSupervisedDataLoader`,
-        else data loader class is :class:`~scvi.dataloaders.AnnDataLoader`.
-
-    Examples
-    --------
-    >>> adata = scvi.data.synthetic_iid()
-    >>> scvi.model.SCVI.setup_anndata(adata, labels_key="labels")
-    >>> adata_manager = scvi.model.SCVI(adata).adata_manager
-    >>> unknown_label = "label_0"
-    >>> splitter = SemiSupervisedDataSplitter(adata, unknown_label)
-    >>> splitter.setup()
-    >>> train_dl = splitter.train_dataloader()
+    loader_type: {'supervised', 'contrastive', 'vanilla'}
+        Controls which data loader is used.
     """
 
     def __init__(
         self,
         adata_manager: AnnDataManager,
-        train_size: float | None = None,
+        loader_type: Literal['balanced', 'vanilla'] = 'balanced',
+        train_size: float | None = 0.9,
         validation_size: float | None = None,
         shuffle_set_split: bool = True,
-        n_samples_per_label: int | None = None,
-        pin_memory: bool = False,
-        external_indexing: list[np.array, np.array, np.array] | None = None,
-        shuffle_train: bool = True,
-        **kwargs,
-    ):
-        super().__init__()
-        self.adata_manager = adata_manager
-        self.train_size_is_none = not bool(train_size)
-        self.train_size = 0.9 if self.train_size_is_none else float(train_size)
-        self.validation_size = validation_size
-        self.shuffle_set_split = shuffle_set_split
-        self.drop_last = kwargs.pop("drop_last", False)
-        self.data_loader_kwargs = kwargs
-        self.n_samples_per_label = n_samples_per_label
-        self.shuffle_train = shuffle_train
-
-        labels_state_registry = adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
-        labels = get_anndata_attribute(
-            adata_manager.adata,
-            adata_manager.data_registry.labels.attr_name,
-            labels_state_registry.original_key,
-        ).ravel()
-        self.unlabeled_category = labels_state_registry.unlabeled_category
-        self._unlabeled_indices = np.argwhere(labels == self.unlabeled_category).ravel()
-        self._labeled_indices = np.argwhere(labels != self.unlabeled_category).ravel()
-
-        self.pin_memory = pin_memory
-        self.external_indexing = external_indexing
-
-    def setup(self, stage: str | None = None):
-        """Split indices in train/test/val sets."""
-        n_labeled_idx = len(self._labeled_indices)
-        n_unlabeled_idx = len(self._unlabeled_indices)
-
-        if n_labeled_idx != 0:
-            # Need to separate to the external and non-external cases of the labeled indices
-            if self.external_indexing is not None:
-                # first we need to intersect the external indexing given with the labeled indices
-                labeled_idx_train, labeled_idx_val, labeled_idx_test = (
-                    np.intersect1d(self.external_indexing[n], self._labeled_indices)
-                    for n in range(3)
-                )
-                n_labeled_train, n_labeled_val = validate_data_split_with_external_indexing(
-                    n_labeled_idx,
-                    [labeled_idx_train, labeled_idx_val, labeled_idx_test],
-                    self.data_loader_kwargs.pop("batch_size", settings.batch_size),
-                    self.drop_last,
-                )
-            else:
-                n_labeled_train, n_labeled_val = validate_data_split(
-                    n_labeled_idx,
-                    self.train_size,
-                    self.validation_size,
-                    self.data_loader_kwargs.pop("batch_size", settings.batch_size),
-                    self.drop_last,
-                    self.train_size_is_none,
-                )
-
-                labeled_permutation = self._labeled_indices
-                if self.shuffle_set_split:
-                    rs = np.random.RandomState(seed=settings.seed)
-                    labeled_permutation = rs.choice(
-                        self._labeled_indices, len(self._labeled_indices), replace=False
-                    )
-
-                labeled_idx_val = labeled_permutation[:n_labeled_val]
-                labeled_idx_train = labeled_permutation[
-                    n_labeled_val : (n_labeled_val + n_labeled_train)
-                ]
-                labeled_idx_test = labeled_permutation[(n_labeled_val + n_labeled_train) :]
-        else:
-            labeled_idx_test = []
-            labeled_idx_train = []
-            labeled_idx_val = []
-
-        if n_unlabeled_idx != 0:
-            # Need to separate to the external and non-external cases of the unlabeled indices
-            if self.external_indexing is not None:
-                # we need to intersect the external indexing given with the labeled indices
-                unlabeled_idx_train, unlabeled_idx_val, unlabeled_idx_test = (
-                    np.intersect1d(self.external_indexing[n], self._unlabeled_indices)
-                    for n in range(3)
-                )
-                n_unlabeled_train, n_unlabeled_val = validate_data_split_with_external_indexing(
-                    n_unlabeled_idx,
-                    [unlabeled_idx_train, unlabeled_idx_val, unlabeled_idx_test],
-                    self.data_loader_kwargs.pop("batch_size", settings.batch_size),
-                    self.drop_last,
-                )
-            else:
-                n_unlabeled_train, n_unlabeled_val = validate_data_split(
-                    n_unlabeled_idx,
-                    self.train_size,
-                    self.validation_size,
-                    self.data_loader_kwargs.pop("batch_size", settings.batch_size),
-                    self.drop_last,
-                    self.train_size_is_none,
-                )
-
-                unlabeled_permutation = self._unlabeled_indices
-                if self.shuffle_set_split:
-                    rs = np.random.RandomState(seed=settings.seed)
-                    unlabeled_permutation = rs.choice(
-                        self._unlabeled_indices,
-                        len(self._unlabeled_indices),
-                        replace=False,
-                    )
-
-                unlabeled_idx_val = unlabeled_permutation[:n_unlabeled_val]
-                unlabeled_idx_train = unlabeled_permutation[
-                    n_unlabeled_val : (n_unlabeled_val + n_unlabeled_train)
-                ]
-                unlabeled_idx_test = unlabeled_permutation[(n_unlabeled_val + n_unlabeled_train) :]
-        else:
-            unlabeled_idx_train = []
-            unlabeled_idx_val = []
-            unlabeled_idx_test = []
-
-        indices_train = np.concatenate((labeled_idx_train, unlabeled_idx_train))
-        indices_val = np.concatenate((labeled_idx_val, unlabeled_idx_val))
-        indices_test = np.concatenate((labeled_idx_test, unlabeled_idx_test))
-
-        self.train_idx = indices_train.astype(int)
-        self.val_idx = indices_val.astype(int)
-        self.test_idx = indices_test.astype(int)
-
-        if len(self._labeled_indices) != 0:
-            self.data_loader_class = SemiSupervisedDataLoader
-            dl_kwargs = {
-                "n_samples_per_label": self.n_samples_per_label,
-            }
-        else:
-            self.data_loader_class = AnnDataLoader
-            dl_kwargs = {}
-
-        self.data_loader_kwargs.update(dl_kwargs)
-
-    def train_dataloader(self):
-        """Create the train data loader."""
-        return self.data_loader_class(
-            self.adata_manager,
-            indices=self.train_idx,
-            shuffle=self.shuffle_train,
-            drop_last=self.drop_last,
-            pin_memory=self.pin_memory,
-            **self.data_loader_kwargs,
-        )
-
-    def val_dataloader(self):
-        """Create the validation data loader."""
-        if len(self.val_idx) > 0:
-            return self.data_loader_class(
-                self.adata_manager,
-                indices=self.val_idx,
-                shuffle=False,
-                drop_last=False,
-                pin_memory=self.pin_memory,
-                **self.data_loader_kwargs,
-            )
-        else:
-            pass
-
-    def test_dataloader(self):
-        """Create the test data loader."""
-        if len(self.test_idx) > 0:
-            return self.data_loader_class(
-                self.adata_manager,
-                indices=self.test_idx,
-                shuffle=False,
-                drop_last=False,
-                pin_memory=self.pin_memory,
-                **self.data_loader_kwargs,
-            )
-        else:
-            pass
-
-
-class ContrastiveDataSplitter(pl.LightningDataModule):
-    """
-    Contrastive data splitter. Creates label and context balanced batches.
-    """
-    def __init__(
-        self,
-        adata_manager: AnnDataManager,
-        train_size: float | None = None,
-        validation_size: float | None = None,
-        shuffle_set_split: bool = True,
-        max_cells_per_batch: int = 24,
-        max_classes_per_batch: int = 20,
+        n_samples: int | None = 500,
+        batch_size: int = 512,
         ctrl_class: str | None = None,
-        ctrl_frac: float | None = 1,
+        ctrl_frac: float | None = 1.0,
         last_first: bool = True,
         shuffle_classes: bool = True,
         pin_memory: bool = False,
         use_copy: bool = True,
-        use_contrastive_loader: Literal['train', 'val', 'both'] | None = 'train',
-        use_control: Literal['train', 'val', 'both'] | None = 'train',
+        use_special_for_split: list[str] = ['train'],
         test_context_labels: np.ndarray | None = None,
-        external_indexing: list[np.array, np.array, np.array] | None = None,
-        cache_indices: dict[str, np.array] | None = None,
+        external_indexing: list[np.ndarray, np.ndarray, np.ndarray] | None = None,
+        cache_indices: dict[str, np.ndarray] | None = None,
+        drop_last: bool = False,
+        use_balanced_weights: bool = True,
+        use_contrastive_loader: bool = True,
+        n_classes_per_batch: int | None = None,
+        n_samples_per_class: int | None = None,
+        min_contexts_per_class: int | None = None,
         **kwargs,
     ):
         super().__init__()
         self.adata_manager = adata_manager
+        self.loader_type = loader_type
         self.train_size_is_none = not bool(train_size)
         self.train_size = 0.9 if self.train_size_is_none else float(train_size)
         self.validation_size = validation_size
         self.shuffle_set_split = shuffle_set_split
-        self.drop_last = kwargs.pop("drop_last", False)
+        self.drop_last = drop_last
         self.data_loader_kwargs = kwargs
-        self.max_cells_per_batch = max_cells_per_batch
-        self.max_classes_per_batch = max_classes_per_batch
+
+        # loader-specific parameters
+        self.n_samples = n_samples * batch_size
+        self.n_classes_per_batch = n_classes_per_batch
+        self.n_samples_per_class = n_samples_per_class
+        self.min_contexts_per_class = min_contexts_per_class
+        self.use_balanced_weights = use_balanced_weights
+        self.use_contrastive_loader = use_contrastive_loader
+        
+        self.batch_size = batch_size
         self.ctrl_class = ctrl_class
         self.ctrl_frac = ctrl_frac
         self.last_first = last_first
         self.shuffle_classes = shuffle_classes
-        self.use_contrastive_loader = use_contrastive_loader
-        self.use_control = use_control
-        self.test_context_labels = test_context_labels
+        self.pin_memory = pin_memory
         self.use_copy = use_copy
-        # Fall back to product of max cells per batch * max classes per batch
-        _bs = self.data_loader_kwargs.get("batch_size")
-        if _bs is None:
-            self.batch_size = int(max_cells_per_batch * max_classes_per_batch)
-            self.data_loader_kwargs["batch_size"] = self.batch_size
-        else:
-            self.batch_size = _bs
-        # Set indices, labels, and batch labels
+        self.test_context_labels = test_context_labels
+        self.external_indexing = external_indexing
+        self.cache_indices = cache_indices
+        self.use_special_for_split = use_special_for_split
+
+        # === Label and context extraction ===
         self.indices = np.arange(adata_manager.adata.n_obs)
         labels_state_registry = adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
-        labels = get_anndata_attribute(
+        self.labels = get_anndata_attribute(
             adata_manager.adata,
             adata_manager.data_registry.labels.attr_name,
             labels_state_registry.original_key,
         ).ravel()
         batch_state_registry = adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY)
-        batches = get_anndata_attribute(
+        self.batches = get_anndata_attribute(
             adata_manager.adata,
             adata_manager.data_registry.batch.attr_name,
             batch_state_registry.original_key,
         ).ravel()
-        self.labels = labels
-        self.batches = batches
-        self.pin_memory = pin_memory
-        self.external_indexing = external_indexing
-        # Register training and validation indices from pre-training
-        self.cache_indices = cache_indices
 
     def setup(self, stage: str | None = None):
         """Split indices in train/test/val sets."""
-        # Split indices into sets if no cache is provided
+        # === Split logic (identical to contrastive) ===
         if self.cache_indices is None:
-            # Split entire data into train/val and test if test groups are provided
             if self.test_context_labels is not None:
-                # Create mask for all indices in test contexts
                 test_mask = np.isin(self.batches, self.test_context_labels)
-                # Set main split
                 base_idx = self.indices[~test_mask]
-                # Set test split
                 test_idx = self.indices[test_mask]
             else:
-                # Set main split to all available data
                 base_idx = self.indices
                 test_idx = []
 
-            # Don't use test indices for train/val splits
-            class_indices = self.indices[base_idx]
+            # Stratified split for reproducibility
             class_labels = self.labels[base_idx]
-            # Split dataset into train and validation set
             train_idx, val_idx = train_test_split(
-                class_indices,
+                base_idx,
                 train_size=self.train_size,
-                stratify=class_labels,           # Preserve class distribution
+                stratify=class_labels,
                 shuffle=self.shuffle_set_split,
-                random_state=settings.seed
+                random_state=settings.seed,
             )
-            
-            # Split indices are stratified
+
             indices_train = np.array(train_idx)
             indices_val = np.array(val_idx)
             indices_test = np.array(test_idx)
         else:
-            # Cache indices from pre-training
-            indices_train = np.array(self.cache_indices.get('train'))
-            indices_val = np.array(self.cache_indices.get('val'))
-            indices_test = np.array(self.cache_indices.get('test'))
-        
-        # Set data splitting indices
+            indices_train = np.array(self.cache_indices.get("train"))
+            indices_val = np.array(self.cache_indices.get("val"))
+            indices_test = np.array(self.cache_indices.get("test"))
+
+        # === Assign splits ===
         self.train_idx = indices_train.astype(int)
         self.val_idx = indices_val.astype(int)
         self.test_idx = indices_test.astype(int)
-        # Set split labels
+
+        # === Subset metadata ===
         self.train_labels = self.labels[self.train_idx]
         self.train_batches = self.batches[self.train_idx]
         self.val_labels = self.labels[self.val_idx]
         self.val_batches = self.batches[self.val_idx]
+        self.test_labels = self.labels[self.test_idx] if len(self.test_idx) else None
+        self.test_batches = self.batches[self.test_idx] if len(self.test_idx) else None
 
-        # Setup train data loader
-        self.data_loader_class = AnnDataLoader
-        # Set some defaults for data loader class
-        self.train_data_loader_kwargs = self.data_loader_kwargs.copy()
-        # Use contrastive loader for training
-        if self.use_contrastive_loader in ['train', 'both']:
-            self.data_loader_class = ContrastiveAnnDataLoader
-            self.train_data_loader_kwargs.update({
-                'labels': self.train_labels,
-                'batches': self.train_batches,
-                'max_cells_per_batch': self.max_cells_per_batch,
-                'max_classes_per_batch': self.max_classes_per_batch,
-                'ctrl_class': self.ctrl_class,
-                'ctrl_frac': self.ctrl_frac,
-                'use_copy': self.use_copy
-            })
-        # Set validation loader
-        self.val_loader_class = AnnDataLoader
-        self.val_data_loader_kwargs = self.data_loader_kwargs.copy()
-        # Use contrastive loader for validation
-        if self.use_contrastive_loader in ['val', 'both']:
-            self.val_loader_class = ContrastiveAnnDataLoader
-            self.val_data_loader_kwargs.update({
-                'labels': self.val_labels,
-                'batches': self.val_batches,
-                'max_cells_per_batch': self.max_cells_per_batch,
-                'max_classes_per_batch': self.max_classes_per_batch,
-                'ctrl_class': self.ctrl_class,
-                'ctrl_frac': self.ctrl_frac,
-                'use_copy': self.use_copy
-            })
+        # === Loader selection === use AnnDataLoader as fallback
+        self.loader_class_train = AnnDataLoader
+        self.loader_class_val = AnnDataLoader
+        self.loader_class_test = AnnDataLoader
 
+        # Assign special loader types
+        if "train" in self.use_special_for_split:
+            if self.loader_type == "balanced":
+                self.loader_class_train = BalancedAnnDataLoader
+        if "val" in self.use_special_for_split:
+            if self.loader_type == "balanced":
+                self.loader_class_val = BalancedAnnDataLoader
+                
+    def get_base_kwargs(self, mode: str):
+        if mode == "train":
+            indices = self.train_idx
+        elif mode == "val":
+            indices = self.val_idx
+        elif mode == "test":
+            indices = self.test_idx
+        else:
+            raise ValueError(f"Invalid split {mode}")
+        return {
+            "indices": indices,
+            "shuffle": self.shuffle_classes,
+            "drop_last": self.drop_last,
+            "pin_memory": self.pin_memory,
+            "batch_size": self.batch_size,
+            **self.data_loader_kwargs,
+        }
+         
+    def get_special_kwargs(self, mode: str):
+        if mode == "train":
+            labels = self.train_labels
+            batches = self.train_batches
+        elif mode == "val":
+            labels = self.val_labels
+            batches = self.val_batches
+        elif mode == "test":
+            labels = self.test_labels
+            batches = self.test_batches
+        else:
+            raise ValueError(f"Invalid split {mode}")
+        return {
+            "labels": labels,
+            "batches": batches,
+            "use_balanced_weights": self.use_balanced_weights,
+            "n_classes_per_batch": self.n_classes_per_batch,
+            "n_samples_per_class": self.n_samples_per_class,
+            "min_contexts_per_class": self.min_contexts_per_class,
+            "use_contrastive_loader": self.use_contrastive_loader,
+        }
+        
+    def _get_dataloader(self, mode: str):
+        """Create dataloader of specific split.
+
+        Args:
+            mode (str): Data split, one of train, val, test
+
+        Returns:
+            DataLoader class
+        """
+        kwargs = self.get_base_kwargs(mode)
+        if mode in self.use_special_for_split:
+            if self.loader_type != "vanilla":
+                kwargs.update(self.get_special_kwargs(mode))    
+        # Only shuffle train dataloader
+        if mode != "train":
+            kwargs["shuffle"] = False
+        # Select dataloader class
+        if mode == "train":
+            dataloader_cls = self.loader_class_train
+        elif mode == "val":
+            dataloader_cls = self.loader_class_val
+        elif mode == "test":
+            dataloader_cls = self.loader_class_test
+        else:
+            raise ValueError(f"Invalid split {mode}")
+        return dataloader_cls(self.adata_manager, **kwargs)
+
+    # === Dataloaders ===
     def train_dataloader(self):
-        """Create the train data loader."""
-        return self.data_loader_class(
-            self.adata_manager,
-            indices=self.train_idx,
-            shuffle=self.shuffle_classes,
-            drop_last=self.drop_last,
-            pin_memory=self.pin_memory,
-            **self.train_data_loader_kwargs,
-        )
+        return self._get_dataloader('train')
 
     def val_dataloader(self):
-        """Create the validation data loader."""
-        if len(self.val_idx) > 0:
-            return self.val_loader_class(
-                self.adata_manager,
-                indices=self.val_idx,
-                shuffle=False,
-                drop_last=False,
-                pin_memory=self.pin_memory,
-                **self.val_data_loader_kwargs,
-            )
-        else:
-            pass
+        if len(self.val_idx) == 0:
+            return None
+        return self._get_dataloader('val')
 
     def test_dataloader(self):
-        logging.info(f'Test loader with {len(self.test_idx)} test indices.')
-        """Create the test data loader."""
-        if len(self.test_idx) > 0:
-            return self.val_loader_class(
-                self.adata_manager,
-                indices=self.test_idx,
-                shuffle=False,
-                drop_last=False,
-                pin_memory=self.pin_memory,
-                **self.val_data_loader_kwargs,
-            )
-        else:
-            pass
+        if len(self.test_idx) == 0:
+            return None
+        return self._get_dataloader('test')
