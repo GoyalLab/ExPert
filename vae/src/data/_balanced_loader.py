@@ -249,9 +249,10 @@ class WeightedContrastiveBatchSampler(Sampler[List[int]]):
         n_samples_per_class: int = 4,
         min_contexts_per_class: int = 1,
         replacement: bool = True,
-        shuffle_classes: bool = True,
+        shuffle: bool = True,
         use_class_weights: bool = True,
         strict: bool = True,
+        seed: int | None = None,
     ):
         super().__init__(None)
         self.indices = np.asarray(indices)
@@ -263,9 +264,10 @@ class WeightedContrastiveBatchSampler(Sampler[List[int]]):
         self.n_samples_per_class = n_samples_per_class
         self.min_contexts_per_class = min_contexts_per_class
         self.replacement = replacement
-        self.shuffle_classes = shuffle_classes
+        self.shuffle = shuffle
         self.use_class_weights = use_class_weights
         self.strict = strict
+        self.seed = seed
 
         # --- build per-class (+context) pools
         self.class_pools = defaultdict(list)
@@ -304,9 +306,10 @@ class WeightedContrastiveBatchSampler(Sampler[List[int]]):
                 pool = self.class_pools[(cls, ctx)]
                 if len(pool) == 0:
                     continue
-                draw_n = max(1, self.n_samples_per_class // len(ctxs))
+                # Draw more than needed and subset later
+                draw_n = int(max(1, np.ceil(self.n_samples_per_class / len(ctxs))))
                 chosen.extend(
-                    rng.choice(pool, min(draw_n, len(pool)), replace=self.replacement)
+                    rng.choice(pool, draw_n, replace=True)
                 )
             return chosen[: self.n_samples_per_class]
         # Sample random class indices
@@ -317,8 +320,10 @@ class WeightedContrastiveBatchSampler(Sampler[List[int]]):
             return rng.choice(pool, self.n_samples_per_class, replace=self.replacement).tolist()
 
     def __iter__(self) -> Iterator[List[int]]:
-        rng = np.random.default_rng()
+        # Initiate random generator
+        rng = np.random.default_rng(seed=self.seed)
 
+        # Sample batches
         for _ in range(self.num_batches):
             # --- sample classes (weighted)
             class_idx = rng.choice(
@@ -329,16 +334,18 @@ class WeightedContrastiveBatchSampler(Sampler[List[int]]):
             )
             classes = self.unique_classes[class_idx]
 
-            if self.shuffle_classes:
-                rng.shuffle(classes)
-
-            # --- gather samples
+            # --- gather samples for every class
             batch = []
             for cls in classes:
                 cls_indices = self._sample_class_indices(cls, rng)
+                # Only add subbatch if it has enough samples
                 if len(cls_indices) < self.n_samples_per_class and self.strict:
                     break
                 batch.extend(cls_indices)
+            # Shuffle batch indices
+            if self.shuffle:
+                rng.shuffle(batch)
+            # Ensure batch size is valid
             if len(batch) == self.n_classes_per_batch * self.n_samples_per_class:
                 yield batch
 

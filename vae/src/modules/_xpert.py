@@ -669,14 +669,14 @@ class XPert(VAE):
 
         # For class -> latent, restrict to the classes present in the batch
         chosen = F.normalize(emb[y], dim=-1)   # (B, d)
-        logits_c2z = (chosen @ z.T) / T # (B, B)
+        logits_c2z = (chosen @ z.T) / T         # (B, B)
         # Each class embedding should match its corresponding latent (diagonal)
         labels_c2z = torch.arange(z.size(0), device=z.device)
 
         # Latent -> class loss
         logits_z2c = z @ chosen.T / T     # (B, B)
         loss_z2c = F.cross_entropy(logits_z2c, y, reduction='none')
-        # Class -> latent loss, can't use semantics here
+        # Class -> latent loss
         loss_c2z = F.cross_entropy(logits_c2z, labels_c2z, reduction='none')
         # Symmetric loss per sample
         return 0.5 * (loss_z2c + loss_c2z)
@@ -972,17 +972,17 @@ class XPert(VAE):
         generative_outputs: dict[str, Distribution | None],
         rl_weight: float = 1.0,
         kl_weight: float = 1.0,
-        ctrl_contrastive_weight: float = 1.0,
-        cls_weight: float = 0.1,
-        ctx_align_weight: float = 1.0,
-        cls_align_weight: float = 1.0,
-        joint_align_weight: float = 0.1,
-        random_unseen_replacement_p: float = 0.05,
-        pseudo_latent_frac: float = 0.05,
+        ctrl_contrastive_weight: float = 0.0,
+        cls_weight: float = 0.0,
+        ctx_align_weight: float = 0.0,
+        cls_align_weight: float = 0.0,
+        joint_align_weight: float = 0.0,
+        random_unseen_replacement_p: float = 0.0,
+        pseudo_latent_frac: float = 0.0,
         manifold_regularization_frac: float = 0.0,
-        pseudo_latent_weight: float = 1.0,
-        manifold_regularization_weight: float = 1.0,
-        align_temp_reg_weight: float = 1.0,
+        pseudo_latent_weight: float = 0.0,
+        manifold_regularization_weight: float = 0.0,
+        align_temp_reg_weight: float = 0.0,
         T_align: float | None = None,
         n_negatives: int | None = None,
         **kwargs,
@@ -1099,9 +1099,11 @@ class XPert(VAE):
 
         # Only do alignment part if loss > 0
         if io.non_zero(ctx_align_weight) or io.non_zero(cls_align_weight):
+            # Align to posterior mean of latent space or full distribution
+            _z = qz.loc if self.use_posterior_mean else z
             # Do alignment
             alignment_output = self.aligner(
-                z, 
+                _z, 
                 ctx_idx=ctx, 
                 ctx_emb=self.ctx_emb.weight,
                 cls_idx=cls,
@@ -1177,7 +1179,7 @@ class XPert(VAE):
             # Add additional regularization losses
             if pseudo_latent_frac > 0 and pseudo_latent_weight > 0:
                 # Enforce model to not be biased towards observed classes
-                pseudo_latent_loss = self._pseudo_latent_loss(z, frac=pseudo_latent_frac, T=T_align)
+                pseudo_latent_loss = self._pseudo_latent_loss(_z, frac=pseudo_latent_frac, T=T_align)
                 # Only add loss if not nan
                 if not torch.isnan(pseudo_latent_loss):
                     # Add to overall alignment loss

@@ -8,6 +8,7 @@ class _REGISTRY_KEYS_NT(NamedTuple):
     BATCH_KEY: str = "batch"
     SAMPLE_KEY: str = "sample"
     LABELS_KEY: str = "labels"
+    DATASET_KEY: str = "dataset"
     GENE_EMB_KEY: str = "gene_embedding"
     CTX_EMB_KEY: str = "ctx_embedding"
     CLS_EMB_KEY: str = "cls_embedding"

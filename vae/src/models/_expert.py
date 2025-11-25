@@ -103,11 +103,16 @@ class ExPert(
         # Initialize indices and labels for this VAE
         self._setup()
         # Get covariates
-        n_cats_per_cov = (
-            self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
-            if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
-            else None
-        )
+        if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
+            # Get covariate regsitry
+            cov_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+            # Get number of categories per covariate
+            n_cats_per_cov = cov_registry.n_cats_per_key
+            # Get summary string
+            cov_summary_string = '\n\t - '.join([f'{k} ({len(v)})' for k, v in cov_registry.mappings.items()])
+        else:
+            n_cats_per_cov = None
+            cov_summary_string = None
         # Determine number of batches/datasets and fix library method
         n_batch = self.summary_stats.n_batch
         # Check number of hidden neurons, set to input features if < 0 else use given number
@@ -149,10 +154,12 @@ class ExPert(
             f"n_unseen_contexts: {self.n_unobs_ctx}, \n" if self.n_unobs_ctx > 0 else "\n"
             f"use_gene_emb: {self.use_gene_emb}"
         )
+        # Include covariate information
+        if cov_summary_string is not None:
+            self._model_summary_string += f"\ncat_covariates: {cov_summary_string}\n"
         # Include control class information
         if self.ctrl_class is not None and self.ctrl_class_idx is not None:
-            self._model_summary_string += f"\nctrl_class: {self.ctrl_class}"
-
+            self._model_summary_string += f"\nctrl_class: {self.ctrl_class}\n"
         
     def _setup(self):
         """Setup adata for training. Prepare embeddings."""
@@ -419,6 +426,7 @@ class ExPert(
         )
         # Switch pre-training stage off
         model_params['pretrain'] = False
+        
         # Create fine-tune model
         model = cls(adata, **model_params)
         # Load pre-trained model weights
@@ -440,6 +448,10 @@ class ExPert(
         else:
             # Include all states
             pretrained_state_dict = pretrained_model.module.state_dict()
+        # Update scalar tensors
+        scalar_state_dicts = {k: torch.Tensor([v]) for k,v in pretrained_state_dict.items() if len(v.size()) < 1}
+        pretrained_state_dict.update(scalar_state_dicts)
+        
         # Load pre-trained weights
         model.module.load_state_dict(pretrained_state_dict, strict=False)
         # Label model as pre-trained
@@ -1264,7 +1276,7 @@ class ExPert(
             save_ad_txt = 'with' if save_anndata else 'without'
             adata_txt = 'adata (minified)' if self.is_minified else 'adata'
             log.info(f'Saving model {save_ad_txt} {adata_txt} to: {model_output_dir}')
-            self.save(dir_path=model_output_dir, save_anndata=save_anndata, overwrite=True)
+            self.save(dir_path=model_output_dir, save_anndata=save_anndata, overwrite=True, keep_emb=True)
         # Create evalutaion return object
         return_obj = None
         if results_mode is not None:
@@ -1405,7 +1417,7 @@ class ExPert(
     def test(
         self,
         test_adata_p: str,
-        cls_label: str = 'cls_label',
+        cls_label: str = 'perturbation',
         batch_label: str = 'context',
         output_dir: str | None = None,
         incl_unseen: bool = False,
@@ -1606,12 +1618,14 @@ class ExPert(
     
     def save(self, *args, **kwargs) -> None:
         """Save wrapper to handle external model embeddings"""
+        keep_emb = bool(kwargs.pop('keep_emb'))
         # Handle external model embeddings if anndata is saved with model
         if self.cls_emb is not None and bool(kwargs.get('save_anndata')):
             # Convert embeddings to numpy arrays
-            if bool(kwargs.get('keep_emb')):
+            if keep_emb:
                 self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
-                self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
+                if REGISTRY_KEYS.CLS_SIM_KEY in self.adata.uns:
+                    self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
             # Remove embeddings completely
             else:
                 self.adata.uns.pop(REGISTRY_KEYS.CLS_EMB_KEY, None)

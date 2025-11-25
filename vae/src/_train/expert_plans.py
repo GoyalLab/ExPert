@@ -226,7 +226,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Ensure it's cast to float
         freeze_lr = float(freeze_lr)
         
-        logging.info(f'Creating custom optimizer.')
+        logging.info(f'Creating custom optimizer. lr: {freeze_lr}')
 
         def _creator(params):
             # collect all parameters (params is usually a generator)

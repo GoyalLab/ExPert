@@ -26,8 +26,10 @@ def parse_args():
     parser.add_argument('--input', type=str, required=True, help='Path to h5ad input file (train/val split)')
     parser.add_argument('--test', type=str, default=None, help='Path to h5ad test file (test split)')
     parser.add_argument('--config', type=str, required=True, help='config.yaml file that specififes hyperparameters for training')
+    parser.add_argument('--fine_tune_config', type=str, default=None, help='config.yaml file that specififes hyperparameters for fine-tune training')
     parser.add_argument('--outdir', type=str, default=None, help='Output directory, default is config file directory')
     parser.add_argument('--test_unseen', action='store_true', help='Test model on unseen perturbations')
+    parser.add_argument('--save', action='store_true', help='Save model output data')
     return parser.parse_args()
 
     
@@ -104,11 +106,13 @@ def full_run(
         model_dir: str,
         test_p: str,
         test_unseen: bool = True,
-        load_checkpoint: bool = True,
+        load_checkpoint: bool = False,
         cls_label: str = 'perturbation',
         batch_label: str = 'context',
         ctrl_key: str | None = 'control',
         results_mode: Literal['return', 'save'] | None | list[str] = 'save',
+        save_anndata: bool = False,
+        fine_tune_config_p: str | None = None,
         **kwargs
     ) -> pd.DataFrame:
     """Function to perform a full model training, evaluation, and testing process."""
@@ -117,26 +121,51 @@ def full_run(
     # Set default model output to config directory
     model_dir = model_dir if model_dir is not None else os.path.dirname(config_p)
     # Train model with loaded config file
-    model = train(
+    base_model = train(
         adata_p=train_p, 
         config_p=config_p, 
         out_dir=model_dir,
         **kwargs
     )
     # Evaluate model
-    model.evaluate(results_mode=results_mode)
+    base_model.evaluate(results_mode=results_mode, save_anndata=save_anndata)
     # Save output dir
-    output_dir = model.model_log_dir
+    output_dir = base_model.model_log_dir
     # Try to load best checkpoint, otherwise stick to final model
     if load_checkpoint:
-        model = ExPert.load_checkpoint(
+        base_model = ExPert.load_checkpoint(
             output_dir,
-            adata=model.adata
+            adata=base_model.adata
         )
     # Do not test model if no test path is provided
     if test_p is None or not os.path.exists(test_p):
         log.info(f'Skipping model test since no valid test path is provided.')
         return None
+    # Run fine-tune stage if extra config is provided
+    if fine_tune_config_p:
+        # Specify fine-tuning config path
+        fine_tune_config_p = '../resources/params/runs/two-stage/fine-tune.yaml'
+        # Load fine-tune config params
+        fine_tune_config = read_config(fine_tune_config_p)
+        # Add logger to config
+        fine_tune_output_dir = os.path.join(base_model.model_log_dir, 'fine-tune')
+        fine_tune_config[CONF_KEYS.TRAIN]['logger'] = pl.loggers.TensorBoardLogger(fine_tune_output_dir)
+        # Get model params
+        model_kwargs = fine_tune_config[CONF_KEYS.MODEL]
+        # Create new model from pre-trained with frozen base encoder and decoder
+        model = ExPert.from_base_model(
+            base_model, 
+            freeze_modules=['z_encoder', 'decoder'], 
+            check_model_kwargs=False, 
+            **model_kwargs
+        )
+        # Train fine-tune model
+        model.train(fine_tune_config, cache_data_splitter=False)
+        # Evaluate fine-tuned model
+        model.evaluate(results_mode=results_mode, save_anndata=save_anndata)
+    else:
+        # Treat single trained model as full model
+        model = base_model
     # Create test output directory
     test_out = os.path.join(output_dir, 'test')
     os.makedirs(test_out, exist_ok=True)
@@ -179,4 +208,12 @@ if __name__ == '__main__':
     # Parse cmd line args
     args = parse_args()
     # Full model run
-    _ = full_run(config_p=args.config, train_p=args.input, model_dir=args.outdir, test_p=args.test, test_unseen=args.test_unseen)
+    _ = full_run(
+        config_p=args.config, 
+        train_p=args.input, 
+        model_dir=args.outdir, 
+        test_p=args.test, 
+        test_unseen=args.test_unseen,
+        fine_tune_config_p=args.fine_tune_config,
+        save_anndata=args.save
+    )
