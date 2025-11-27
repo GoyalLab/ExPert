@@ -41,15 +41,16 @@ def get_classification_report(
         adata: ad.AnnData, 
         cls_label: str,
         pred_label: str,
+        class_names: str | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
     from sklearn.metrics import classification_report
 
-    class_names = adata.obs[cls_label].unique()
     y = adata.obs[cls_label].values.astype(str)
     y_test = adata.obs[pred_label].values.astype(str)
+    # Get classification report
     report = classification_report(
-        y_true=y_test, 
-        y_pred=y,
+        y_true=y, 
+        y_pred=y_test,
         labels=y,
         target_names=class_names, 
         output_dict=True, 
@@ -201,13 +202,14 @@ def compute_top_n_predictions(
         _adata = adata[adata.obs[labels_key]!=ctrl_key]
     else:
         _adata = adata
+    
+    # Extract soft predictions from adata
+    predictions = _adata.obsm[predictions_key]
     # Create pathway library if toggled
     if use_pathways:
         lib = build_gene2pathways(genes=predictions.columns.values)
     else:
         lib = None
-    # Extract soft predictions from adata
-    predictions = _adata.obsm[predictions_key]
     # Match actual to prediction label indices
     label_to_idx = {label: idx for idx, label in enumerate(predictions.columns)}
     # Get prediction ranks

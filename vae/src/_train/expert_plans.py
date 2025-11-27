@@ -155,7 +155,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.use_local_stage_warmup = use_local_stage_warmup
         # CLS params
         self.n_classes = n_classes
-        self.use_posterior_mean = use_posterior_mean
+        self.use_posterior_mean = use_posterior_mean if use_posterior_mean is not None else "none"
         self.gene_emb = to_tensor(gene_emb)
    
         # Contrastive params
@@ -729,13 +729,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 prog_bar=False,
             )
 
-    def step(self, batch, batch_idx):
+    def step(self, split, batch, batch_idx):
         """Step for supervised training"""
         # Update loss kwargs with schedules weights
         self.loss_kwargs.update(self.weights)
         # Setup kwargs
         input_kwargs = {}
         input_kwargs.update(self.loss_kwargs)
+        
+        # Add split-specific kwargs
+        input_kwargs['use_posterior_mean'] = self.use_posterior_mean in [split, 'both']
         
         # TODO: move to model, Add external gene embedding to batch
         if self.gene_emb is not None:
@@ -747,7 +750,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def training_step(self, batch, batch_idx):
         """Training step for supervised training."""
         # Perform full forward pass of model
-        inference_outputs, _, loss_output = self.step(batch=batch, batch_idx=batch_idx)
+        inference_outputs, _, loss_output = self.step(split='train', batch=batch, batch_idx=batch_idx)
         loss = loss_output.loss
         self.log(
             "train_loss",
@@ -779,7 +782,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def validation_step(self, batch, batch_idx):
         """Validation step for supervised training."""
         # Perform full forward pass of model
-        inference_outputs, _, loss_output = self.step(batch=batch, batch_idx=batch_idx)
+        inference_outputs, _, loss_output = self.step(split='val', batch=batch, batch_idx=batch_idx)
         loss = loss_output.loss
         self.log(
             "validation_loss",
@@ -797,7 +800,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def test_step(self, batch, batch_idx):
         """Test step for supervised training."""
         # Perform full forward pass of model
-        inference_outputs, _, loss_output = self.step(batch=batch, batch_idx=batch_idx)
+        inference_outputs, _, loss_output = self.step(split='test', batch=batch, batch_idx=batch_idx)
         loss = loss_output.loss
         self.log(
             "test_loss",

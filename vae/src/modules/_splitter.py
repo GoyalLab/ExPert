@@ -33,7 +33,7 @@ class DataSplitter(pl.LightningDataModule):
         ctrl_class: str | None = None,
         ctrl_frac: float | None = 1.0,
         last_first: bool = True,
-        shuffle_classes: bool = True,
+        shuffle: bool = True,
         pin_memory: bool = False,
         use_copy: bool = True,
         use_special_for_split: list[str] = ['train'],
@@ -70,7 +70,7 @@ class DataSplitter(pl.LightningDataModule):
         self.ctrl_class = ctrl_class
         self.ctrl_frac = ctrl_frac
         self.last_first = last_first
-        self.shuffle_classes = shuffle_classes
+        self.shuffle = shuffle
         self.pin_memory = pin_memory
         self.use_copy = use_copy
         self.test_context_labels = test_context_labels
@@ -150,6 +150,7 @@ class DataSplitter(pl.LightningDataModule):
                 self.loader_class_val = BalancedAnnDataLoader
                 
     def get_base_kwargs(self, mode: str):
+        """Get base data loader keyword arguments for a specific data split."""
         if mode == "train":
             indices = self.train_idx
         elif mode == "val":
@@ -160,7 +161,7 @@ class DataSplitter(pl.LightningDataModule):
             raise ValueError(f"Invalid split {mode}")
         return {
             "indices": indices,
-            "shuffle": self.shuffle_classes,
+            "shuffle": self.shuffle,
             "drop_last": self.drop_last,
             "pin_memory": self.pin_memory,
             "batch_size": self.batch_size,
@@ -168,6 +169,7 @@ class DataSplitter(pl.LightningDataModule):
         }
          
     def get_special_kwargs(self, mode: str):
+        """Get kewword arguments for special dataloaders of a given split."""
         if mode == "train":
             labels = self.train_labels
             batches = self.train_batches

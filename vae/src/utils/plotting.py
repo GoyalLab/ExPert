@@ -245,14 +245,16 @@ def plot_top_n_performance(
         cls_label: str = 'label',
         metric: Literal['f1-score', 'accuracy', 'precision', 'recall'] = 'f1-score',
         show_random: bool = True,
-        title: str | None = None,
+        N: int | None = None,
         top_n: int = 10,
         mean_split: Literal['train', 'val', 'test'] | None = 'test',
         **kwargs
     ) -> None:
     # Replace title with number of classes
     n_classes = top_n_predictions.label.nunique()
-    title = f'Top N predictions (N={n_classes})'
+    title = f'Top N predictions (#observed={n_classes})'
+    if N is not None:
+        title += f', #available classes: {N}'
     # Subset data to only show up to top_n predictions
     data = top_n_predictions[top_n_predictions.top_n <= top_n].copy()
     # Show random or not

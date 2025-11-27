@@ -69,6 +69,9 @@ class BalancedAnnDataLoader(DataLoader):
         batches = np.asarray(batches)
         self.batches = batches
         
+        # set number of samples
+        self.n_samples = n_samples * batch_size
+        
 
         if "num_workers" not in kwargs:
             kwargs["num_workers"] = settings.dl_num_workers
@@ -107,7 +110,7 @@ class BalancedAnnDataLoader(DataLoader):
                     # create weighted sampler
                     sampler = WeightedRandomSampler(
                         weights=torch.DoubleTensor(sample_weights),
-                        num_samples=n_samples,
+                        num_samples=self.n_samples,
                         replacement=True,
                     )
 
@@ -130,7 +133,8 @@ class BalancedAnnDataLoader(DataLoader):
         super().__init__(self.dataset, **self.kwargs)
 
         logger.info(f"Initialized BalancedAnnDataLoader with {len(self.dataset)} samples, "
-                    f"{len(np.unique(labels))} classes, batch size {batch_size}.")
+                    f"{len(np.unique(labels))} classes, batch size {batch_size}, "
+                    f"Contrastive: {use_contrastive_loader}.")
 
 class BatchSampler(Sampler[List[int]]):
     r"""Wraps another sampler to yield a mini-batch of indices.

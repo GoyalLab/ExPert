@@ -51,7 +51,7 @@ class XPert(VAE):
         n_hidden: int = 256,
         n_latent: int = 128,
         n_layers: int = 2,
-        n_shared: int = 512,
+        n_shared: int | None = 512,
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         cls_sim: torch.Tensor | None = None,
@@ -67,8 +67,7 @@ class XPert(VAE):
         gene_likelihood: Literal['zinb', 'nb', 'poisson', 'normal'] = 'zinb',
         latent_distribution: Literal['normal', 'ln'] = 'normal',
         decode_covariates: bool = True,
-        decode_context_projection: bool = True,
-        decode_shared_space: bool = True,
+        decode_context_projection: bool = False,
         deeply_inject_covariates: bool = False,
         use_batch_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'none',
         use_layer_norm: Literal['encoder', 'decoder', 'none', 'both'] = 'both',
@@ -78,12 +77,10 @@ class XPert(VAE):
         l_mask: str | list[str] | None = None,
         min_kl: float | None = 1.0,
         align_ext_emb_loss_strategy: Literal['kl', 'clip'] | list[str] = 'clip',            # Secondary classifier module (links external embedding)
-        use_posterior_mean: bool = False,
         reduction: Literal['mean', 'sum', 'batchmean'] = 'mean',
         non_elbo_reduction: Literal['mean', 'sum', 'batchmean'] = 'mean',
         use_feature_mask: bool = False,
         drop_prob: float = 1e-3,
-        decay_rate: float = 0.9,
         use_ctx_adv_cls: bool = True,
         use_semantic_target_weights: bool = True,
         extra_encoder_kwargs: dict | None = {},
@@ -91,7 +88,6 @@ class XPert(VAE):
         extra_ctx_adv_classifier_kwargs: dict | None = {},
         extra_aligner_kwargs: dict | None = {},
         extra_cls_kwargs: dict | None = {},
-        pretrain: bool = False,
         **vae_kwargs
     ):
         # Initialize base model class
@@ -136,7 +132,6 @@ class XPert(VAE):
 
         # Setup extra basic vae args
         self.min_kl = min_kl
-        self.use_posterior_mean = use_posterior_mean
 
         # Remove control embedding if it exists
         if self.ctrl_class_idx is not None:
@@ -146,10 +141,11 @@ class XPert(VAE):
         # Setup embedding params
         self.n_ctx, self.n_ctx_dim = ctx_emb.shape
         self.n_cls, self.n_cls_dim = cls_emb.shape
+        self.use_joint = False
         # Save if we have unseen embeddings or not
         self.has_unseen_ctx = self.n_ctx > n_batch
         self.has_unseen_cls = self.n_cls > n_labels
-        self.n_shared = n_shared
+        self.n_shared = n_shared if n_shared is not None else n_latent
         self.use_semantic_target_weights = use_semantic_target_weights
 
         # Set reduction metrics
@@ -190,13 +186,11 @@ class XPert(VAE):
         self.z_encoder = Encoder(**extra_encoder_kwargs)
 
         # ----- Setup decoder module -----
-        # Whether to decode from z or z_shared TODO: fix that we can actually decode from z_shared, currently does not work because of pz shape mismatch
-        self.decode_shared_space = decode_shared_space
+        # Covariate params
         self.decode_covariates = decode_covariates
         self.decode_context_projection = decode_context_projection
-        z_dim = n_shared if decode_shared_space else n_latent
         # Whether to decode covariates
-        n_input_decoder = z_dim + n_continuous_cov * decode_covariates
+        n_input_decoder = n_latent + n_continuous_cov * decode_covariates
         cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
         decoder_cat_list = cat_list if decode_covariates else None
         n_ctx_dim_decoder = None
@@ -263,11 +257,6 @@ class XPert(VAE):
             self.ctx_targets = None
             self.cls_targets = None
 
-        # Set state
-        self.pretrain = pretrain
-
-        # Buffers
-        self.decay_rate = decay_rate
         # ----- Debug -----
         self._step = 0
 
@@ -430,11 +419,9 @@ class XPert(VAE):
         if size_factor is not None:
             size_factor = torch.log(size_factor)
 
-        # Set z either to initial encoder output or to aligner projection
-        z_key = MODULE_KEYS.Z_SHARED_KEY if self.decode_shared_space else MODULE_KEYS.Z_KEY
         # Return generative data
         return {
-            MODULE_KEYS.Z_KEY: inference_outputs[z_key],
+            MODULE_KEYS.Z_KEY: inference_outputs[MODULE_KEYS.Z_KEY],
             MODULE_KEYS.LIBRARY_KEY: inference_outputs[MODULE_KEYS.LIBRARY_KEY],
             MODULE_KEYS.BATCH_INDEX_KEY: inference_outputs[REGISTRY_KEYS.BATCH_KEY],
             MODULE_KEYS.Y_KEY: inference_outputs[REGISTRY_KEYS.LABELS_KEY],
@@ -556,9 +543,8 @@ class XPert(VAE):
         g: torch.Tensor | None = None,
         cont_covs: torch.Tensor | None = None,
         cat_covs: torch.Tensor | None = None,
-        use_posterior_mean: bool | None = None,
+        use_posterior_mean: bool = True,
         inference_outputs: dict[str, torch.Tensor] | None = None,
-        inference: bool = False,
         return_logits: bool = True,
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
@@ -596,8 +582,6 @@ class XPert(VAE):
                 cont_covs, 
                 cat_covs,
             )
-        # Use model setting by default but overwrite if option is specified (e.g. during inference)
-        use_posterior_mean = self.use_posterior_mean if use_posterior_mean is None else use_posterior_mean
         # Get inference outputs
         qz = inference_outputs[MODULE_KEYS.QZ_KEY]
         z = inference_outputs[MODULE_KEYS.Z_KEY]
@@ -605,13 +589,16 @@ class XPert(VAE):
         _z = qz.loc if use_posterior_mean else z
         
         # Optionally use different embeddings, fall back to internals if none are given
-        ctx_emb = ctx_emb if ctx_emb is not None else self.ctx_emb.weight
-        cls_emb = cls_emb if cls_emb is not None else self.cls_emb.weight
+        if ctx_emb is None:
+            ctx_emb = self.ctx_emb.weight
+        if cls_emb is None:
+            cls_emb = self.cls_emb.weight
+            
         # Add z classifier output
         z_cls_logits = self.classifier(_z)
         inference_outputs['logits'] = z_cls_logits
         # Use regular alignment
-        if not inference:
+        if not self.use_joint:
             align_out: dict[str, torch.Tensor] = self.aligner(
                 _z, 
                 ctx_emb=ctx_emb, cls_emb=cls_emb,
@@ -620,8 +607,9 @@ class XPert(VAE):
                 ctrl_idx=self.ctrl_class_idx
             )
         else:
+            # Classify using a joint embedding of context and class
             align_out: dict[str, torch.Tensor] = self.aligner.classify(
-                z=_z, ctx_emb=ctx_emb, ctx_idx=batch_index, cls_emb=cls_emb, return_logits=return_logits
+                _z, ctx_emb=ctx_emb, cls_emb=cls_emb
             )
 
         # Add alignment output to inference
@@ -660,7 +648,7 @@ class XPert(VAE):
             y: torch.Tensor, 
             emb: torch.Tensor, 
             T: torch.Tensor,
-            weights: torch.Tensor | None = None,
+            return_full: bool = True
         ) -> torch.Tensor:
         # Ensure y is a vector
         y = y.flatten()
@@ -669,30 +657,49 @@ class XPert(VAE):
 
         # For class -> latent, restrict to the classes present in the batch
         chosen = F.normalize(emb[y], dim=-1)   # (B, d)
-        logits_c2z = (chosen @ z.T) / T         # (B, B)
         # Each class embedding should match its corresponding latent (diagonal)
-        labels_c2z = torch.arange(z.size(0), device=z.device)
+        labels = torch.arange(z.size(0), device=z.device)
 
         # Latent -> class loss
-        logits_z2c = z @ chosen.T / T     # (B, B)
-        loss_z2c = F.cross_entropy(logits_z2c, y, reduction='none')
+        logits_z2c = (z @ chosen.T) / T     # (B, B)
+        loss_z2c = F.cross_entropy(logits_z2c, labels, reduction='none')
         # Class -> latent loss
-        loss_c2z = F.cross_entropy(logits_c2z, labels_c2z, reduction='none')
+        logits_c2z = (chosen @ z.T) / T         # (B, B)
+        loss_c2z = F.cross_entropy(logits_c2z, labels, reduction='none')
         # Symmetric loss per sample
-        return 0.5 * (loss_z2c + loss_c2z)
+        if return_full:
+            return 0.5 * (loss_z2c + loss_c2z)
+        else:
+            return loss_z2c, loss_c2z
     
     def _joint_clip_loss(
         self,
-        logits: torch.Tensor,
+        z: torch.Tensor,
+        joint_emb: torch.Tensor,
+        T: float | None = 0.1,
     ) -> torch.Tensor:
-        """Calculate joint logits loss."""
-        # Target should be diagonal indices
-        labels = torch.arange(logits.shape[0], device=logits.device)
-        # Align latent --> joint and joint --> latent
-        loss_h2j = F.cross_entropy(logits, labels, reduction='none')
-        loss_j2h = F.cross_entropy(logits.T, labels, reduction='none')
-        # Return combined loss
-        return 0.5 * (loss_h2j + loss_j2h)
+        """Calculate joint embedding clip loss based on both batch-specific embeddings."""
+        # Get temperature default if none
+        if T is None:
+            T = self.aligner.joint_temperature
+        # Normalize latent space
+        z = F.normalize(z, dim=-1)
+
+        # Normalize embeddings
+        b_joint_emb = F.normalize(joint_emb, dim=-1)
+
+        # --- Compute symmetric CLIP loss ---
+        # (1) Latent --> Joint
+        logits_z2joint = (z @ b_joint_emb.T) / T
+        labels = torch.arange(z.size(0), device=z.device)
+        loss_z2joint = F.cross_entropy(logits_z2joint, labels, reduction="none")
+
+        # (2) Joint --> Latent
+        logits_joint2z = (b_joint_emb @ z.T) / T
+        loss_joint2z = F.cross_entropy(logits_joint2z, labels, reduction="none")
+
+        # Symmetric loss
+        return 0.5 * (loss_z2joint + loss_joint2z)
     
     def _random_unseen_replacement(
         self,
@@ -863,6 +870,9 @@ class XPert(VAE):
     
     def _ce_cls_loss(self, logits: torch.Tensor, y: torch.Tensor, T: float | None = None) -> torch.Tensor:
         """Calculate additional simple classification loss on initial latent space."""
+        # Get classifier temperature
+        if T is None:
+            T = self.classifier.temperature
         target_sim = self.cls_targets
         # Return an CE loss
         if self.use_semantic_target_weights and target_sim is not None:
@@ -977,14 +987,15 @@ class XPert(VAE):
         ctx_align_weight: float = 0.0,
         cls_align_weight: float = 0.0,
         joint_align_weight: float = 0.0,
+        use_posterior_mean: bool = False,
         random_unseen_replacement_p: float = 0.0,
         pseudo_latent_frac: float = 0.0,
         manifold_regularization_frac: float = 0.0,
         pseudo_latent_weight: float = 0.0,
         manifold_regularization_weight: float = 0.0,
         align_temp_reg_weight: float = 0.0,
+        joint_alpha: float = 0.8,
         T_align: float | None = None,
-        n_negatives: int | None = None,
         **kwargs,
     ) -> LossOutput:
         # ---- DEBUG ----
@@ -1087,7 +1098,7 @@ class XPert(VAE):
         # Calculate classification loss on z
         if cls_weight > 0:
             z_cls_logits = self.classifier(z)
-            z_ce_loss = self._ce_cls_loss(z_cls_logits, y=cls, T=0.1)
+            z_ce_loss = self._ce_cls_loss(z_cls_logits, y=cls)
             z_ce_loss = self._reduce_loss(z_ce_loss, reduction=self.non_elbo_reduction)
             # Add classification loss details
             lo_kwargs.update({
@@ -1098,18 +1109,18 @@ class XPert(VAE):
             total_loss = total_loss + z_ce_loss * cls_weight
 
         # Only do alignment part if loss > 0
-        if io.non_zero(ctx_align_weight) or io.non_zero(cls_align_weight):
+        if io.non_zero(ctx_align_weight) or io.non_zero(cls_align_weight) or io.non_zero(joint_align_weight):
             # Align to posterior mean of latent space or full distribution
-            _z = qz.loc if self.use_posterior_mean else z
+            _z = qz.loc if use_posterior_mean else z
             # Do alignment
             alignment_output = self.aligner(
                 _z, 
-                ctx_idx=ctx, 
                 ctx_emb=self.ctx_emb.weight,
-                cls_idx=cls,
+                ctx_idx=ctx,
                 cls_emb=self.cls_emb.weight,
+                cls_idx=cls,
                 T=T_align,
-                n_negatives=n_negatives
+                alpha=joint_alpha,
             )
             # Randomly set some labels to unseen contexts and classes to keep these embeddings active
             if random_unseen_replacement_p > 0:
@@ -1119,6 +1130,7 @@ class XPert(VAE):
             # Extract the embedding projections to shared space
             ctx2z = alignment_output.get(MODULE_KEYS.CTX_PROJ_KEY)
             cls2z = alignment_output.get(MODULE_KEYS.CLS_PROJ_KEY)
+            # Extract joint embedding projection
             joint2z = alignment_output.get(MODULE_KEYS.JOINT_PROJ_KEY)
             # Add projected embedding representations to extra outputs
             extra_outputs[MODULE_KEYS.Z_SHARED_KEY] = z_shared
@@ -1133,48 +1145,68 @@ class XPert(VAE):
             if cls_logits is None:
                 # Calculate manually
                 cls_logits = self.aligner.get_cls_logits(z_shared, cls2z, T=T_align)
-            # Calculate clip loss for context embedding
-            ctx_loss_ps = self._clip_loss(
-                z_shared, 
-                y=ctx.squeeze(-1), 
-                emb=ctx2z, 
-                weights=self.ctx_targets,
-                T=self.aligner.ctx_temperature
-            )
-            # Calculate clip loss for class embedding
-            cls_loss_ps = self._clip_loss(
-                z_shared, 
-                y=cls.squeeze(-1), 
-                emb=cls2z, 
-                weights=self.cls_targets,
-                T=self.aligner.cls_temperature
-            )
-            # Apply reductions
-            ctx_loss = self._reduce_loss(ctx_loss_ps, reduction=self.non_elbo_reduction)
-            cls_loss = self._reduce_loss(cls_loss_ps, reduction=self.non_elbo_reduction)
-            # Add to extra metrics
-            extra_metrics[LOSS_KEYS.CLIP_CTX_CLS_LOSS] = ctx_loss
-            extra_metrics[LOSS_KEYS.CLIP_CLS_LOSS] = cls_loss
-            # Add predictions to extra output
-            extra_outputs[PREDICTION_KEYS.PREDICTION_KEY] = torch.argmax(cls_logits, dim=-1).squeeze(-1).detach()
             
-            # Combine alignment losses
-            align_loss = ctx_loss * ctx_align_weight + cls_loss * cls_align_weight
-
-            # Add joint embedding clip loss if available and enabled
+            # Either do individual clips or on joint embedding
             if joint_align_weight > 0:
-                # Extract shared logits from aligner (if given)
-                joint_logits = alignment_output.get(MODULE_KEYS.JOINT_LOGITS_KEY)
-                if joint_logits is None:
-                    # Calculate manually
-                    joint_logits = self.aligner.get_joint_logits(z_shared, joint2z, T=T_align)
-                
-                joint_loss_ps = self._joint_clip_loss(joint_logits)
+                # Mark that we used joint embedding to align
+                self.use_joint = True
+                # Align to combined embedding space
+                joint_loss_ps = self._joint_clip_loss(
+                    _z,
+                    joint_emb=joint2z,
+                    T=T_align
+                )
                 joint_loss = self._reduce_loss(joint_loss_ps, reduction=self.non_elbo_reduction)
                 # Add to extra metrics
                 extra_metrics[LOSS_KEYS.JOINT_LOSS] = joint_loss
+                # Compare z to batch joint embeddings
+                cls_out = self.aligner.classify(
+                    _z,
+                    ctx_emb=self.ctx_emb.weight[:self.n_batch],
+                    cls_emb=self.cls_emb.weight[:self.n_labels],
+                    T=T_align,
+                    alpha=joint_alpha,
+                )
+                # Get full logits
+                joint_logits = cls_out[MODULE_KEYS.JOINT_LOGITS_KEY]
+                logits = cls_out[MODULE_KEYS.CLS_LOGITS_KEY]
                 # Add to overall alignment loss
-                align_loss = align_loss + joint_loss * joint_align_weight
+                align_loss = joint_loss * joint_align_weight
+            else:
+                # Calculate clip loss for context embedding
+                ctx_loss_ps = self._clip_loss(
+                    z_shared, 
+                    y=ctx.flatten(), 
+                    emb=ctx2z, 
+                    T=self.aligner.ctx_temperature
+                )
+                # Calculate clip loss for class embedding
+                loss_z2c_ps, loss_c2z_ps = self._clip_loss(
+                    z_shared, 
+                    y=cls.flatten(), 
+                    emb=cls2z, 
+                    T=self.aligner.cls_temperature,
+                    return_full=False
+                )
+                # Combine losses
+                cls_loss_ps = 0.5 * (loss_z2c_ps + loss_c2z_ps)
+                # Apply reductions
+                ctx_loss = self._reduce_loss(ctx_loss_ps, reduction=self.non_elbo_reduction)
+                cls_loss = self._reduce_loss(cls_loss_ps, reduction=self.non_elbo_reduction)
+                # Add to extra metrics
+                extra_metrics[LOSS_KEYS.CLIP_CTX_CLS_LOSS] = ctx_loss
+                extra_metrics[LOSS_KEYS.CLIP_CLS_LOSS] = cls_loss
+                # Log individual parts of clip loss
+                extra_metrics[f'z2c_loss'] = self._reduce_loss(loss_z2c_ps, reduction=self.non_elbo_reduction)
+                extra_metrics[f'c2z_loss'] = self._reduce_loss(loss_c2z_ps, reduction=self.non_elbo_reduction)
+                # Set logits to class embedding logits
+                logits = cls_logits
+                
+                # Combine alignment losses
+                align_loss = ctx_loss * ctx_align_weight + cls_loss * cls_align_weight
+            
+            # Add class predictions to extra output
+            extra_outputs[PREDICTION_KEYS.PREDICTION_KEY] = torch.argmax(logits, dim=-1).squeeze(-1).detach()
             
             # Add additional regularization losses
             if pseudo_latent_frac > 0 and pseudo_latent_weight > 0:

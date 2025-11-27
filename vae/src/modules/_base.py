@@ -1418,13 +1418,15 @@ class ContextClassAligner(nn.Module):
         ctx_emb_dim: int,
         cls_emb_dim: int,
         n_shared: int = 128,
-        n_hidden: int | None = None,
-        n_layers: int | None = None,
+        n_hidden: int = 256,
+        n_layers: int = 1,
         use_batch_norm: bool = False,
         use_layer_norm: bool = True,
         dropout_rate: float = 0.1,
-        min_temperature: float = 0.1,
+        temperature: float = 0.1,
+        min_temperature: float = 0.05,
         max_temperature: float = 2.0,
+        sigmoid_temp_scaling: bool = False,
         noise_sigma: float | None = 1e-6,
         use_learnable_temperature: bool = True,
         use_learnable_sigma: bool = True,
@@ -1435,18 +1437,22 @@ class ContextClassAligner(nn.Module):
         return_projections: bool = True,
         use_z: bool = True,
         n_heads: int = 1,
+        use_elementwise_combination: bool = False,
         **kwargs,
     ):
         super().__init__()
         self.dropout_rate = dropout_rate
+        self.T = temperature
         self.T_min = min_temperature
         self.T_max = max_temperature
+        self.sigmoid_temp_scaling = sigmoid_temp_scaling
         self.noise_sigma = noise_sigma
         self.return_projections = return_projections
         self.unseen_buffer_prob = unseen_buffer_prob
         self.n_heads = n_heads
         self.use_film = use_film
         self.use_learnable_temperature = use_learnable_temperature
+        self.use_elementwise_combination = use_elementwise_combination
         # Joint c buffers
         self.register_buffer("c_joint_bank", None, persistent=False)
         self.register_buffer("n_ctx_cls", torch.zeros(2, dtype=torch.long), persistent=False)
@@ -1457,9 +1463,9 @@ class ContextClassAligner(nn.Module):
             self._cls_temperature = nn.Parameter(torch.zeros(1))
             self._joint_temperature = nn.Parameter(torch.zeros(1))
         else:
-            self.register_buffer("_ctx_temperature", torch.tensor(self.T_min))
-            self.register_buffer("_cls_temperature", torch.tensor(self.T_min))
-            self.register_buffer("_joint_temperature", torch.tensor(self.T_min))
+            self.register_buffer("_ctx_temperature", torch.tensor(self.T))
+            self.register_buffer("_cls_temperature", torch.tensor(self.T))
+            self.register_buffer("_joint_temperature", torch.tensor(self.T))
 
         # --------- Sigma ---------
         if use_learnable_sigma and noise_sigma is not None:
@@ -1517,27 +1523,35 @@ class ContextClassAligner(nn.Module):
 
         # --------- Dropout ---------
         self.dropout = nn.Dropout(p=dropout_rate)
+        # Cache
+        self.alpha = None
 
     @property
     def ctx_temperature(self):
         if self.use_learnable_temperature:
             return self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self._ctx_temperature)
         else:
-            return self.T_min
+            return self.T
         
     @property
     def cls_temperature(self):
         if self.use_learnable_temperature:
-            return self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self._cls_temperature)
+            if self.sigmoid_temp_scaling:
+                return self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self._cls_temperature)
+            else:
+                return self._cls_temperature.clamp(self.T_min, self.T_max)
         else:
-            return self.T_min
+            return self.T
         
     @property
     def joint_temperature(self):
         if self.use_learnable_temperature:
-            return self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self._joint_temperature)
+            if self.sigmoid_temp_scaling:
+                return self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self._joint_temperature)
+            else:
+                return self._joint_temperature.clamp(self.T_min, self.T_max)
         else:
-            return self.T_min
+            return self.T
         
     def get_temp_reg_loss(self) -> torch.Tensor:
         if not self.use_learnable_temperature:
@@ -1549,18 +1563,33 @@ class ContextClassAligner(nn.Module):
             (self.joint_temperature - m)**2
         )
         return loss.mean()
+    
+    def join_emb(self, ctx_emb: torch.Tensor, cls_emb: torch.Tensor, alpha: float = 0.9):
+        # Set embedding weights for combination
+        ctx_w = 1 - alpha
+        cls_w = alpha
+        # Normalize embeddings before combining
+        b_ctx = F.normalize(ctx_emb * ctx_w, dim=-1)
+        b_cls = F.normalize(cls_emb * cls_w, dim=-1)
+        # Joint representation (full)
+        joint = b_ctx + b_cls
+        # Add elementwise combinations
+        if self.use_elementwise_combination:
+            joint = joint + (b_ctx * b_cls)
+        # Return normalized joint embedding
+        return F.normalize(joint, dim=-1)
    
     def forward(
         self,
         z: torch.Tensor,
-        ctx_idx: torch.Tensor,
         ctx_emb: torch.Tensor,
-        cls_idx: torch.Tensor,
+        ctx_idx: torch.Tensor,
         cls_emb: torch.Tensor,
+        cls_idx: torch.Tensor,
         return_logits: bool = True,
         T: torch.Tensor | None = None,
         ctrl_idx: int | None = None,
-        n_negatives: int | None = None,
+        alpha: float = 0.8,
     ) -> dict[str, torch.Tensor]:
         """
         Parameters
@@ -1571,9 +1600,11 @@ class ContextClassAligner(nn.Module):
         cls_idx : Tensor, shape (B,)
         cls_emb : Tensor, shape (N_cls, cls_emb_dim)
         """
+        # Move embeddings to correct device
         ctx_emb, cls_emb = ctx_emb.to(z.device), cls_emb.to(z.device)
         
-        C = cls_emb.size(0)
+        # Cache alpha
+        self.alpha = alpha
 
         # ----- Latent projection -----
         h = self.latent_projection(z)
@@ -1584,33 +1615,29 @@ class ContextClassAligner(nn.Module):
         # ----- External projections -----
         c_ctx = self.ctx_projection(ctx_emb)        # (N_ctx, D)
         c_cls = self.cls_projection(cls_emb)        # (N_cls, D)
-        # Get batch-specific embeddings
-        b_ctx = c_ctx[ctx_idx.squeeze(-1)]
-        b_cls = c_cls[cls_idx.squeeze(-1)]
-        # Set control index to -inf if given
-        if ctrl_idx is not None:
-            c_cls[torch.as_tensor(ctrl_idx, device=c_cls.device, dtype=torch.long)] = -float('inf')
-
-        # Compute joint projection with batch representations
-        b_joint = b_ctx + b_cls + (b_ctx * b_cls)   # (B, D)
-        # Use FiLM modulation for context
-        if self.use_film:
-            h_mod = self.film(h, b_ctx)
-        else:
-            h_mod = h
-
+        
         # Optional noise regularization
         if self.noise_sigma is not None and self.noise_sigma > 0:
             noise_ctx = F.normalize(torch.randn_like(c_ctx), dim=-1)
             noise_cls = F.normalize(torch.randn_like(c_cls), dim=-1)
             c_ctx = c_ctx + self.noise_sigma * noise_ctx
             c_cls = c_cls + self.noise_sigma * noise_cls
-
+            
+        # Set control index to -inf if given
+        if ctrl_idx is not None:
+            c_cls[torch.as_tensor(ctrl_idx, device=c_cls.device, dtype=torch.long)] = -float('inf')
+        
+        # Get batch-specific joint embeddingd
+        b_joint_norm = self.join_emb(
+            ctx_emb=c_ctx[ctx_idx.flatten()], 
+            cls_emb=c_cls[cls_idx.flatten()], 
+            alpha=alpha
+        )
+        
         # Normalize
-        h_norm = F.normalize(h_mod, dim=-1)
+        h_norm = F.normalize(h, dim=-1)
         c_ctx_norm = F.normalize(c_ctx, dim=-1)
         c_cls_norm = F.normalize(c_cls, dim=-1)
-        b_joint_norm = F.normalize(b_joint, dim=-1)
 
         # Outputs
         outputs = {
@@ -1640,49 +1667,66 @@ class ContextClassAligner(nn.Module):
         # Alignment via cosine similarity
         return (h_norm @ c_cls_norm.T) / _T     # (B, N_cls)
     
-    def get_joint_logits(self, h_norm: torch.Tensor, b_joint_norm: torch.Tensor, T: torch.Tensor | None) -> torch.Tensor:
+    def get_joint_logits(self, h_norm: torch.Tensor, c_joint_norm: torch.Tensor, T: torch.Tensor | None) -> torch.Tensor:
         # Choose interal T or given
         _T = T if T is not None else self.joint_temperature
         # Alignment via cosine similarity
-        return (h_norm @ b_joint_norm.T) / _T     # (B, B)
-    
+        return (h_norm @ c_joint_norm.T) / _T     # (B, B)
+        
     @torch.no_grad()
     def precompute_joint_bank(
-            self, 
-            ctx_emb: torch.Tensor, 
-            cls_emb: torch.Tensor, 
-            device: str = None,
-            cache: bool = True,
-        ):
+        self,
+        ctx_emb: torch.Tensor,
+        cls_emb: torch.Tensor,
+        device: str | torch.device | None = None,
+        alpha: float = 0.8,
+        cache: bool = True,
+    ):
+        """
+        Precompute all possible (context, class) joint embeddings.
+
+        Args:
+            ctx_emb: Context embeddings, shape (N_ctx, D_ctx)
+            cls_emb: Class embeddings, shape (N_cls, D_cls)
+            device: Optional target device (defaults to model device)
+            alpha: Weight controlling context vs. class influence
+            cache: Whether to store result in self.c_joint_bank for reuse
+        """
         import logging
-        logging.info('Precomputing joint embeddings.')
-        ctx_emb = ctx_emb.to(device or next(self.parameters()).device)
-        cls_emb = cls_emb.to(device or next(self.parameters()).device)
+        log = logging.getLogger(__name__)
+        log.info(f"Precomputing joint embeddings (contexts={ctx_emb.size(0)}, classes={cls_emb.size(0)}).")
 
-        # Project to shared space
-        c_ctx = F.normalize(self.ctx_projection(ctx_emb), dim=-1)
-        c_cls = F.normalize(self.cls_projection(cls_emb), dim=-1)
+        # Resolve device
+        device = device or next(self.parameters()).device
 
-        # Build joint combinations
-        c_joint = c_ctx.unsqueeze(1) + c_cls.unsqueeze(0) + (c_ctx.unsqueeze(1) * c_cls.unsqueeze(0))
-        c_joint = F.normalize(c_joint.view(-1, c_joint.size(-1)), dim=-1)
+        # Move to correct device and normalize
+        c_ctx = F.normalize(self.ctx_projection(ctx_emb.to(device)) * (1 - alpha), dim=-1)
+        c_cls = F.normalize(self.cls_projection(cls_emb.to(device)) * alpha, dim=-1)
 
-        # Cache on module
+        # Compute joint embeddings using broadcasting
+        # (N_ctx, 1, D) + (1, N_cls, D) + elementwise interaction
+        joint = c_ctx.unsqueeze(1) + c_cls.unsqueeze(0) + (c_ctx.unsqueeze(1) * c_cls.unsqueeze(0))
+        joint = F.normalize(joint.view(-1, joint.size(-1)), dim=-1)
+
         if cache:
-            self.c_joint_bank = c_joint.detach()
-            self.n_ctx_cls[:] = torch.tensor([c_ctx.size(0), c_cls.size(0)], device=self.n_ctx_cls.device)
-            return
+            self.c_joint_bank = joint.detach()
+            self.n_ctx_cls = torch.tensor([c_ctx.size(0), c_cls.size(0)], device=device)
+            log.info(f"Cached joint bank with {joint.size(0):,} entries of dim {joint.size(-1)}.")
+            return self.c_joint_bank
         else:
-            return c_joint
+            return joint
+
     
     @torch.no_grad()
     def classify(
         self,
         z: torch.Tensor,
         ctx_emb: torch.Tensor,
-        ctx_idx: torch.Tensor,
         cls_emb: torch.Tensor,
-        temperature: float | None = None,
+        alpha: float | None = 0.8,
+        T: float | None = None,
+        use_softmax: bool = False,
+        cache: bool = False
     ) -> dict[str, torch.Tensor]:
         """
         Compute cosine similarities between query latent(s) and all joint embeddings
@@ -1696,48 +1740,58 @@ class ContextClassAligner(nn.Module):
             External context embeddings.
         cls_emb : Tensor, (N_cls, cls_emb_dim)
             External class embeddings.
-        temperature : Optional[float]
+        T : Optional[float]
             If given, overrides learned temperature.
-        topk : int
-            Number of top predictions to return.
 
         Returns
         -------
         dict[str, Tensor]
         """
+        # Set to latest alpha if None else use given
+        alpha = alpha if alpha is not None else self.alpha
         # ---- Project ----
         h = F.normalize(self.latent_projection(z), dim=-1)
         # Project to shared space
-        c_ctx = F.normalize(self.ctx_projection(ctx_emb), dim=-1)
-        c_cls = F.normalize(self.cls_projection(cls_emb), dim=-1)
-        # Modulate h TODO: only works if we know the context
-        if self.use_film and b_ctx is not None:
-            b_ctx = c_ctx[ctx_idx.squeeze(-1)]
-            h_mod = self.film(h, b_ctx)
-        else:
-            h_mod = h
+        c_ctx = F.normalize(self.ctx_projection(ctx_emb) * (1-alpha), dim=-1)
+        c_cls = F.normalize(self.cls_projection(cls_emb) * alpha, dim=-1)
         
         # ---- Compute all possible joint embeddings ----
-        # Cache embeddings if possible
-        diff_n = (self.n_ctx_cls != torch.tensor([ctx_emb.size(0), cls_emb.size(0)], device=self.n_ctx_cls.device)).any()
-        if getattr(self, 'c_joint_bank', None) is None or diff_n:
-            # Re-compute embeddings
-            self.precompute_joint_bank(ctx_emb, cls_emb)
-        # Get embeddings
-        c_joint = self.c_joint_bank
+        if not self.training and cache:
+            # Cache embeddings if possible
+            diff_n = (self.n_ctx_cls != torch.tensor([ctx_emb.size(0), cls_emb.size(0)], device=self.n_ctx_cls.device)).any()
+            if not hasattr(self, 'c_joint_bank') or diff_n:
+                # Re-compute embeddings
+                self.precompute_joint_bank(ctx_emb, cls_emb, alpha=alpha)
+            # Get embeddings
+            c_joint = self.c_joint_bank
+        else:
+            # Compute joint embeddings using broadcasting
+            # (N_ctx, 1, D) + (1, N_cls, D) 
+            joint = c_ctx.unsqueeze(1) + c_cls.unsqueeze(0)
+            # + elementwise interaction
+            if self.use_elementwise_combination:
+                joint = joint + (c_ctx.unsqueeze(1) * c_cls.unsqueeze(0))
+            # Normalize joint embedding
+            c_joint = F.normalize(joint.view(-1, joint.size(-1)), dim=-1)
+        
         # ---- Similarity scores ----
-        T = temperature if temperature is not None else self.joint_temperature
-        logits = (h_mod @ c_joint.T) / T  # (B, N_ctx * N_cls)
+        T = T if T is not None else self.joint_temperature
+        logits = (h @ c_joint.T) / T  # (B, N_ctx * N_cls)
         # --- Compute joint softmax ---
-        logits = F.softmax(logits, dim=-1)  # (B, N_ctx * N_cls)
+        logits = F.softmax(logits, dim=-1) if use_softmax else logits # (B, N_ctx * N_cls)
         # --- Reshape into 3D (B, N_ctx, N_cls) ---
         p_joint = logits.view(z.size(0), ctx_emb.size(0), cls_emb.size(0))
+        
         # --- Marginalize ---
-        ctx_logits = p_joint.sum(dim=-1)   # (B, N_ctx)
-        cls_logits = p_joint.sum(dim=-2)   # (B, N_cls)
+        if use_softmax:
+            ctx_logits = p_joint.sum(dim=-1)   # (B, N_ctx)
+            cls_logits = p_joint.sum(dim=-2)   # (B, N_cls)
+        else:
+            ctx_logits = p_joint.mean(dim=-1)   # (B, N_ctx)
+            cls_logits = p_joint.mean(dim=-2)   # (B, N_cls)
         # ---- Return result object ----
         return {
-            MODULE_KEYS.Z_SHARED_KEY: h_mod,
+            MODULE_KEYS.Z_SHARED_KEY: h,
             MODULE_KEYS.JOINT_LOGITS_KEY: logits,
             MODULE_KEYS.CTX_LOGITS_KEY: ctx_logits,
             MODULE_KEYS.CLS_LOGITS_KEY: cls_logits,

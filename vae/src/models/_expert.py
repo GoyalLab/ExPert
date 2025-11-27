@@ -370,7 +370,7 @@ class ExPert(
         check_model_kwargs: bool = True,
         **model_kwargs,
     ):
-        """Initialize ExPert model with weights from pretrained :class:`~src.models.JEDVI` model.
+        """Initialize ExPert model with weights from pretrained :class:`~src.models.ExPert` model.
 
         Parameters
         ----------
@@ -424,8 +424,6 @@ class ExPert(
             adata,
             **pretrained_setup_args,
         )
-        # Switch pre-training stage off
-        model_params['pretrain'] = False
         
         # Create fine-tune model
         model = cls(adata, **model_params)
@@ -623,8 +621,8 @@ class ExPert(
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         return_latents: bool = True,
-        inference: bool = False,
         verbose: bool = True,
+        obs_only: bool = True,
         **kwargs
     ) -> dict[str, pd.DataFrame | np.ndarray]:
         """Return cell label predictions.
@@ -668,6 +666,8 @@ class ExPert(
         else:
             ctx_labels = self.idx_to_batch
             ctx_emb = self.module.ctx_emb.weight
+            if obs_only:
+                ctx_emb = ctx_emb[:self.module.n_batch]
         # Use new class embedding at inference
         if cls_emb is not None:
             log.info(f'Using new class embedding: {cls_emb.shape}')
@@ -676,6 +676,10 @@ class ExPert(
         else:
             cls_labels = self.idx_to_label
             cls_emb = self.module.cls_emb.weight
+            if obs_only:
+                cls_emb = cls_emb[:self.module.n_labels]
+            
+        # Subset to observed embeddings only
 
         # Add control embedding
         if self.module.ctrl_class_idx is not None:
@@ -686,12 +690,6 @@ class ExPert(
             else:
                 # Reset index to 0s
                 cls_emb[self.module.ctrl_class_idx] = torch.tensor(0.0)
-   
-        # Use aligner classify mode
-        if inference:
-            log.info(f'Using inference mode (joint prediction).')
-            # Register embedding interactions
-            self.module.aligner.precompute_joint_bank(ctx_emb, cls_emb)
         
         log.info(f'Classifying.')
         # Collect batch logits
@@ -742,7 +740,6 @@ class ExPert(
                     cont_covs=cont_covs,
                     use_posterior_mean=use_posterior_mean,
                     inference_outputs=inference_outputs,
-                    inference=inference,
                     ctx_emb=ctx_emb,
                     cls_emb=cls_emb,
                     return_logits=True
@@ -1241,9 +1238,6 @@ class ExPert(
         if self.is_evaluated and not force:
             log.info('This model has already been evaluated, pass force=True to re-evaluate.')
             return
-        # Set z shared to false if model is in pretrain mode
-        if self.module.pretrain:
-            z_shared = False
         # Refactor results mode to always be a list of options or None
         results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
         # Run full prediction for all registered data
@@ -1354,7 +1348,8 @@ class ExPert(
             self.adata.uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY],
             output_file=top_n_o,
             metric=metric,
-            mean_split='test'
+            mean_split='test',
+            N=self.adata.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY].shape[-1]
         )
         z_key = self._LATENT_Z_SHARED_KEY if z_shared else self._LATENT_Z_KEY
         # Calculate UMAP for latent space based on latent mean
@@ -1473,10 +1468,9 @@ class ExPert(
             log.info('Minifying test data.')
             self.minify_query(test_ad)
         # Get model predictions for test data
-        use_full = None if not incl_unseen else True
         prediction_output = self.predict(
             adata=test_ad, 
-            use_full_cls_emb=use_full, 
+            obs_only=not incl_unseen,
             return_latents=True,
         )
         # Save predictions to test adata
@@ -1502,7 +1496,8 @@ class ExPert(
         summary, report = pf.get_classification_report(
             test_ad,
             cls_label=cls_label,
-            pred_label=PREDICTION_KEYS.PREDICTION_KEY
+            pred_label=PREDICTION_KEYS.PREDICTION_KEY,
+            class_names=test_ad.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY].columns.values
         )
         # Save results to test adata
         test_ad.uns[PREDICTION_KEYS.SUMMARY_KEY] = summary
