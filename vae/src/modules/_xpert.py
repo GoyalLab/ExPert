@@ -51,7 +51,7 @@ class XPert(VAE):
         n_hidden: int = 256,
         n_latent: int = 128,
         n_layers: int = 2,
-        n_shared: int | None = 512,
+        n_shared: int | None = None,
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         cls_sim: torch.Tensor | None = None,
@@ -238,7 +238,7 @@ class XPert(VAE):
         # Setup aligner
         self.aligner = ContextClassAligner(
             n_input=n_latent,
-            n_shared=n_shared,
+            n_shared=self.n_shared,
             ctx_emb_dim=self.n_ctx_dim,
             cls_emb_dim=self.n_cls_dim,
             **extra_aligner_kwargs
@@ -642,7 +642,7 @@ class XPert(VAE):
         log_probs = F.log_softmax(logits, dim=-1)
         return torch.sum(-p * log_probs, dim=-1)
     
-    def _clip_loss(
+    def _clip_loss_simple(
             self, 
             z: torch.Tensor, 
             y: torch.Tensor, 
@@ -671,6 +671,75 @@ class XPert(VAE):
             return 0.5 * (loss_z2c + loss_c2z)
         else:
             return loss_z2c, loss_c2z
+        
+    def _clip_loss(
+        self, 
+        z: torch.Tensor, 
+        y: torch.Tensor, 
+        emb: torch.Tensor, 
+        T: torch.Tensor,
+        k: int = 10,                 # number of hard negatives
+        return_full: bool = True
+    ) -> torch.Tensor:
+
+        # flatten labels
+        y = y.flatten()
+
+        # normalize embeddings
+        z = F.normalize(z, dim=-1)
+        chosen = F.normalize(emb[y], dim=-1)   # (B, d)
+
+        B = z.size(0)
+        device = z.device
+
+        # ---------------------------------------------
+        #  Compute full similarity matrices
+        # ---------------------------------------------
+        full_z2c = (z @ chosen.T) / T          # (B, B)
+        full_c2z = (chosen @ z.T) / T          # (B, B)
+
+        # diagonal positions = positive pairs
+        labels = torch.arange(B, device=device)
+
+        # ---------------------------------------------
+        #  Hard Negative Mining (Top-K per row)
+        # ---------------------------------------------
+
+        # mask out diagonal (positives)
+        pos_mask = torch.eye(B, dtype=torch.bool, device=device)
+
+        # ---- z2c direction ----
+        neg_z2c = full_z2c.masked_fill(pos_mask, -1e9)   # remove positives
+        # pick top-k hardest negatives
+        k_eff = min(k, B - 1)
+        hard_neg_z2c = neg_z2c.topk(k_eff, dim=-1).values   # (B, k)
+
+        # extract positives
+        pos_z2c = full_z2c[labels, labels].unsqueeze(1)     # (B, 1)
+
+        # construct new logits
+        logits_z2c = torch.cat([pos_z2c, hard_neg_z2c], dim=1)   # (B, 1+k)
+
+        # labels: positive is always index 0
+        loss_z2c = F.cross_entropy(logits_z2c, torch.zeros(B, dtype=torch.long, device=device), reduction='none')
+
+        # ---- c2z direction ----
+        neg_c2z = full_c2z.masked_fill(pos_mask, -1e9)
+        hard_neg_c2z = neg_c2z.topk(k_eff, dim=-1).values
+
+        pos_c2z = full_c2z[labels, labels].unsqueeze(1)
+        logits_c2z = torch.cat([pos_c2z, hard_neg_c2z], dim=1)
+
+        loss_c2z = F.cross_entropy(logits_c2z, torch.zeros(B, dtype=torch.long, device=device), reduction='none')
+
+        # ---------------------------------------------
+        #  Symmetric CLIP loss
+        # ---------------------------------------------
+        if return_full:
+            return 0.5 * (loss_z2c + loss_c2z)
+        else:
+            return loss_z2c, loss_c2z
+
     
     def _joint_clip_loss(
         self,

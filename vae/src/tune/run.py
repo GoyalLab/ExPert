@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import pandas as pd
 
@@ -143,8 +144,6 @@ def full_run(
         return None
     # Run fine-tune stage if extra config is provided
     if fine_tune_config_p:
-        # Specify fine-tuning config path
-        fine_tune_config_p = '../resources/params/runs/two-stage/fine-tune.yaml'
         # Load fine-tune config params
         fine_tune_config = read_config(fine_tune_config_p)
         # Add logger to config
@@ -217,3 +216,5 @@ if __name__ == '__main__':
         fine_tune_config_p=args.fine_tune_config,
         save_anndata=args.save
     )
+    log.info(f'Exiting run.')
+    sys.exit(0)

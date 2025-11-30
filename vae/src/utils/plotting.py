@@ -313,3 +313,153 @@ def plot_top_n_performance(
         plt.show()
     # Close the plot
     plt.close()
+    
+def plot_umap_with_proxies(
+    latent_space: np.ndarray,
+    labels: np.ndarray,
+    covs: np.ndarray,
+    modes: np.ndarray | None = None,
+    cls_emb: np.ndarray | None = None,
+    code_to_label: dict[int, str] | None = None,
+    title_prefix: str = "",
+    save_path: str | None = None,
+    n_obs: int | None = None,
+    show_labels_only: bool = True,
+):
+    """
+    Stand-alone UMAP plotter for latent spaces (optionally with class proxies).
+    No class/cache/logger dependencies.
+
+    Parameters
+    ----------
+    latent_space : np.ndarray, shape (N, d)
+        Latent embeddings (z).
+    labels : np.ndarray, shape (N,)
+        Class indices for each latent point.
+    covs : np.ndarray, shape (N,)
+        Covariate/batch labels.
+    modes : np.ndarray, optional, shape (N,)
+        Train/val/test labels for each cell.
+    cls_emb : np.ndarray, shape (C, d), optional
+        Class proxy embeddings.
+    code_to_label : dict, optional
+        Maps class IDs to human-readable labels.
+    title_prefix : str
+        Appears in plot titles.
+    save_path : str
+        If provided, the figure will be saved.
+    """
+    import umap
+    import numpy as np
+    import pandas as pd
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+
+    N = latent_space.shape[0]
+    modes = np.asarray(modes) if modes is not None else np.repeat("mode", N)
+
+    # ---- Combine with class proxies if provided
+    if cls_emb is not None:
+        n_proxies = cls_emb.shape[0]
+
+        proxy_labels = np.arange(n_proxies)
+        proxy_covs = np.repeat("proxy", n_proxies)
+        proxy_modes = np.repeat("proxy", n_proxies)
+        if n_obs is None:
+            proxy_is_obs = np.ones(n_proxies, dtype=bool)
+        else:
+            proxy_is_obs = np.array(
+                [True] * n_obs + [False] * (n_proxies - n_obs)
+            )[:n_proxies]
+
+        embeddings_all = np.concatenate([latent_space, cls_emb], axis=0)
+
+        df = pd.DataFrame({
+            "label_id": np.concatenate([labels, proxy_labels]),
+            "cov": np.concatenate([covs, proxy_covs]),
+            "mode": np.concatenate([modes, proxy_modes]),
+            "is_proxy": np.concatenate([np.zeros(N, bool), np.ones(n_proxies, bool)]),
+            "is_observed": np.concatenate([np.ones(N, bool), proxy_is_obs])
+        })
+
+    else:
+        embeddings_all = latent_space
+
+        df = pd.DataFrame({
+            "label_id": labels,
+            "cov": covs,
+            "mode": modes,
+            "is_proxy": np.zeros(N, bool),
+            "is_observed": np.ones(N, bool),
+        })
+
+    # Human-readable class labels
+    if code_to_label is not None:
+        df["label"] = code_to_label[df["label_id"]]
+    else:
+        df["label"] = df["label_id"].astype(str)
+
+    # ---- UMAP transform
+    reducer = umap.UMAP(n_components=2)
+    emb_2d = reducer.fit_transform(embeddings_all)
+    df["UMAP1"] = emb_2d[:, 0]
+    df["UMAP2"] = emb_2d[:, 1]
+
+    # ---- Plot helper
+    def _scatter(ax, data, hue, title, plot_proxy=True, legend=True):
+        sns.scatterplot(
+            data=data[~data.is_proxy],
+            x="UMAP1", y="UMAP2", hue=hue,
+            s=6, alpha=0.6, ax=ax, legend=legend
+        )
+        if plot_proxy and data.is_proxy.any():
+            sns.scatterplot(
+                data=data[data.is_proxy],
+                x="UMAP1", y="UMAP2", hue=hue,
+                marker="X", s=40,
+                edgecolor="black", linewidth=0.5,
+                ax=ax, legend=legend
+            )
+        ax.set_title(title)
+        ax.set_xlabel("UMAP1")
+        ax.set_ylabel("UMAP2")
+        if legend:
+            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small")
+
+    # ---- 4-panel figure
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9), dpi=150)
+
+    df_obs_only = df[(df.is_proxy & df.is_observed) | (~df.is_proxy)]
+    _scatter(
+        axes[0, 0],
+        df_obs_only,
+        "label",
+        f"{title_prefix} Observed Proxies Only",
+        plot_proxy=True,
+        legend=False
+    )
+    _scatter(axes[0, 1], df, "label", f"{title_prefix} Classes", plot_proxy=False)
+
+    # Get all labels in given data
+    obs_cls = df[~df.is_proxy].label_id.unique()
+    df_unseen_only = df[(df.is_proxy & ~df.is_observed & df.label_id.isin(obs_cls))]
+    # include backgrounds (non-proxy) for context
+    df_unseen_only = pd.concat([df[~df.is_proxy], df_unseen_only])
+    _scatter(
+        axes[1, 0],
+        df_unseen_only,
+        "label",
+        f"{title_prefix} Unseen Proxies Only",
+        plot_proxy=True,
+        legend=True
+    )
+
+    _scatter(axes[1, 1], df, "cov", f"{title_prefix} Covariates", plot_proxy=False)
+
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=200)
+
+    plt.show()
+    return df, fig

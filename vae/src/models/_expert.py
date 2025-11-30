@@ -81,7 +81,7 @@ class ExPert(
         n_hidden: int = 256,
         n_latent: int = 20,
         n_layers: int = 2,
-        n_shared: int = 128,
+        n_shared: int | None = None,
         dropout_rate: float = 0.2,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
@@ -356,6 +356,9 @@ class ExPert(
         """Reset model's embeddings from tensors to dataframes"""
         self.ctx_emb = self.get_ctx_emb(return_dataframe=True)
         self.cls_emb, _ = self.get_cls_emb(return_dataframe=True)
+        
+    def get_obs_classes(self) -> np.ndarray:
+        return self.idx_to_label[:self.n_labels]
     
     @classmethod
     def from_base_model(
@@ -623,6 +626,7 @@ class ExPert(
         return_latents: bool = True,
         verbose: bool = True,
         obs_only: bool = True,
+        add_report: bool = True,
         **kwargs
     ) -> dict[str, pd.DataFrame | np.ndarray]:
         """Return cell label predictions.
@@ -678,9 +682,7 @@ class ExPert(
             cls_emb = self.module.cls_emb.weight
             if obs_only:
                 cls_emb = cls_emb[:self.module.n_labels]
-            
-        # Subset to observed embeddings only
-
+   
         # Add control embedding
         if self.module.ctrl_class_idx is not None:
             log.info('Adding control embedding')
@@ -763,7 +765,7 @@ class ExPert(
                 ctx2z.append(_ctx2z)
                 cls2z.append(_cls2z)
                 # Collect labels
-                data_ctx_labels.append(batch.cpu())
+                data_ctx_labels.append(batch.flatten().cpu())
                 data_cls_labels.append(l.cpu())
                 # ---- CLEANUP ----
                 del cls_output, x, l, batch
@@ -816,8 +818,9 @@ class ExPert(
             PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY: ctx_soft_predictions,
             PREDICTION_KEYS.PREDICTION_KEY: cls_predictions,
             PREDICTION_KEYS.SOFT_PREDICTION_KEY: cls_soft_predictions,
-            REGISTRY_KEYS.BATCH_KEY: data_ctx_labels,
-            REGISTRY_KEYS.LABELS_KEY: data_cls_labels,
+            REGISTRY_KEYS.BATCH_KEY: ctx_labels[data_ctx_labels],
+            REGISTRY_KEYS.LABELS_KEY: cls_labels[data_cls_labels],
+            'label_idx': data_cls_labels,
             'indices': indices,
         }
         # Add latent spaces to prediction output
@@ -828,6 +831,12 @@ class ExPert(
                 MODULE_KEYS.CTX_PROJ_KEY: ctx2z,
                 MODULE_KEYS.CLS_PROJ_KEY: cls2z,
             })
+        # Add classification report
+        if add_report:
+            log.info(f'Adding classification report.')
+            s, r = self.get_prediction_output_report(o)
+            o[PREDICTION_KEYS.SUMMARY_KEY] = s
+            o[PREDICTION_KEYS.REPORT_KEY] = r
         return o
         
     def get_training_plan(self, **plan_kwargs):
@@ -1129,6 +1138,25 @@ class ExPert(
         # Add mode to results
         report_data[REGISTRY_KEYS.SPLIT_KEY] = split
         summary[REGISTRY_KEYS.SPLIT_KEY] = split
+        return summary, report_data
+    
+    def get_prediction_output_report(self, prediction_output: dict):
+        from sklearn.metrics import classification_report
+
+        # Generate a classification report for the relevant mode
+        report = classification_report(
+            y_true=prediction_output[REGISTRY_KEYS.LABELS_KEY],
+            y_pred=prediction_output[PREDICTION_KEYS.PREDICTION_KEY],
+            zero_division=np.nan,
+            output_dict=True
+        )
+        # Format output accordingly
+        report_df = pd.DataFrame(report).transpose()
+        summary = report_df[report_df.index.isin(['accuracy', 'macro avg', 'weighted avg'])].copy()
+        report_data = report_df[~report_df.index.isin(['accuracy', 'macro avg', 'weighted avg'])].copy()
+        # Filter for observed classes
+        report_data = report_data[report_data.support > 0].copy()
+        report_data['log_count'] = np.log(report_data.support)
         return summary, report_data
     
     def _register_classification_report(self, force: bool = False, ignore_ctrl: bool = True) -> None:
