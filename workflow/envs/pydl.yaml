@@ -9,6 +9,7 @@ dependencies:
   - _py-xgboost-mutex=2.0=cpu_0
   - _x86_64-microarch-level=1=2_x86_64
   - absl-py=2.1.0=pyhd8ed1ab_0
+  - accelerate=1.12.0=pyhcf101f3_0
   - aiohappyeyeballs=2.4.3=pyhd8ed1ab_0
   - aiohttp=3.10.5=py311h9ecbd09_1
   - aiohttp-cors=0.7.0=pyhd8ed1ab_2
@@ -48,6 +49,7 @@ dependencies:
   - azure-storage-blobs-cpp=12.12.0=hd2e3451_0
   - azure-storage-common-cpp=12.7.0=h10ac4d7_1
   - azure-storage-files-datalake-cpp=12.11.0=h325d260_1
+  - biothings_client=0.4.1=pyh29332c3_0
   - blas=1.0=mkl
   - blinker=1.9.0=pyhff2d567_0
   - blosc=1.21.6=hef167b5_0
@@ -59,7 +61,7 @@ dependencies:
   - bzip2=1.0.8=h4bc722e_7
   - c-ares=1.32.3=h4bc722e_0
   - c-blosc2=2.15.1=hc57e6cf_0
-  - ca-certificates=2025.4.26=hbd8a1cb_0
+  - ca-certificates=2025.11.12=hbd8a1cb_0
   - cached-property=1.5.2=hd8ed1ab_1
   - cached_property=1.5.2=pyha770c72_1
   - cachetools=5.5.0=pyhd8ed1ab_1
@@ -67,7 +69,7 @@ dependencies:
   - cairomm-1.16=1.16.2=h7e731d7_1
   - captum=0.6.0=pyhd8ed1ab_0
   - catalogue=2.0.10=py311h38be061_0
-  - certifi=2025.4.26=pyhd8ed1ab_0
+  - certifi=2025.11.12=pyhd8ed1ab_0
   - cffi=1.17.1=py311hf29c0ef_0
   - chardet=5.2.0=py311h38be061_2
   - charls=2.4.2=h59595ed_0
@@ -149,6 +151,7 @@ dependencies:
   - freetype=2.12.1=h267a509_2
   - freetype-py=2.3.0=pyhd8ed1ab_0
   - fribidi=1.0.10=h36c2ea0_0
+  - frozendict=2.4.7=py311h49ec1c0_0
   - frozenlist=1.5.0=py311h9ecbd09_0
   - fsspec=2024.9.0=pyhff2d567_0
   - future=1.0.0=pyhd8ed1ab_0
@@ -175,6 +178,7 @@ dependencies:
   - graphviz=12.0.0=hba01fac_0
   - greenlet=3.1.1=py311hfdbb021_0
   - grpcio=1.62.2=py311ha6695c7_0
+  - gseapy=1.1.9=py311h5e00ca1_0
   - gtk2=2.24.33=h6470451_5
   - gtk3=3.24.43=hd6cba2e_1
   - gts=0.7.6=h977cf35_4
@@ -339,6 +343,7 @@ dependencies:
   - llvm-openmp=15.0.7=h0cdce71_0
   - llvmlite=0.43.0=py311h9c9ff8c_1
   - locket=1.0.0=pyhd8ed1ab_0
+  - lxml=5.3.1=py311hcfaa980_0
   - lz4=4.3.3=py311h2cbdf9a_1
   - lz4-c=1.9.4=hcb278e6_0
   - lzo=2.10=hd590300_1001
@@ -365,6 +370,7 @@ dependencies:
   - multiprocess=0.70.16=py311h9ecbd09_1
   - munkres=1.1.4=pyh9f0ad1d_0
   - murmurhash=1.0.10=py311hfdbb021_2
+  - mygene=3.2.2=pyh5e36f6f_0
   - mysql-common=9.0.1=h266115a_2
   - mysql-libs=9.0.1=he0572af_2
   - namex=0.0.8=pyhd8ed1ab_0
@@ -384,7 +390,7 @@ dependencies:
   - openjpeg=2.5.2=h488ebb8_0
   - openldap=2.6.8=hedd0468_0
   - openpyxl=3.1.5=py311h50c5138_1
-  - openssl=3.5.0=h7b32b05_1
+  - openssl=3.6.0=h26f9b46_0
   - opt-einsum=3.4.0=hd8ed1ab_1
   - opt_einsum=3.4.0=pyhd8ed1ab_0
   - optax=0.2.3=pyhd8ed1ab_0
@@ -399,6 +405,7 @@ dependencies:
   - partd=1.4.2=pyhd8ed1ab_0
   - patsy=1.0.1=pyhff2d567_0
   - pcre2=10.44=hba22ea6_2
+  - peft=0.13.0=pyhd8ed1ab_0
   - pexpect=4.9.0=pyhd8ed1ab_0
   - pgmpy=0.1.24=py311h38be061_1
   - pickleshare=0.7.5=py_1003
@@ -433,7 +440,9 @@ dependencies:
   - pydeprecate=0.3.0=pyhd8ed1ab_0
   - pygments=2.18.0=pyhd8ed1ab_0
   - pygobject=3.50.0=py311hba7ce5e_1
+  - pyld=2.0.4=pyhd8ed1ab_1
   - pynndescent=0.5.13=pyhff2d567_0
+  - pyopengl=3.1.9=pyhd8ed1ab_0
   - pyopenssl=24.3.0=pyhd8ed1ab_0
   - pyparsing=3.2.0=pyhd8ed1ab_1
   - pyro-api=0.1.2=pyhd8ed1ab_0

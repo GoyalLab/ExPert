@@ -5,8 +5,8 @@ import pandas as pd
 import scanpy as sc
 import anndata as ad
 import scipy.sparse as sp
-
-import itertools, random
+from os import PathLike
+import random
 from copy import deepcopy
 
 import torch
@@ -21,6 +21,13 @@ log = logging.getLogger(__name__)
 mutually_excl_keys: dict[str, list[tuple[str]]] = {
     CONF_KEYS.MODEL: [('use_batch_norm', 'use_layer_norm')]
 }
+
+def load_json(p: str, mode: str = 'r', **kwargs):
+    import json
+    if p is None or not isinstance(p, str) or not p.endswith('json'):
+        return None
+    with open(p, mode) as f:
+        return json.load(f, **kwargs)
 
 
 def to_tensor(m: sp.csr_matrix | torch.Tensor | np.ndarray | pd.DataFrame | None) -> torch.Tensor:

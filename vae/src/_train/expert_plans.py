@@ -94,8 +94,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         top_k: int = 1,
         use_posterior_mean: Literal["train", "val", "both"] | None = "val",
         log_class_distribution: bool = False,
-        freeze_modules: list[str] | None = None,
-        soft_freeze_lr: float | None = None,
+        freeze_modules: dict[str, float] | None = None,
         freeze_encoder_epoch: int | None = None,
         freeze_decoder_epoch: int | None = None,
         gene_emb: torch.Tensor | None = None,
@@ -119,7 +118,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         **loss_kwargs,
     ):
         # Get custom optimizer for soft freezing if argument is provided
-        optimizer, optimizer_fn = self._optimizer_creator_fn_custom(freeze_modules=freeze_modules, freeze_lr=soft_freeze_lr)
+        optimizer, optimizer_fn = self._optimizer_creator_fn_custom(module_lrs=freeze_modules)
         if optimizer == 'Custom':
             loss_kwargs['optimizer'] = optimizer
             loss_kwargs['optimizer_creator'] = optimizer_fn
@@ -203,30 +202,26 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def _optimizer_creator_fn_custom(
         self,
         optimizer_cls: torch.optim.Adam | torch.optim.AdamW = torch.optim.Adam,
-        freeze_modules: list[str] | None = None,
-        freeze_lr: float | None = 1e-5,
+        module_lrs: dict[str, float] | None = None,
     ):
         """
-        Create an optimizer for the model, applying a reduced LR to any parameter
-        belonging to a module whose name matches entries in `freeze_modules`.
+        Create an optimizer for the model with custom learning rates per module.
 
         Parameters
         ----------
         optimizer_cls : torch.optim.Optimizer class
             e.g., torch.optim.Adam or torch.optim.AdamW
-        freeze_modules : list of str, optional
-            Names (substrings) of modules to 'soft freeze' (e.g. ["encoder", "decoder"])
-        freeze_lr : float
-            Learning rate for frozen modules; default 1e-5
+        module_lrs : dict[str, float], optional
+            Dict mapping module name substrings to learning rates
+            e.g., {"encoder": 1e-5, "lora_": 5e-6, "decoder": 1e-4}
+            Parameters matching multiple keys use the first match.
+            Parameters not matching any key use self.lr (default)
         """
-        # Create a custom optimizer if modules should be soft frozen
-        if freeze_modules is None or freeze_lr is None or not float(freeze_lr) > 0:
+        # Create default optimizer if no custom LRs specified
+        if module_lrs is None or not module_lrs:
             return "Adam", None
-
-        # Ensure it's cast to float
-        freeze_lr = float(freeze_lr)
         
-        logging.info(f'Creating custom optimizer. lr: {freeze_lr}')
+        logging.info(f'Creating custom optimizer with module LRs: {module_lrs}')
 
         def _creator(params):
             # collect all parameters (params is usually a generator)
@@ -241,18 +236,36 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 for p in module.parameters(recurse=False):
                     param_to_name[p] = module_name
 
-            # build param groups
-            param_groups = []
+            # group parameters by learning rate
+            lr_to_params = {}  # {lr: [params]}
+            
             for p in params_list:
                 name = param_to_name.get(p, "")
-                if any(fm in name for fm in freeze_modules):
-                    param_groups.append({"params": [p], "lr": freeze_lr})
-                else:
-                    param_groups.append({"params": [p], "lr": self.lr})
+                
+                # Find matching module LR (first match wins)
+                matched_lr = None
+                for module_key, lr in module_lrs.items():
+                    if module_key in name:
+                        matched_lr = float(lr)
+                        break
+                
+                # Use default LR if no match
+                if matched_lr is None:
+                    matched_lr = self.lr
+                
+                # Add to corresponding group
+                if matched_lr not in lr_to_params:
+                    lr_to_params[matched_lr] = []
+                lr_to_params[matched_lr].append(p)
+            
+            # Build param groups
+            param_groups = []
+            for lr, params_group in lr_to_params.items():
+                param_groups.append({"params": params_group, "lr": lr})
+                logging.info(f"  LR {lr}: {len(params_group)} parameters")
 
             return optimizer_cls(
                 param_groups,
-                lr=self.lr,
                 eps=self.eps,
                 weight_decay=self.weight_decay,
             )
@@ -821,6 +834,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.module.freeze_module('z_encoder')
         if self.freeze_decoder_epoch is not None and self.current_epoch >= self.freeze_decoder_epoch and not getattr(self.module.decoder, 'frozen', False):
             self.module.freeze_module('decoder')
+        # Compute class embeddings once per epoch
+        if self.module.cls_emb.encoder is not None and self._get_schedule_weight('cls_align_weight') > 0:
+            self.module.reset_cached_cls_emb()
 
     def _plt_random_ctx_predictions(self, random_predictions: torch.Tensor):
         if random_predictions is None:

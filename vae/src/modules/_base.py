@@ -1,3 +1,4 @@
+import os
 import math
 import torch
 import torch.nn as nn
@@ -8,6 +9,7 @@ from collections.abc import Callable, Iterable
 from typing import Literal, Iterable, Optional
 
 from torch.distributions import Normal
+from transformers import AutoTokenizer, AutoModel
 
 from src.utils.constants import MODULE_KEYS, PREDICTION_KEYS
 from src.utils.io import to_tensor
@@ -1261,6 +1263,7 @@ class DecoderSCVI(nn.Module):
         use_funnel: bool = False,
         linear_decoder: bool = False,
         n_dim_context_emb: int | None = None,
+        n_ctx_frac: float | None = 0.5,
         n_context_compression: int = 2,
         linear_ctx_compression: bool = True,
         use_film: bool = False,
@@ -1268,6 +1271,9 @@ class DecoderSCVI(nn.Module):
     ):
         super().__init__()
         self.n_dim_context_emb = n_dim_context_emb or 0
+        # Use fraction of latent dimension as target context dim
+        if n_ctx_frac is not None:
+            n_context_compression = int(n_input * n_ctx_frac)
         self.use_film = use_film
 
         # Compress context embedding dimension to reduce its effect
@@ -1459,9 +1465,9 @@ class ContextClassAligner(nn.Module):
 
         # --------- Temperature ---------
         if use_learnable_temperature:
-            self._ctx_temperature = nn.Parameter(torch.zeros(1))
-            self._cls_temperature = nn.Parameter(torch.zeros(1))
-            self._joint_temperature = nn.Parameter(torch.zeros(1))
+            self._ctx_temperature = nn.Parameter(torch.tensor(0.0))
+            self._cls_temperature = nn.Parameter(torch.tensor(0.0))
+            self._joint_temperature = nn.Parameter(torch.tensor(0.0))
         else:
             self.register_buffer("_ctx_temperature", torch.tensor(self.T))
             self.register_buffer("_cls_temperature", torch.tensor(self.T))
@@ -1611,26 +1617,29 @@ class ContextClassAligner(nn.Module):
 
         if self.dropout_rate > 0:
             h = self.dropout(h)
+            
+        # Optional noise regularization
+        if self.noise_sigma is not None and self.noise_sigma > 0:
+            noise_ctx = F.normalize(torch.randn_like(ctx_emb), dim=-1)
+            noise_cls = F.normalize(torch.randn_like(cls_emb), dim=-1)
+            ctx_emb = ctx_emb + self.noise_sigma * noise_ctx
+            cls_emb = cls_emb + self.noise_sigma * noise_cls
 
         # ----- External projections -----
         c_ctx = self.ctx_projection(ctx_emb)        # (N_ctx, D)
         c_cls = self.cls_projection(cls_emb)        # (N_cls, D)
-        
-        # Optional noise regularization
-        if self.noise_sigma is not None and self.noise_sigma > 0:
-            noise_ctx = F.normalize(torch.randn_like(c_ctx), dim=-1)
-            noise_cls = F.normalize(torch.randn_like(c_cls), dim=-1)
-            c_ctx = c_ctx + self.noise_sigma * noise_ctx
-            c_cls = c_cls + self.noise_sigma * noise_cls
             
         # Set control index to -inf if given
         if ctrl_idx is not None:
             c_cls[torch.as_tensor(ctrl_idx, device=c_cls.device, dtype=torch.long)] = -float('inf')
         
+        # Get batch-specific embeddings
+        b_ctx = c_ctx[ctx_idx.flatten()] if ctx_idx is not None else c_ctx
+        b_cls = c_cls[cls_idx.flatten()] if cls_idx is not None else c_cls
         # Get batch-specific joint embeddingd
         b_joint_norm = self.join_emb(
-            ctx_emb=c_ctx[ctx_idx.flatten()], 
-            cls_emb=c_cls[cls_idx.flatten()], 
+            ctx_emb=b_ctx, 
+            cls_emb=b_cls, 
             alpha=alpha
         )
         
@@ -1799,6 +1808,181 @@ class ContextClassAligner(nn.Module):
             MODULE_KEYS.CLS_PROJ_KEY: c_cls,
             MODULE_KEYS.JOINT_PROJ_KEY: c_joint,
         }
+        
+        
+class ClassEmbedding(nn.Module):
+    """
+    Provides class embeddings from either:
+      1) A pre-trained embedding matrix (cls_emb)
+      2) A transformer encoder applied to class_texts (dict)
+
+    Forward() returns embeddings only for requested class indices.
+    """
+
+    def __init__(
+        self,
+        pretrained_emb: torch.Tensor | None = None,
+        class_texts: dict | None = None,
+        transformer_name: str = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
+        device: str = "cuda",
+        max_length: int = 256,
+        batch_size: int = 64,
+        freeze_encoder: bool = False,
+        train_last_n_layers: int = 1,
+        use_lora: bool = True,
+        lora_rank: int = 4,
+        lora_dropout: int = 0.1,
+    ):
+        super().__init__()
+
+        self.device = device
+        self.class_texts = class_texts
+        self.max_length = max_length
+        self.batch_size = batch_size
+
+        # -----------------------------
+        # Case 1: Transformer text encoder
+        # -----------------------------
+        if class_texts is not None:
+            # Load tokenizer + encoder
+            self.tokenizer = AutoTokenizer.from_pretrained(transformer_name)
+            self.encoder = AutoModel.from_pretrained(transformer_name)
+
+            self.class_names = list(class_texts.keys())
+            self._num_classes = len(self.class_names)
+            self._emb_dim = self.encoder.config.hidden_size
+            self.embedding = None
+
+            # --- Freeze or partially freeze encoder ---
+            if freeze_encoder:
+                for p in self.encoder.parameters():
+                    p.requires_grad = False
+            
+            # Use LoRA to reduce trainable parameters
+            if use_lora:
+                from peft import get_peft_model, LoraConfig, TaskType
+                # Apply lora
+                lora_config = LoraConfig(
+                    task_type=TaskType.FEATURE_EXTRACTION,
+                    r=lora_rank,
+                    lora_alpha=int(lora_rank*2),
+                    lora_dropout=lora_dropout,
+                    target_modules=["query", "value"],
+                    bias="none",
+                    inference_mode=False,
+                )
+                # Update encoder
+                self.encoder = get_peft_model(self.encoder, lora_config)
+            else:
+                # Unfreeze last n layers
+                if train_last_n_layers > 0:
+                    for layer in self.encoder.encoder.layer[-train_last_n_layers:]:
+                        for p in layer.parameters():
+                            p.requires_grad = True
+            
+            # Always make pool trainable
+            if hasattr(self.encoder, "pooler"):
+                for p in self.encoder.pooler.parameters():
+                    p.requires_grad = True
+
+            # ---------------------------------------------------
+            # Pre-tokenize ALL class texts ON INIT (major speedup)
+            # ---------------------------------------------------
+            # Disable parallel toeknization
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            self.pretokenized_inputs = []
+            for name in self.class_names:
+                text = class_texts[name]
+                tokens = self.tokenizer(
+                    text,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors="pt",
+                )
+                # Keep pretokenized CPU tensors for safety
+                self.pretokenized_inputs.append(tokens)
+
+        # -----------------------------
+        # Case 2: Pre-trained embedding
+        # -----------------------------
+        else:
+            assert pretrained_emb is not None, \
+                "Provide either pretrained_emb or class_texts."
+
+            self.embedding = nn.Embedding.from_pretrained(pretrained_emb, freeze=True)
+            self.encoder = None
+            self.tokenizer = None
+
+            self._num_classes, self._emb_dim = pretrained_emb.shape
+
+        self.to(device)
+
+    # -------------------------------------------------------
+    @property
+    def shape(self):
+        return (self._num_classes, self._emb_dim)
+
+    # -------------------------------------------------------
+    def forward(self, class_indices: torch.Tensor | list | None = None):
+        """
+        Compute class embeddings.
+
+        Args:
+            class_indices: Optional list/tensor of class indices to return.
+                           If None → return all class embeddings.
+
+        Returns:
+            Tensor of shape (K, emb_dim)
+        """
+
+        # ---------------------------------------------------------
+        # Case 1: Pretrained embedding → trivial indexing
+        # ---------------------------------------------------------
+        if self.embedding is not None:
+            if class_indices is None:
+                return self.embedding.weight
+            else:
+                return self.embedding.weight[class_indices]
+
+        # ---------------------------------------------------------
+        # Case 2: Transformer text embeddings (pretokenized)
+        # ---------------------------------------------------------
+
+        # If subset not provided → use all
+        if class_indices is None:
+            indices = list(range(self._num_classes))
+        else:
+            if isinstance(class_indices, torch.Tensor):
+                class_indices = class_indices.tolist()
+            indices = class_indices
+
+        # Select pre-tokenized inputs
+        selected_tokens = [self.pretokenized_inputs[i] for i in indices]
+
+        all_embeddings = []
+
+        # Process in small chunks (tokens already on CPU)
+        for i in range(0, len(indices), self.batch_size):
+            batch_tokens = selected_tokens[i : i + self.batch_size]
+
+            # Merge token dicts into a batch
+            merged = {
+                key: torch.cat([t[key] for t in batch_tokens], dim=0).to(self.device)
+                for key in batch_tokens[0]
+            }
+
+            with torch.no_grad():
+                out = self.encoder(**merged)
+                cls = out.last_hidden_state[:, 0]
+
+            all_embeddings.append(cls)
+
+            del merged, out, cls
+            torch.cuda.empty_cache()
+
+        embeddings = torch.cat(all_embeddings, dim=0)
+        return embeddings
 
 
 class EmbeddingAligner(nn.Module):

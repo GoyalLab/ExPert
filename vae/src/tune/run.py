@@ -10,9 +10,13 @@ import pytorch_lightning as pl
 import scanpy as sc
 import anndata as ad
 
+import multiprocessing as mp
+import threading
+import gc
+
 
 from src.utils.constants import PREDICTION_KEYS
-from src.utils.io import read_config
+import src.utils.io as io
 from src.tune._statics import CONF_KEYS
 from src.models._expert import ExPert
 
@@ -28,10 +32,48 @@ def parse_args():
     parser.add_argument('--test', type=str, default=None, help='Path to h5ad test file (test split)')
     parser.add_argument('--config', type=str, required=True, help='config.yaml file that specififes hyperparameters for training')
     parser.add_argument('--fine_tune_config', type=str, default=None, help='config.yaml file that specififes hyperparameters for fine-tune training')
+    parser.add_argument('--cls_texts', type=str, default=None, help='Path to class texts dict as json')
     parser.add_argument('--outdir', type=str, default=None, help='Output directory, default is config file directory')
     parser.add_argument('--test_unseen', action='store_true', help='Test model on unseen perturbations')
-    parser.add_argument('--save', action='store_true', help='Save model output data')
+    parser.add_argument('--no_save', action='store_true', help='Save model output data')
     return parser.parse_args()
+
+
+def clean_up():
+    print("Cleaning up dataloaders, worker processes, CUDA contexts...")
+
+    # --- Terminate PyTorch DataLoader worker processes ---
+    try:
+        children = mp.active_children()
+        for p in children:
+            print(f"  -> terminating child process {p.pid}")
+            p.terminate()
+            p.join(timeout=2)
+    except Exception as e:
+        print(f"Could not inspect or terminate multiprocessing children: {e}")
+
+    # --- Clear CUDA contexts ---
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            print("  -> cleared CUDA context")
+    except Exception as e:
+        print(f"Could not clear CUDA: {e}")
+
+    # --- Inspect daemon threads (cannot force-kill, but useful for debugging) ---
+    try:
+        for t in threading.enumerate():
+            if t.daemon and t.is_alive():
+                print(f"  -> daemon thread still alive: {t.name}")
+    except Exception as e:
+        print(f"Thread inspection error: {e}")
+
+    # --- Force garbage collection (closes mmap and file handles) ---
+    gc.collect()
+
+    print("Cleanup finished.")
 
     
 def get_ouptut_dir(config_p: str, output_base_dir: str | None = None) -> str:
@@ -52,6 +94,7 @@ def _train(
         batch_key: str = 'context',
         verbose: bool = False,
         context_filter: list[str] | None = None,
+        cls_texts_p: str | None = None,
         **train_kwargs
     ) -> ExPert:
     """Train wrapper for ExPert.train()"""
@@ -72,11 +115,14 @@ def _train(
     # Setup anndata with model
     setup_kwargs = {'batch_key': batch_key, 'labels_key': cls_label}
     setup_kwargs.update(config.get(CONF_KEYS.MODEL_SETUP, {}))
+    # Load class texts if path is given
+    cls_texts = io.load_json(cls_texts_p)
     ExPert.setup_anndata(
         model_set,
         **setup_kwargs
     )
-    model = ExPert(model_set, **config[CONF_KEYS.MODEL].copy())
+    # Initialize main model
+    model = ExPert(model_set, cls_text_dict=cls_texts, **config[CONF_KEYS.MODEL].copy())
     if verbose:
         print(model.module)
     # Set training logger
@@ -88,8 +134,8 @@ def _train(
 
 def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.Module | pd.DataFrame | ad.AnnData | str]:
     """Train wrapper for use with config file."""
-    # Load run config TODO: add model schema to check for invalid arguments
-    config = read_config(config_p, do_setup=False, check_schema=False)
+    # Load run config
+    config = io.read_config(config_p, do_setup=False, check_schema=False)
     # Init run output dir
     step_model_dir = get_ouptut_dir(config_p, output_base_dir=out_dir)
     # Train the model
@@ -145,7 +191,7 @@ def full_run(
     # Run fine-tune stage if extra config is provided
     if fine_tune_config_p:
         # Load fine-tune config params
-        fine_tune_config = read_config(fine_tune_config_p)
+        fine_tune_config = io.read_config(fine_tune_config_p)
         # Add logger to config
         fine_tune_output_dir = os.path.join(base_model.model_log_dir, 'fine-tune')
         fine_tune_config[CONF_KEYS.TRAIN]['logger'] = pl.loggers.TensorBoardLogger(fine_tune_output_dir)
@@ -203,18 +249,37 @@ def full_run(
     top_n_predictions.to_csv(os.path.join(output_dir, 'test_top_n_predictions.csv'))
     return top_n_predictions
 
-if __name__ == '__main__':
-    # Parse cmd line args
-    args = parse_args()
-    # Full model run
-    _ = full_run(
-        config_p=args.config, 
-        train_p=args.input, 
-        model_dir=args.outdir, 
-        test_p=args.test, 
-        test_unseen=args.test_unseen,
-        fine_tune_config_p=args.fine_tune_config,
-        save_anndata=args.save
-    )
-    log.info(f'Exiting run.')
-    sys.exit(0)
+def main():
+    try:
+        # Parse command line arguments
+        args = parse_args()
+        # Train model
+        _ = full_run(
+            config_p=args.config,
+            train_p=args.input,
+            model_dir=args.outdir,
+            test_p=args.test,
+            test_unseen=args.test_unseen,
+            fine_tune_config_p=args.fine_tune_config,
+            cls_texts_p=args.cls_texts,
+            save_anndata=not args.no_save
+        )
+
+    except Exception as e:
+        print("Error in full_run:", e)
+        raise e
+
+    finally:
+        # Close all dataloaders, etc.
+        clean_up()
+
+        print("Exiting job.")
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        # Force termination so Slurm marks the job as finished
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    main()

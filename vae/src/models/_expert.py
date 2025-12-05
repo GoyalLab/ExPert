@@ -83,6 +83,7 @@ class ExPert(
         n_layers: int = 2,
         n_shared: int | None = None,
         dropout_rate: float = 0.2,
+        cls_text_dict: dict | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         use_full_cls_emb: bool = False,
@@ -91,6 +92,10 @@ class ExPert(
     ):
         super().__init__(adata)
         self._model_kwargs = dict(model_kwargs)
+        # Save class text information for manual transformer training
+        self.cls_text_dict = cls_text_dict
+        self.use_raw_text = cls_text_dict is not None
+        # Fall back to transformer if raw data is provided
         self.use_gene_emb = self.adata_manager.registry.get('field_registries', {}).get(REGISTRY_KEYS.GENE_EMB_KEY, None) is not None
         # Set number of classes
         self.n_labels = self.summary_stats.n_labels
@@ -100,7 +105,7 @@ class ExPert(
         self.model_log_dir = None
         self.ctrl_class = ctrl_class
 
-        # Initialize indices and labels for this VAE
+        # Initialize indices and labels for this model
         self._setup()
         # Get covariates
         if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
@@ -130,6 +135,7 @@ class ExPert(
             n_shared=n_shared,
             cls_emb=cls_emb,
             cls_sim=cls_sim,
+            cls_text_dict=self.cls_text_dict,
             ctrl_class_idx=self.ctrl_class_idx,
             ctx_emb=self.ctx_emb,
             dropout_rate=dropout_rate,
@@ -153,6 +159,7 @@ class ExPert(
             f"n_contexts: {n_batch}, "
             f"n_unseen_contexts: {self.n_unobs_ctx}, \n" if self.n_unobs_ctx > 0 else "\n"
             f"use_gene_emb: {self.use_gene_emb}"
+            f"use_raw_text: {self.use_raw_text}"
         )
         # Include covariate information
         if cov_summary_string is not None:
@@ -245,8 +252,8 @@ class ExPert(
             # Set indices
             self.idx_to_label = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.LABELS_KEY])
             # Set control class index
-            self.ctrl_class = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.CTRL_CLASS_KEY]
-            self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY]
+            self.ctrl_class = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT].get(EXT_CLS_EMB_INIT.CTRL_CLASS_KEY)
+            self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT].get(EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY)
         else:
             # Register adata's class embedding with this model
             cls_emb: pd.DataFrame = self.adata.uns[cls_emb_key]
@@ -313,6 +320,12 @@ class ExPert(
                 EXT_CLS_EMB_INIT.CTRL_CLASS_KEY: self.ctrl_class,
                 EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY: self.ctrl_class_idx,
             }
+        # Order class texts according to model
+        if self.use_raw_text:
+            # TODO: make this work without the need for an external embedding pls
+            self.cls_text_dict = {cls: self.cls_text_dict[cls] for cls in self.idx_to_label if cls in self.cls_text_dict}
+            self.idx_to_label = np.array([*self.cls_text_dict.keys()])
+            log.info(f'Registered {len(self.cls_text_dict)} class texts.')
         # Set embedding dimension
         self.ext_class_embed_dim = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
 
@@ -323,7 +336,7 @@ class ExPert(
         log.info(summary)
 
     def draw_module(self, **kwargs) -> None:
-        """Draw """
+        """Draw module setup."""
         pass
 
     def get_ctx_emb(self, return_dataframe: bool = False):
@@ -679,7 +692,7 @@ class ExPert(
         # Use model's class labels and embedding
         else:
             cls_labels = self.idx_to_label
-            cls_emb = self.module.cls_emb.weight
+            cls_emb = self.module.cached_cls_emb
             if obs_only:
                 cls_emb = cls_emb[:self.module.n_labels]
    
@@ -842,7 +855,11 @@ class ExPert(
     def get_training_plan(self, **plan_kwargs):
         # If fine-tune stage, set lower lr for encoder and decoder
         soft_freeze_lr = plan_kwargs.pop('soft_freeze_lr', None)
-        freeze_modules = getattr(self, 'freeze_modules', None)
+        freeze_modules = getattr(self, 'freeze_modules', {})
+        freeze_modules = {m: soft_freeze_lr for m in freeze_modules}
+        # Add custom learning rates for other modules
+        lr_modules = plan_kwargs.pop('lr_modules', {})
+        freeze_modules.update(lr_modules)
             
         # Create training plan
         return self._training_plan_cls(
@@ -850,7 +867,6 @@ class ExPert(
             n_classes=self.n_labels, 
             gene_emb=self.gene_emb,
             freeze_modules=freeze_modules,
-            soft_freeze_lr=soft_freeze_lr,
             **plan_kwargs
         )
     
@@ -1641,9 +1657,9 @@ class ExPert(
     
     def save(self, *args, **kwargs) -> None:
         """Save wrapper to handle external model embeddings"""
-        keep_emb = bool(kwargs.pop('keep_emb'))
+        keep_emb = bool(kwargs.pop('keep_emb', None))
         # Handle external model embeddings if anndata is saved with model
-        if self.cls_emb is not None and bool(kwargs.get('save_anndata')):
+        if self.cls_emb is not None and bool(kwargs.get('save_anndata', None)):
             # Convert embeddings to numpy arrays
             if keep_emb:
                 self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
@@ -1675,7 +1691,7 @@ class ExPert(
         **kwargs,
     ):
         """
-        Setup AnnData object for training a JEDVI model.
+        Setup AnnData object for training an ExPert model.
         """
         if not isinstance(adata.X, sp.csr_matrix) and cast_to_csr:
             log.info('Converting adata.X to csr matrix to boost training efficiency.')
