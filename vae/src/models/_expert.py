@@ -637,9 +637,10 @@ class ExPert(
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         return_latents: bool = True,
-        verbose: bool = True,
+        progress_bar: bool = False,
         obs_only: bool = True,
         add_report: bool = True,
+        add_missing_categories: bool = True,
         **kwargs
     ) -> dict[str, pd.DataFrame | np.ndarray]:
         """Return cell label predictions.
@@ -663,8 +664,11 @@ class ExPert(
         # Log usage of gene embeddings
         if self.gene_emb is not None:
             log.info(f'Using model gene embeddings ({self.gene_emb.shape})')
-        # validate adata or get it from model
-        adata = self._validate_anndata(adata)
+        # Ensure adata has the correct features
+        if adata is not None:
+            adata = self.align_model_features(adata, inplace=False)
+        # Validate adata or get it from model
+        adata = self._validate_anndata(adata, extend_categories=True, add_missing_categories=add_missing_categories)
         # Take all cells by default
         if indices is None:
             indices = np.arange(adata.n_obs)
@@ -720,8 +724,8 @@ class ExPert(
         data_ctx_labels = []
         data_cls_labels = []
         # Add progress bar to classification if toggled
-        if verbose:
-            dl_it = tqdm(enumerate(scdl))
+        if progress_bar:
+            dl_it = tqdm(enumerate(scdl), unit='batch')
         else:
             dl_it = enumerate(scdl)
         # Run through each batch of data
@@ -729,15 +733,15 @@ class ExPert(
             for _, tensors in dl_it:
                 # Unpack batch tensor
                 x = tensors.get(REGISTRY_KEYS.X_KEY)
-                l = tensors[REGISTRY_KEYS.LABELS_KEY].squeeze(-1)
-                batch = tensors[REGISTRY_KEYS.BATCH_KEY]
+                l = tensors.get(REGISTRY_KEYS.LABELS_KEY)
+                batch = tensors.get(REGISTRY_KEYS.BATCH_KEY)
                 # Get continous covariates
                 cont_key = REGISTRY_KEYS.CONT_COVS_KEY
                 cont_covs = tensors[cont_key] if cont_key in tensors.keys() else None
                 # Get categorical covariates
                 cat_key = REGISTRY_KEYS.CAT_COVS_KEY
                 cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
-                # TODO: cachce inference if adata is minified
+                # Cachce inference if adata is minified
                 if _is_minified(adata):
                     inference_outputs = {
                         MODULE_KEYS.QZM_KEY: tensors[self._LATENT_QZM_KEY],
@@ -778,8 +782,10 @@ class ExPert(
                 ctx2z.append(_ctx2z)
                 cls2z.append(_cls2z)
                 # Collect labels
-                data_ctx_labels.append(batch.flatten().cpu())
-                data_cls_labels.append(l.cpu())
+                if batch is not None:
+                    data_ctx_labels.append(batch.flatten().cpu())
+                if l is not None:
+                    data_cls_labels.append(l.flatten().cpu())
                 # ---- CLEANUP ----
                 del cls_output, x, l, batch
                 torch.cuda.empty_cache()
@@ -793,8 +799,14 @@ class ExPert(
         z_shared = torch.cat(z_shared).numpy()
         ctx2z = torch.stack(ctx2z, dim=0).mean(0).numpy()
         cls2z = torch.stack(cls2z, dim=0).mean(0).numpy()
-        data_ctx_labels = torch.cat(data_ctx_labels).numpy()
-        data_cls_labels = torch.cat(data_cls_labels).numpy()
+        # Map indices back to labels
+        ctx_ls, cls_ls = None, None
+        if data_ctx_labels:
+            data_ctx_labels = torch.cat(data_ctx_labels).numpy()
+            ctx_ls = ctx_labels[data_ctx_labels]
+        if data_cls_labels:
+            data_cls_labels = torch.cat(data_cls_labels).numpy()
+            cls_ls = cls_labels[data_cls_labels]
 
         # Set nans to 0s
         ctx_logits = np.nan_to_num(ctx_logits, -np.inf)
@@ -831,8 +843,8 @@ class ExPert(
             PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY: ctx_soft_predictions,
             PREDICTION_KEYS.PREDICTION_KEY: cls_predictions,
             PREDICTION_KEYS.SOFT_PREDICTION_KEY: cls_soft_predictions,
-            REGISTRY_KEYS.BATCH_KEY: ctx_labels[data_ctx_labels],
-            REGISTRY_KEYS.LABELS_KEY: cls_labels[data_cls_labels],
+            REGISTRY_KEYS.BATCH_KEY: ctx_ls,
+            REGISTRY_KEYS.LABELS_KEY: cls_ls,
             'label_idx': data_cls_labels,
             'indices': indices,
         }
@@ -1056,17 +1068,56 @@ class ExPert(
         if minify_adata and not self.is_minified:
             log.info(f'Minifying adata with latent distribution')
             self.minify_adata(use_latent_qzm_key=self._LATENT_QZM_KEY, use_latent_qzv_key=self._LATENT_QZV_KEY)
+            
+    def _add_missing_query_registry(self, adata: ad.AnnData):
+        # Get model's registry
+        field_registries: dict = self.adata_manager.registry.get('field_registries')
+        # Fill in missing .obs keys
+        for field, reg in field_registries.items():
+            # Get adata slot
+            attr_key = reg.get('data_registry', {}).get('attr_key', '')
+            slot = reg.get('data_registry', {}).get('attr_name', '')
+            # Handle extra covariates
+            if field == REGISTRY_KEYS.CAT_COVS_KEY:
+                cat_covs = reg.get('state_registry').get('field_keys', [])
+                for catc in cat_covs:
+                    if catc not in adata.obs:
+                        log.info(f'Adding placeholder for missing .obs[{catc}]')
+                        adata.obs[catc] = 'unknown'
+            elif field == REGISTRY_KEYS.CONT_COVS_KEY:
+                cont_covs = reg.get('state_registry').get('field_keys', [])
+                for contc in cont_covs:
+                    if contc not in adata.obs:
+                        log.info(f'Adding placeholder for missing .obs[{contc}]')
+                        adata.obs[contc] = np.nan
+            # Handle .obs fields
+            elif slot == 'obs':
+                # Pick first value
+                val = reg['state_registry']['categorical_mapping'][0]
+                key = reg['state_registry']['original_key']
+                if key not in adata.obs:
+                    log.info(f'Added placeholder for missing .obs[{key}]')
+                    # Add dummy values to adata
+                    adata.obs[key] = val
+            elif slot == 'uns':
+                if attr_key not in adata.uns:
+                    log.info(f'Added empty placeholder for missing .uns[{attr_key}]')
+                    adata.uns[attr_key] = None
         
     def _validate_anndata(
-        self, adata: AnnOrMuData | None = None, copy_if_view: bool = True, extend_categories: bool = True
+        self, adata: AnnOrMuData | None = None, copy_if_view: bool = True, extend_categories: bool = True, add_missing_categories: bool = False,
     ) -> AnnData:
         """Validate anndata has been properly registered, transfer if necessary."""
         if adata is None:
             adata = self.adata
 
         _check_if_view(adata, copy_if_view=copy_if_view)
-
+        # TODO: Fix bug that model can't find the manager for this class
+        # AssertionError: Unable to find instance specific manager store. The model has likely not been initialized with an AnnData object.
+        # cls._per_instance_manager_store is empty
         adata_manager = self.get_anndata_manager(adata)
+        if add_missing_categories:
+                self._add_missing_query_registry(adata)
         if adata_manager is None:
             log.info(
                 "Input AnnData not setup with scvi-tools. "
@@ -1233,7 +1284,7 @@ class ExPert(
         # Add split labels to adata.obs
         self.adata.obs[REGISTRY_KEYS.SPLIT_KEY] = pd.Categorical(split_labels)
     
-    def _register_model_predictions(self, force: bool = True) -> None:
+    def _register_model_predictions(self, force: bool = True, use_z: bool = False) -> None:
         """Add detailed model classification outputs to internal self.adata object"""
         # Check if model has been trained
         self._check_if_trained(warn=False)
@@ -1248,9 +1299,9 @@ class ExPert(
         self.adata.obs[PREDICTION_KEYS.CTX_PREDICTION_KEY] = po[PREDICTION_KEYS.CTX_PREDICTION_KEY]
         self.adata.obsm[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY]
         # Save regular classification predictions to model adata
-        if self.module.align_ext_emb_loss_strategies is None:
+        if self.module.align_ext_emb_loss_strategies is None or use_z:
             # Use classifier predictions
-            predictions = pd[PREDICTION_KEYS.Z_PREDICTION_KEY]
+            predictions = po[PREDICTION_KEYS.Z_PREDICTION_KEY]
             soft_predictions = po[PREDICTION_KEYS.Z_SOFT_PREDICTION_KEY]
         else:
             # Use aligner predictions
@@ -1277,6 +1328,7 @@ class ExPert(
             force: bool = True,
             ignore_ctrl: bool = True,
             z_shared: bool = True,
+            use_z: bool = False,
         ) -> dict[pd.DataFrame] | None:
         """Run model evaluation for all available data splits registered with the model."""
         if self.is_evaluated and not force:
@@ -1286,7 +1338,7 @@ class ExPert(
         results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
         # Run full prediction for all registered data
         log.info('Running model predictions on all data splits.')
-        self._register_model_predictions(force=force)
+        self._register_model_predictions(force=force, use_z=use_z)
         # Run classification report for all data splits
         log.info('Generating reports.')
         self._register_classification_report(force=force, ignore_ctrl=ignore_ctrl)
@@ -1473,6 +1525,7 @@ class ExPert(
         results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
         # TODO: all this only works for labelled data, implement option to handle unlabelled data
         # TODO: actually pretty easy, just set prediction column to unknown for all cells duh
+        # TODO: same for batch label
         # TODO: make this more modular
         # Read test adata and filter columns
         log.info(f'Testing model with: {test_adata_p}')
@@ -1650,10 +1703,18 @@ class ExPert(
                 checkpoint_model_p = checkpoint_model_paths[n] if n > 0 and n < len(checkpoint_model_paths) else checkpoint_model_paths[0]
                 log.info(f'Loading model checkpoint {checkpoint_model_p}.')
                 checkpoint_model_dir = os.path.dirname(checkpoint_model_p)
-                return super().load(checkpoint_model_dir, adata=adata)
+                return cls.load(checkpoint_model_dir, adata=adata)
         log.info(f'Could not find model checkpoint(s). Using default "{default_dirname}" directory.')    
         model_state_dir = os.path.join(model_dir, default_dirname)
-        return super().load(model_state_dir, adata=adata)
+        return cls.load(model_state_dir, adata=adata)
+    
+    @classmethod
+    def load(cls, dir_path: str, **kwargs):
+        model = super().load(dir_path, **kwargs)
+        # Add directory to model
+        model.model_log_dir = dir_path
+        return model
+        
     
     def save(self, *args, **kwargs) -> None:
         """Save wrapper to handle external model embeddings"""

@@ -37,6 +37,59 @@ def performance_metric(actual, pred, labels, lib=None, mode='test'):
     m['mode'] = mode
     return m
 
+def get_topk_predictions(
+        soft_preds: np.ndarray,
+        y_true: np.ndarray | list,
+        k: int = 5,
+        return_scores: bool = False
+    ):
+    """
+    Convert soft predictions into flattened top-k predictions suitable for sklearn.
+
+    Parameters
+    ----------
+    soft_preds : np.ndarray, shape (N, C)
+        Soft logits/probabilities.
+    y_true : array-like, shape (N,)
+        Ground-truth class labels.
+    k : int
+        Number of top-k predictions per cell.
+    return_scores : bool
+        Whether to return flattened top-k scores.
+
+    Returns
+    -------
+    y_true_flat : np.ndarray, shape (N*k,)
+        True labels, repeated k times.
+    y_pred_flat : np.ndarray, shape (N*k,)
+        Top-k predicted class indices, flattened.
+    y_scores_flat : np.ndarray, shape (N*k,), optional
+        Top-k scores aligned to y_pred_flat.
+    """
+
+    soft_preds = np.asarray(soft_preds)
+    y_true = np.asarray(y_true)
+
+    N, C = soft_preds.shape
+
+    # -------------------------
+    # Top-k class indices
+    # -------------------------
+    topk_idx = np.argsort(soft_preds, axis=1)[:, -k:][:, ::-1]   # (N, k)
+    topk_scores = np.take_along_axis(soft_preds, topk_idx, axis=1)  # (N, k)
+
+    # -------------------------
+    # Flatten outputs
+    # -------------------------
+    y_pred_flat = topk_idx.reshape(-1)          # shape (N*k,)
+    y_scores_flat = topk_scores.reshape(-1)     # shape (N*k,)
+    y_true_flat = np.repeat(y_true, k)          # shape (N*k,)
+
+    if return_scores:
+        return y_true_flat, y_pred_flat, y_scores_flat
+
+    return y_true_flat, y_pred_flat
+
 def get_classification_report(
         adata: ad.AnnData, 
         cls_label: str,
@@ -264,8 +317,9 @@ def collect_runs(base_dir: str):
         summary_ps = glob.glob(f'{root}/**/*_eval_summary.csv', recursive=True)
         if "config.yaml" in files and len(summary_ps) > 0:
             cfg_path = os.path.join(root, "config.yaml")
-            summ_path = summary_ps[0]
-            runs.append((cfg_path, summ_path))
+            # Add all run versions
+            for summ_path in summary_ps:
+                runs.append((cfg_path, summ_path))
     print(f"Found {len(runs)} runs.")
     return runs
 
@@ -307,7 +361,10 @@ def build_dataframe(base_dir: str, split: str = "test", metric: str = "f1-score"
         try:
             row = parse_run(cfg_path, summ_path, split=split, metric=metric)
             data.append(row)
-            idx.extend([os.path.basename(os.path.dirname(cfg_path))])
+            config_id = os.path.basename(os.path.dirname(cfg_path))
+            version_id = os.path.basename(os.path.dirname(summ_path))
+            run_id = str(config_id) + '_' + str(version_id)
+            idx.extend([run_id])
         except Exception as e:
             print(f"Error parsing {cfg_path}: {e}")
     df = pd.DataFrame(data, index=idx)

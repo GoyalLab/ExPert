@@ -1104,7 +1104,7 @@ class Encoder(nn.Module):
         var_eps: float = 1e-4,
         var_activation: Callable | None = None,
         use_feature_mask: bool = False,
-        drop_prob: float = 0.25,
+        drop_prob: float = 0.01,
         encoder_type: Literal["funnel", "fc", "transformer"] = "funnel",
         context_integration_method : Literal["concat", "film", "attention"] | None = "attention",
         use_context_inference: bool = True,
@@ -1135,7 +1135,8 @@ class Encoder(nn.Module):
         self.context_integration_method = context_integration_method
         self.use_context_inference = use_context_inference
         self.use_learnable_temperature = use_learnable_temperature
-
+        
+        # Set encoder output to double the latent dimension
         funnel_out_dim = 2 * n_output
         if context_integration_method is not None and self.context_integration_method not in ["concat", "film", "attention"]:
             raise ValueError(f'Invalid context integration method: "{context_integration_method}"')
@@ -1162,12 +1163,16 @@ class Encoder(nn.Module):
         elif self.context_integration_method == 'attention' and self.n_dim_context_emb > 0:
             self.ctx_integration = ContextFeatureAttention(n_features=encoder_input_dim, d_ctx=self.n_dim_context_emb, d_hidden=n_hidden)
         else:
-            # Skip context integration
+            # Just concatenate x and context
             self.ctx_integration = None
+        # Disable context integration if method is set to None
+        if self.context_integration_method is None:
+            self.use_context_inference = False
         # Add context projection
         if self.use_context_inference:
             self.context_proj = nn.Linear(self.n_dim_context_emb, funnel_out_dim)
         else:
+            # Skip context integration
             self.context_proj = None
 
         # Create a learnable temperature scaling
@@ -1201,32 +1206,31 @@ class Encoder(nn.Module):
             x = x * mask.expand(x.shape[0], -1)
 
         # Concatenate or modulate by context
-        ctx_logits = None
-        if self.n_dim_context_emb > 0 and context_emb is not None:
-            if self.context_integration_method != 'concat':
-                # Use context inference method
-                if self.use_context_inference:
-                    # Encode x only TODO: try separate linear projection for disentanglement
-                    h_x = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
-                    # Project context to shared dimensionality
-                    h_c = self.context_proj(context_emb)            # (n_contexts, d_h)
-                    # Calculate context similarity
-                    ctx_logits = h_x @ h_c.T / self.temperature         # (b, d_h) @ (d_h, n_contexts) = (b, n_contexts)
-                    # Select context information based on highest softmax
-                    ctx_emb = (torch.softmax(ctx_logits, dim=-1).unsqueeze(-1) * context_emb.unsqueeze(0)).sum(dim=1)
-                else:
-                    # Use batch inflated context embedding
-                    ctx_emb = context_emb
-                # Add context integration
-                if self.ctx_integration is not None:
-                    x = self.ctx_integration(x, ctx_emb)
-                # Do final encoder forward pass
-                q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
+        ctx_logits, b_ctx_emb = None, None
+        if self.n_dim_context_emb > 0 and context_emb is not None and self.use_context_inference:
+            # Encode x only TODO: try separate linear projection for disentanglement
+            h_x = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
+            # Normalize latent space for cosine similarity
+            h_x = F.normalize(h_x, dim=-1)
+            # Project contexts to shared dimensionality
+            h_c = F.normalize(self.context_proj(context_emb), dim=-1)            # (n_contexts, d_h)
+            # Calculate context similarity
+            ctx_logits = h_x @ h_c.T / self.temperature         # (b, d_h) @ (d_h, n_contexts) = (b, n_contexts)
+            # Select batch-relevant context information based on highest softmax (b, d_h)
+            b_ctx_emb = (torch.softmax(ctx_logits, dim=-1).unsqueeze(-1) * context_emb.unsqueeze(0)).sum(dim=1)
+            
+            # Add context integration to batch
+            if self.ctx_integration is not None:
+                # FiLM or attention
+                x = self.ctx_integration(x, b_ctx_emb)
             else:
                 # Simple concatenation
-                x = torch.cat([x, context_emb], dim=-1)
-                q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
+                x = torch.cat([x, b_ctx_emb], dim=-1)
+            
+            # Do a second encoder forward pass
+            q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
         else:
+            # Do a simple forward pass with just x and no additional information
             q = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
         
         # Debug
@@ -1510,7 +1514,10 @@ class ContextClassAligner(nn.Module):
                 use_layer_norm=use_layer_norm,
                 activation_fn=nn.GELU,
             )
-        if linear_cls_proj:
+        # Skip class projection if its already in the correct dimension
+        if cls_emb_dim == n_shared:
+            self.cls_projection = nn.Identity()
+        elif linear_cls_proj:
             self.cls_projection = nn.Linear(cls_emb_dim, n_shared)
         else:
             self.cls_projection = FunnelFCLayers(
@@ -1823,15 +1830,17 @@ class ClassEmbedding(nn.Module):
         self,
         pretrained_emb: torch.Tensor | None = None,
         class_texts: dict | None = None,
-        transformer_name: str = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
+        n_output: int | None = None,
+        transformer_name: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
         device: str = "cuda",
         max_length: int = 256,
         batch_size: int = 64,
         freeze_encoder: bool = False,
         train_last_n_layers: int = 1,
         use_lora: bool = True,
-        lora_rank: int = 4,
+        lora_rank: int = 8,
         lora_dropout: int = 0.1,
+        ignore_texts: bool = False,
     ):
         super().__init__()
 
@@ -1843,7 +1852,7 @@ class ClassEmbedding(nn.Module):
         # -----------------------------
         # Case 1: Transformer text encoder
         # -----------------------------
-        if class_texts is not None:
+        if class_texts is not None and not ignore_texts:
             # Load tokenizer + encoder
             self.tokenizer = AutoTokenizer.from_pretrained(transformer_name)
             self.encoder = AutoModel.from_pretrained(transformer_name)
@@ -1867,7 +1876,7 @@ class ClassEmbedding(nn.Module):
                     r=lora_rank,
                     lora_alpha=int(lora_rank*2),
                     lora_dropout=lora_dropout,
-                    target_modules=["query", "value"],
+                    target_modules=["query", "value", "key"],
                     bias="none",
                     inference_mode=False,
                 )
@@ -1885,11 +1894,9 @@ class ClassEmbedding(nn.Module):
                 for p in self.encoder.pooler.parameters():
                     p.requires_grad = True
 
-            # ---------------------------------------------------
-            # Pre-tokenize ALL class texts ON INIT (major speedup)
-            # ---------------------------------------------------
             # Disable parallel toeknization
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            # Pre-tokenize ALL class texts
             self.pretokenized_inputs = []
             for name in self.class_names:
                 text = class_texts[name]
@@ -1916,6 +1923,14 @@ class ClassEmbedding(nn.Module):
 
             self._num_classes, self._emb_dim = pretrained_emb.shape
 
+        # Add final output adapter if n output is not None
+        if n_output is not None:
+            self.adapter = nn.Linear(self._emb_dim, n_output)
+            self._emb_dim = n_output
+        else:
+            self.adapter = nn.Identity()
+
+        # Move module to device
         self.to(device)
 
     # -------------------------------------------------------
@@ -1935,15 +1950,16 @@ class ClassEmbedding(nn.Module):
         Returns:
             Tensor of shape (K, emb_dim)
         """
-
         # ---------------------------------------------------------
         # Case 1: Pretrained embedding → trivial indexing
         # ---------------------------------------------------------
         if self.embedding is not None:
             if class_indices is None:
-                return self.embedding.weight
+                embeddings = self.embedding.weight
             else:
-                return self.embedding.weight[class_indices]
+                embeddings = self.embedding.weight[class_indices]
+            # Add adapter projection if given
+            return self.adapter(embeddings)
 
         # ---------------------------------------------------------
         # Case 2: Transformer text embeddings (pretokenized)
@@ -1971,17 +1987,16 @@ class ClassEmbedding(nn.Module):
                 key: torch.cat([t[key] for t in batch_tokens], dim=0).to(self.device)
                 for key in batch_tokens[0]
             }
-
-            with torch.no_grad():
-                out = self.encoder(**merged)
-                cls = out.last_hidden_state[:, 0]
+            # Forward pass through encoder
+            out = self.encoder(**merged)
+            cls = out.last_hidden_state[:, 0]
 
             all_embeddings.append(cls)
 
-            del merged, out, cls
-            torch.cuda.empty_cache()
-
+        # Collect batched text embeddings
         embeddings = torch.cat(all_embeddings, dim=0)
+        # Add adaptor
+        embeddings = self.adapter(embeddings)
         return embeddings
 
 

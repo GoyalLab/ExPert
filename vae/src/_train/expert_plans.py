@@ -1184,6 +1184,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # 3. by observed vs unseen
         df_obs = df.copy()
         df_obs["obs_label"] = np.where(df_obs.is_observed, "Observed proxy", "Unseen proxy")
+        # Ensure observed are plotted last
+        df_obs["obs_label"] = pd.Categorical(df_obs["obs_label"], ["Unseen proxy", "Observed proxy"], ordered=True)
         _scatter_base(axes[1, 0], df_obs, "obs_label", f"Observed vs Unseen @ Epoch {self.current_epoch}")
 
         # 4. by covariates (contexts)

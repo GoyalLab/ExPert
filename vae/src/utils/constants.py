@@ -111,7 +111,10 @@ class _LOSS_KEYS_NT(NamedTuple):
     CZ: str = "cz"
     W: str = "W"
     Z2C: str = "z2c"
+    Z2C_LOGITS: str = "z2c_logits"
     C2Z: str = "c2z"
+    C2Z_LOGITS: str = "c2z_logits"
+    UNSEEN_Z2C: str = "uz2c"
 
 class _EXT_CLS_EMB_INIT_NT(NamedTuple):
     MODEL_KEY: str = "model"

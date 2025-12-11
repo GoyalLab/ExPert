@@ -326,12 +326,6 @@ def plot_umap_with_proxies(
     n_obs: int | None = None,
     palette: str = 'tab20'
 ):
-    import umap
-    import numpy as np
-    import pandas as pd
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-
     N = latent_space.shape[0]
     modes = np.asarray(modes) if modes is not None else np.repeat("mode", N)
 
@@ -460,14 +454,12 @@ def plot_umap_with_proxies(
              f"{title_prefix} Observed Proxies Only",
              plot_proxy=True, legend=False)
 
-    _scatter(axes[0, 1], df, "label",
-             f"{title_prefix} Classes",
-             plot_proxy=False, legend=False)
+    _scatter(axes[0, 1], df, "is_observed",
+             f"{title_prefix} Observed & unobserved proxies",
+             plot_proxy=True, legend=True)
 
     # Unseen proxies only
-    obs_cls = df[~df.is_proxy].label_id.unique()
-    df_unseen_only = df[(df.is_proxy & ~df.is_observed &
-                         df.label_id.isin(obs_cls))]
+    df_unseen_only = df[(df.is_proxy & ~df.is_observed)]
     df_unseen_only = pd.concat([df[~df.is_proxy], df_unseen_only])
     _scatter(axes[1, 0], df_unseen_only, "label",
              f"{title_prefix} Unseen Proxies Only",
@@ -484,3 +476,128 @@ def plot_umap_with_proxies(
 
     plt.show()
     return df, fig
+
+def plot_confusion_full(
+        y_true: np.ndarray | list,
+        y_pred: np.ndarray | list,
+        figsize: tuple[int, int] = (10, 8),
+        hm_kwargs: dict = {'annot': False},
+        verbose: bool = False,
+        plt_file: str | None = None,
+        ref_labels: np.ndarray | list | None = None
+    ) -> None:
+
+    import numpy as np
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from sklearn.metrics import (
+        accuracy_score, precision_score, recall_score,
+        f1_score, confusion_matrix
+    )
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    true_labels = np.unique(y_true)
+    pred_labels = np.unique(y_pred)
+    all_labels = np.unique(np.concatenate([true_labels, pred_labels]))
+
+    # ---------------------------------------------------
+    # ORDERING LOGIC
+    # ---------------------------------------------------
+    if ref_labels is not None:
+        ref_labels = np.asarray(ref_labels)
+
+        # Use ref_labels order, but keep only those appearing in data
+        ordered_from_ref = [lab for lab in ref_labels if lab in all_labels]
+
+        # Add any prediction-only labels NOT in ref_labels at the end
+        remaining = [lab for lab in all_labels if lab not in ordered_from_ref]
+
+        ordered_pred = np.array(ordered_from_ref + remaining)
+        ordered_true = np.array([lab for lab in ordered_pred if lab in true_labels])
+
+    else:
+        # ---------- DEFAULT BEHAVIOR ----------
+        intersect = np.intersect1d(true_labels, pred_labels)
+        true_only = np.setdiff1d(true_labels, intersect)
+        pred_only = np.setdiff1d(pred_labels, intersect)
+
+        ordered_true = np.concatenate([intersect, true_only])
+        ordered_pred = np.concatenate([intersect, pred_only])
+
+    # ---------------------------------------------------
+    # Compute confusion matrix with ordered_pred as columns
+    # ---------------------------------------------------
+    cm_full = confusion_matrix(y_true, y_pred, labels=ordered_pred)
+
+    # Keep rows that correspond to ordered_true
+    row_mask = np.isin(ordered_pred, ordered_true)
+    cm = cm_full[row_mask, :]
+    row_labels = ordered_pred[row_mask]
+
+    # ---------------------------------------------------
+    # Normalize rows
+    # ---------------------------------------------------
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_percentage = np.divide(
+        cm.astype(float),
+        row_sums,
+        out=np.zeros_like(cm, dtype=float),
+        where=row_sums != 0
+    ) * 100
+
+    # ---------------------------------------------------
+    # Metrics
+    # ---------------------------------------------------
+    if verbose:
+        print(f"Accuracy:  {accuracy_score(y_true, y_pred):.4f}")
+        print(f"Precision: {precision_score(y_true, y_pred, average='macro', zero_division=0):.4f}")
+        print(f"Recall:    {recall_score(y_true, y_pred, average='macro', zero_division=0):.4f}")
+        print(f"F1:        {f1_score(y_true, y_pred, average='macro', zero_division=0):.4f}")
+
+    # ---------------------------------------------------
+    # Plot heatmap
+    # ---------------------------------------------------
+    plt.figure(figsize=figsize)
+
+    ax = sns.heatmap(
+        cm_percentage,
+        xticklabels=ordered_pred,
+        yticklabels=row_labels,
+        square=True,
+        cbar=True,
+        cbar_kws={"orientation": "horizontal", "pad": 0.15},
+        **hm_kwargs
+    )
+
+    ax.set_aspect("equal")
+
+    # ---------------------------------------------------
+    # Draw green rectangles for diagonals
+    # ---------------------------------------------------
+    for i, true_lab in enumerate(row_labels):
+        if true_lab in ordered_pred:
+            j = np.where(ordered_pred == true_lab)[0][0]
+            ax.add_patch(
+                Rectangle(
+                    (j, i), 1, 1,
+                    fill=False,
+                    edgecolor="lime",
+                    linewidth=1.5
+                )
+            )
+
+    plt.xlabel("Predicted Labels")
+    plt.ylabel("True Labels")
+    plt.title("Confusion Matrix")
+
+    plt.tight_layout()
+
+    if plt_file:
+        plt.savefig(plt_file, dpi=300, bbox_inches="tight")
+    else:
+        plt.show()
+
+    plt.close()

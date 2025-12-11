@@ -37,7 +37,8 @@ class DataSplitter(pl.LightningDataModule):
         pin_memory: bool = False,
         use_copy: bool = True,
         use_special_for_split: list[str] = ['train'],
-        test_context_labels: np.ndarray | None = None,
+        extra_ctx_col: str | None = None,
+        test_context_labels: np.ndarray | str | None = None,
         external_indexing: list[np.ndarray, np.ndarray, np.ndarray] | None = None,
         cache_indices: dict[str, np.ndarray] | None = None,
         drop_last: bool = False,
@@ -92,13 +93,22 @@ class DataSplitter(pl.LightningDataModule):
             adata_manager.data_registry.batch.attr_name,
             batch_state_registry.original_key,
         ).ravel()
+        # Set extra column if it exists
+        if extra_ctx_col is not None and extra_ctx_col in adata_manager.adata.obs:
+            self.contexts = adata_manager.adata.obs[extra_ctx_col].values
+        # Fall back to batches as context labels
+        else:
+            self.contexts = None
 
     def setup(self, stage: str | None = None):
         """Split indices in train/test/val sets."""
         # === Split logic (identical to contrastive) ===
         if self.cache_indices is None:
             if self.test_context_labels is not None:
-                test_mask = np.isin(self.batches, self.test_context_labels)
+                # Ensure test contexts is an interable
+                test_ctxs = [self.test_context_labels] if isinstance(self.test_context_labels, str) else self.test_context_labels
+                ref_ctxs = self.contexts if self.contexts is not None else self.batches
+                test_mask = np.isin(ref_ctxs, test_ctxs)
                 base_idx = self.indices[~test_mask]
                 test_idx = self.indices[test_mask]
             else:
