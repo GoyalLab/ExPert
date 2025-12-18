@@ -687,8 +687,6 @@ class ExPert(
         else:
             ctx_labels = self.idx_to_batch
             ctx_emb = self.module.ctx_emb.weight
-            if obs_only:
-                ctx_emb = ctx_emb[:self.module.n_batch]
         # Use new class embedding at inference
         if cls_emb is not None:
             log.info(f'Using new class embedding: {cls_emb.shape}')
@@ -697,8 +695,6 @@ class ExPert(
         else:
             cls_labels = self.idx_to_label
             cls_emb = self.module.cached_cls_emb
-            if obs_only:
-                cls_emb = cls_emb[:self.module.n_labels]
    
         # Add control embedding
         if self.module.ctrl_class_idx is not None:
@@ -811,6 +807,11 @@ class ExPert(
         # Set nans to 0s
         ctx_logits = np.nan_to_num(ctx_logits, -np.inf)
         cls_logits = np.nan_to_num(cls_logits, -np.inf)
+        
+        # Subset to observed classes only
+        if obs_only:
+            ctx_logits = ctx_logits[:,:self.module.n_batch]
+            cls_logits = cls_logits[:,:self.module.n_labels]
 
         # Add classifier predictions
         z_cls_soft_predictions = pd.DataFrame(

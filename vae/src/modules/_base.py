@@ -14,6 +14,8 @@ from transformers import AutoTokenizer, AutoModel
 from src.utils.constants import MODULE_KEYS, PREDICTION_KEYS
 from src.utils.io import to_tensor
 
+import logging
+
 
 class MemoryQueue:
     def __init__(
@@ -1199,7 +1201,7 @@ class Encoder(nn.Module):
         else:
             return self._temperature
     
-    def forward(self, x: torch.Tensor, *cat_list: int, g: torch.Tensor | None = None, context_emb: torch.Tensor | None = None):
+    def forward(self, x: torch.Tensor, *cat_list: int, g: torch.Tensor | None = None, ctx_label: torch.Tensor | None = None, context_emb: torch.Tensor | None = None):
         # Optional feature masking
         if self.training and self.use_feature_mask and self.drop_prob > 0:
             mask = torch.bernoulli(torch.full((self.n_input,), 1 - self.drop_prob, device=x.device)).view(1, -1)
@@ -1208,22 +1210,23 @@ class Encoder(nn.Module):
         # Concatenate or modulate by context
         ctx_logits, b_ctx_emb = None, None
         if self.n_dim_context_emb > 0 and context_emb is not None and self.use_context_inference:
-            # Encode x only TODO: try separate linear projection for disentanglement
-            h_x = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
-            # Normalize latent space for cosine similarity
-            h_x = F.normalize(h_x, dim=-1)
-            # Project contexts to shared dimensionality
-            h_c = F.normalize(self.context_proj(context_emb), dim=-1)            # (n_contexts, d_h)
-            # Calculate context similarity
-            ctx_logits = h_x @ h_c.T / self.temperature         # (b, d_h) @ (d_h, n_contexts) = (b, n_contexts)
-            # Select batch-relevant context information based on highest softmax (b, d_h)
-            b_ctx_emb = (torch.softmax(ctx_logits, dim=-1).unsqueeze(-1) * context_emb.unsqueeze(0)).sum(dim=1)
-            
             # Add context integration to batch
             if self.ctx_integration is not None:
+                # Encode x only TODO: try separate linear projection for disentanglement
+                h_x = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
+                # Normalize latent space for cosine similarity
+                h_x = F.normalize(h_x, dim=-1)
+                # Project contexts to shared dimensionality
+                h_c = F.normalize(self.context_proj(context_emb), dim=-1)            # (n_contexts, d_h)
+                # Calculate context similarity
+                ctx_logits = h_x @ h_c.T / self.temperature         # (b, d_h) @ (d_h, n_contexts) = (b, n_contexts)
+                # Select batch-relevant context information based on highest softmax (b, d_h)
+                b_ctx_emb = (torch.softmax(ctx_logits, dim=-1).unsqueeze(-1) * context_emb.unsqueeze(0)).sum(dim=1)
+                
                 # FiLM or attention
                 x = self.ctx_integration(x, b_ctx_emb)
             else:
+                b_ctx_emb = context_emb[ctx_label.flatten()]
                 # Simple concatenation
                 x = torch.cat([x, b_ctx_emb], dim=-1)
             
@@ -1488,7 +1491,7 @@ class ContextClassAligner(nn.Module):
             self.latent_projection = nn.Identity()
         elif n_hidden is None and n_layers is None:
             # Simple linear projection
-            self.latent_projection = nn.Linear(n_input, n_shared)
+            self.latent_projection = nn.Linear(n_input, n_shared, bias=False)
         else:
             # Add a small fc network
             self.latent_projection = FunnelFCLayers(
@@ -1503,7 +1506,7 @@ class ContextClassAligner(nn.Module):
 
         # --------- External embedding projections ---------
         if linear_ctx_proj:
-            self.ctx_projection = nn.Linear(ctx_emb_dim, n_shared)
+            self.ctx_projection = nn.Linear(ctx_emb_dim, n_shared, bias=False)
         else:
             self.ctx_projection = FunnelFCLayers(
                 ctx_emb_dim, n_shared, 
@@ -1518,7 +1521,7 @@ class ContextClassAligner(nn.Module):
         if cls_emb_dim == n_shared:
             self.cls_projection = nn.Identity()
         elif linear_cls_proj:
-            self.cls_projection = nn.Linear(cls_emb_dim, n_shared)
+            self.cls_projection = nn.Linear(cls_emb_dim, n_shared, bias=False)
         else:
             self.cls_projection = FunnelFCLayers(
                 cls_emb_dim, n_shared, 
@@ -1835,7 +1838,7 @@ class ClassEmbedding(nn.Module):
         device: str = "cuda",
         max_length: int = 256,
         batch_size: int = 64,
-        freeze_encoder: bool = False,
+        freeze: bool = False,
         train_last_n_layers: int = 1,
         use_lora: bool = True,
         lora_rank: int = 8,
@@ -1848,6 +1851,7 @@ class ClassEmbedding(nn.Module):
         self.class_texts = class_texts
         self.max_length = max_length
         self.batch_size = batch_size
+        self.freeze = freeze
 
         # -----------------------------
         # Case 1: Transformer text encoder
@@ -1862,13 +1866,13 @@ class ClassEmbedding(nn.Module):
             self._emb_dim = self.encoder.config.hidden_size
             self.embedding = None
 
-            # --- Freeze or partially freeze encoder ---
-            if freeze_encoder:
-                for p in self.encoder.parameters():
-                    p.requires_grad = False
+            # --- Freeze encoder ---
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            
             
             # Use LoRA to reduce trainable parameters
-            if use_lora:
+            if not freeze and use_lora:
                 from peft import get_peft_model, LoraConfig, TaskType
                 # Apply lora
                 lora_config = LoraConfig(
@@ -1882,15 +1886,15 @@ class ClassEmbedding(nn.Module):
                 )
                 # Update encoder
                 self.encoder = get_peft_model(self.encoder, lora_config)
-            else:
+                logging.info(f'Applied LoRA to pre-trained text encoder.')
+            elif not freeze and train_last_n_layers > 0:
                 # Unfreeze last n layers
-                if train_last_n_layers > 0:
-                    for layer in self.encoder.encoder.layer[-train_last_n_layers:]:
-                        for p in layer.parameters():
-                            p.requires_grad = True
-            
+                for layer in self.encoder.encoder.layer[-train_last_n_layers:]:
+                    for p in layer.parameters():
+                        p.requires_grad = True
+                logging.info(f'Unfroze last {train_last_n_layers} layers of pre-trained text encoder.')
             # Always make pool trainable
-            if hasattr(self.encoder, "pooler"):
+            if hasattr(self.encoder, "pooler") and not freeze:
                 for p in self.encoder.pooler.parameters():
                     p.requires_grad = True
 
@@ -1925,13 +1929,24 @@ class ClassEmbedding(nn.Module):
 
         # Add final output adapter if n output is not None
         if n_output is not None:
-            self.adapter = nn.Linear(self._emb_dim, n_output)
+            self.adapter = nn.Linear(self._emb_dim, n_output, bias=False)
+            self.use_adapter = True
+            # Initialize small weights
+            nn.init.normal_(self.adapter.weight, mean=0.0, std=0.02)
             self._emb_dim = n_output
         else:
             self.adapter = nn.Identity()
+            self.use_adapter = False
 
         # Move module to device
         self.to(device)
+        
+    def orthogonal_reg(self):
+        if not self.use_adapter:
+            return torch.tensor(0.0)
+        W = self.adapter.weight
+        I = torch.eye(W.size(1), device=W.device)
+        return ((W.T @ W - I)**2).mean()
 
     # -------------------------------------------------------
     @property
@@ -1995,9 +2010,11 @@ class ClassEmbedding(nn.Module):
 
         # Collect batched text embeddings
         embeddings = torch.cat(all_embeddings, dim=0)
-        # Add adaptor
-        embeddings = self.adapter(embeddings)
-        return embeddings
+        # Add embeddings to cache if model is frozen and not already replaced with a pretrained embedding
+        if self.freeze and self.embedding is None:
+            logging.info('Registered frozen text embeddings.')
+            self.embedding = nn.Embedding.from_pretrained(embeddings, freeze=True)
+        return self.adapter(embeddings)
 
 
 class EmbeddingAligner(nn.Module):

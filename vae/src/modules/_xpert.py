@@ -70,6 +70,7 @@ class XPert(VAE):
         use_cpm: bool = False,
         gene_likelihood: Literal['zinb', 'nb', 'poisson', 'normal'] = 'zinb',
         latent_distribution: Literal['normal', 'ln'] = 'normal',
+        encode_covariates: bool = False,
         decode_covariates: bool = True,
         decode_context_projection: bool = False,
         deeply_inject_covariates: bool = False,
@@ -87,7 +88,9 @@ class XPert(VAE):
         drop_prob: float = 1e-3,
         use_ctx_adv_cls: bool = True,
         use_hierachical_labels: bool = True,
-        use_pretrained_emb_for_hierachy: bool = False,
+        hierachy_inference: Literal['embedding', 'library'] = 'embedding',
+        use_hierachical_clip: bool = False,
+        use_learnable_hierarchy_temperatures: bool = True,
         module_quantile: float = 0.9,
         pathway_quantile: float = 0.7,
         use_augmentation: bool = True,
@@ -115,7 +118,7 @@ class XPert(VAE):
             log_variational=log_variational,
             gene_likelihood=gene_likelihood,
             latent_distribution=latent_distribution,
-            encode_covariates=False,
+            encode_covariates=encode_covariates,
             deeply_inject_covariates=deeply_inject_covariates,
             use_batch_norm=use_batch_norm,
             use_layer_norm=use_layer_norm,
@@ -161,6 +164,7 @@ class XPert(VAE):
 
         # Setup external embeddings
         self.ctx_emb = torch.nn.Embedding.from_pretrained(ctx_emb, freeze=True)
+        self.use_adapter = use_adapter
         if use_adapter:
             extra_cls_emb_kwargs['n_output'] = n_latent
         self.pretrained_emb = cls_emb
@@ -179,9 +183,18 @@ class XPert(VAE):
         self.use_joint = False
         # Setup class proxies and hierachical labels
         self.use_hierachical_labels = use_hierachical_labels
-        self.use_pretrained_emb_for_hierachy = use_pretrained_emb_for_hierachy
+        self.use_hierachical_clip = use_hierachical_clip
+        self.hierachy_inference = hierachy_inference
         self.gene_names = list(cls_text_dict.keys()) if cls_text_dict is not None else None
+        # Set unseen indices for all layers
+        self.unseen_gene_indices = torch.arange(self.n_labels, self.n_cls)
         self.reset_cached_cls_emb(verbose=True, reset_labels=True)
+        # Setup learnable temperatures
+        self.use_learnable_hierarchy_temperatures = use_learnable_hierarchy_temperatures
+        if use_learnable_hierarchy_temperatures:
+            self.log_t_gene = torch.nn.Parameter(torch.log(torch.tensor(1/0.1)))
+            self.log_t_module = torch.nn.Parameter(torch.log(torch.tensor(1/0.25)))
+            self.log_t_pathway = torch.nn.Parameter(torch.log(torch.tensor(1/1.0)))
         # Save if we have unseen embeddings or not
         self.has_unseen_ctx = self.n_ctx > n_batch
         self.has_unseen_cls = self.n_cls > n_labels
@@ -191,13 +204,16 @@ class XPert(VAE):
         use_batch_norm_decoder = use_batch_norm == 'decoder' or use_batch_norm == 'both'
         use_layer_norm_encoder = use_layer_norm == 'encoder' or use_layer_norm == 'both'
         use_layer_norm_decoder = use_layer_norm == 'decoder' or use_layer_norm == 'both'
+        # Set covaritates
+        cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
 
         # ----- Setup encoder module -----
+        encoder_cat_list = cat_list if encode_covariates else None
         self.default_encoder_kwargs = {
             'n_input': n_input,
             'n_output': n_latent,
             'n_hidden': n_hidden,
-            'n_cat_list': None,
+            'n_cat_list': encoder_cat_list,
             'dropout_rate': dropout_rate,
             'use_batch_norm': use_batch_norm_encoder,
             'use_layer_norm': use_layer_norm_encoder,
@@ -215,7 +231,6 @@ class XPert(VAE):
         self.decode_context_projection = decode_context_projection
         # Whether to decode covariates
         n_input_decoder = n_latent + n_continuous_cov * decode_covariates
-        cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
         decoder_cat_list = cat_list if decode_covariates else None
         n_ctx_dim_decoder = None
         # Whether to include covariates in decoder
@@ -273,37 +288,32 @@ class XPert(VAE):
 
         # ----- Debug -----
         self._step = 0
+        self.visualize_hierarchy_blocks()
         
     def reset_cached_cls_emb(self, verbose: bool = False, reset_labels: bool = False):
         """Reset embedding on epoch start"""
         # Recompute gene embeddings
         with torch.no_grad():
             self.cached_cls_emb = self.cls_emb()
-        # Set embeddings for labels to either cached or pretrained
-        if self.use_pretrained_emb_for_hierachy:
-            cls_emb = self.pretrained_emb.to(self.cached_cls_emb.device)
-        else:
-            cls_emb = self.cached_cls_emb
         # Reset hierarchical labels
         if reset_labels and self.use_hierachical_labels:
-            self._set_hierarchical_labels(cls_emb, verbose=verbose)
+            self._set_hierarchical_labels(self.cached_cls_emb, verbose=verbose)
         
     def _set_hierarchical_labels(
         self, 
         cls_emb: torch.Tensor, 
-        mode: str = 'library',
         verbose: bool = False
     ):
         """Set module and pathway labels with adaptive thresholding"""
         n = self.n_cls
         # Set hierarchy based on class embedding similarities
-        if mode == 'embedding':
+        if self.hierachy_inference == 'embedding':
             self._set_hierarchy_embedding(cls_emb)
-        elif mode == 'library':
+        elif self.hierachy_inference == 'library':
             self._set_hierarchical_labels_from_database()
-        
-        # Set unseen indices for all layers
-        self.unseen_gene_indices = torch.arange(self.n_labels, n, device=cls_emb.device)
+        else:
+            raise ValueError(f'Unknown argument {self.hierachy_inference} for self.hierachy_inference.')
+            
         # Get modules/pathways for observed genes
         observed_modules = set(self.cls2module[:self.n_labels].tolist())
         observed_pathways = set(self.cls2pw[:self.n_labels].tolist())
@@ -329,6 +339,22 @@ class XPert(VAE):
         n_modules = self.cls2module.max().item() + 1
         n_pathways = self.cls2pw.max().item() + 1
         
+        # pathway_children[p] = list of fine gene indices in pathway p
+        self.pw2module = {}
+        for gene_id, pw_id in enumerate(self.cls2pw):
+            module_id = self.cls2module[gene_id].item()
+            self.pw2module.setdefault(int(pw_id), set()).add(int(module_id))
+
+        # convert sets to lists
+        self.pw2module = {k: list(v) for k, v in self.pw2module.items()}
+
+
+        # module_children[m] = list of pathway indices in module m
+        self.module_children = {
+            m: torch.where(self.cls2module == m)[0].tolist()
+            for m in range(n_modules)
+        }
+        
         # Module membership: (n_modules, n_genes)
         self.module_membership = torch.zeros(
             n_modules, n, 
@@ -346,6 +372,9 @@ class XPert(VAE):
         for g_idx in range(n):
             p_idx = self.cls2pw[g_idx].item()
             self.pathway_membership[p_idx, g_idx] = 1.0
+            
+        # Build hierachy masks
+        self._build_dense_masks()
         
         if verbose:
             log.info(f"Hierarchical labels computed:")
@@ -458,51 +487,122 @@ class XPert(VAE):
                 log.info(f"    - {pathway_name}: {count} genes")
             
     def _set_hierarchy_embedding(self, cls_emb: torch.Tensor):
-        cls_emb_norm = F.normalize(cls_emb, dim=-1)
-        similarity = cls_emb_norm @ cls_emb_norm.T
-        
-        # Remove diagonal
-        n = similarity.size(0)
-        mask = ~torch.eye(n, dtype=torch.bool, device=similarity.device)
-        sim_flat = similarity[mask]
-        
-        # Module: mean + k*std (tight clustering)
-        module_threshold = torch.quantile(sim_flat, self.module_quantile)
-        
-        # Pathway: mean + k*std (loose clustering)  
-        pathway_threshold = torch.quantile(sim_flat, self.pathway_quantile)
-        
-        module_adj = (similarity > module_threshold).float()
-        self.cls2module = self._connected_components(module_adj)
-        
-        pathway_adj = (similarity > pathway_threshold).float()
-        self.cls2pw = self._connected_components(pathway_adj)
+        """
+        Build a data-driven hierarchy directly from embedding geometry.
+        - Pathway level = coarse clusters
+        - Module level  = fine clusters
+        Uses hierarchical clustering and automatically selects cut thresholds
+        based on silhouette score over multiple candidate cuts.
+        """
 
-    def _connected_components(self, adj_matrix: torch.Tensor) -> torch.Tensor:
-        """Find connected components in adjacency matrix (simple greedy assignment)"""
-        n = adj_matrix.size(0)
-        labels = torch.arange(n, device=adj_matrix.device)
-        
-        # Union-find style: merge connected nodes
-        for i in range(n):
-            neighbors = torch.where(adj_matrix[i] > 0)[0]
-            if len(neighbors) > 0:
-                min_label = labels[neighbors].min()
-                labels[neighbors] = min_label
-                labels[i] = min_label
-        
-        # Compress labels to 0, 1, 2, ...
-        unique_labels = labels.unique(sorted=True)
-        label_map = {old.item(): new for new, old in enumerate(unique_labels)}
-        compressed = torch.tensor([label_map[l.item()] for l in labels], 
-                                device=labels.device)
-        
-        return compressed
+        import numpy as np
+        import torch
+        from scipy.spatial.distance import pdist, squareform
+        from scipy.cluster.hierarchy import linkage, fcluster
+        from sklearn.metrics import silhouette_score
+
+        # -------------------------------------------
+        # Normalize embeddings
+        # -------------------------------------------
+        cls_emb = F.normalize(cls_emb, dim=-1)
+        C = cls_emb.size(0)
+        emb_np = cls_emb.detach().cpu().numpy()
+
+        # -------------------------------------------
+        # Pairwise cosine distances (condensed form)
+        # -------------------------------------------
+        dist_condensed = pdist(emb_np, metric="cosine")   # length C*(C-1)/2
+        dist_square = squareform(dist_condensed)          # (C, C)
+
+        # -------------------------------------------
+        # Hierarchical clustering (average linkage)
+        # -------------------------------------------
+        Z = linkage(dist_condensed, method="average")
+        heights = Z[:, 2]   # dendrogram merge heights
+
+        # -------------------------------------------
+        # Helper to compute silhouette score safely
+        # -------------------------------------------
+        def try_silhouette(labels):
+            labels = np.asarray(labels)
+            if len(np.unique(labels)) < 2:
+                return -1
+            return silhouette_score(dist_square, labels, metric="precomputed")
+
+        # -------------------------------------------
+        # 1) MODULE CUT (fine clusters)
+        # -------------------------------------------
+        mod_percentiles = [0.05, 0.10, 0.15, 0.20, 0.25]
+        mod_scores = []
+        mod_cuts = []
+
+        for p in mod_percentiles:
+            t = np.quantile(heights, p)
+            labels = fcluster(Z, t, criterion="distance")
+            sil = try_silhouette(labels)
+            mod_scores.append(sil)
+            mod_cuts.append(t)
+
+        best_idx = int(np.argmax(mod_scores))
+        module_tau = mod_cuts[best_idx]
+
+        # -------------------------------------------
+        # 2) PATHWAY CUT (coarse clusters)
+        # -------------------------------------------
+        pw_percentiles = [0.40, 0.50, 0.60, 0.70]
+        pw_scores = []
+        pw_cuts = []
+
+        for p in pw_percentiles:
+            t = np.quantile(heights, p)
+            labels = fcluster(Z, t, criterion="distance")
+            sil = try_silhouette(labels)
+            pw_scores.append(sil)
+            pw_cuts.append(t)
+
+        best_idx = int(np.argmax(pw_scores))
+        pathway_tau = pw_cuts[best_idx]
+
+        # -------------------------------------------
+        # Final cluster assignments
+        # -------------------------------------------
+        module_labels_np  = fcluster(Z, module_tau,  criterion="distance") - 1
+        pathway_labels_np = fcluster(Z, pathway_tau, criterion="distance") - 1
+
+        module_labels  = torch.tensor(module_labels_np,  device=cls_emb.device, dtype=torch.long)
+        pathway_labels = torch.tensor(pathway_labels_np, device=cls_emb.device, dtype=torch.long)
+
+        # -------------------------------------------
+        # Enforce hierarchy: module → pathway
+        # -------------------------------------------
+        final_pathway_labels = torch.zeros_like(module_labels, dtype=torch.long)
+
+        for m in module_labels.unique():
+            mask = (module_labels == m)
+            # assign module to the most common pathway among its members
+            pw = int(torch.mode(pathway_labels[mask]).values.item())
+            final_pathway_labels[mask] = pw
+
+        # -------------------------------------------
+        # Store hierarchy
+        # -------------------------------------------
+        self.cls2module = module_labels
+        self.cls2pw = final_pathway_labels
+
+        # -------------------------------------------
+        # Report hierarchy
+        # -------------------------------------------
+        log.info(
+            f"[Hierarchy] Pathways: {self.cls2pw.unique().numel()} | "
+            f"Modules: {self.cls2module.unique().numel()}"
+        )
     
-    def _get_module_embeddings(self, cls2z: torch.Tensor) -> torch.Tensor:
+    def _get_module_embeddings(self, cls2z: torch.Tensor, indices: torch.Tensor | None = None) -> torch.Tensor:
         """Aggregate gene embeddings into module embeddings"""
-        cls2module = self.cls2module[:cls2z.size(0)]
-        n_modules = cls2module.max().item() + 1
+        cls2module = self.cls2module
+        if indices is not None:
+            cls2module = cls2module[indices]
+        n_modules = cls2module.unique().shape[0]
         module_embs = torch.zeros(n_modules, cls2z.size(1), device=cls2z.device)
         
         for i in range(n_modules):
@@ -512,10 +612,12 @@ class XPert(VAE):
         
         return F.normalize(module_embs, dim=-1)
 
-    def _get_pathway_embeddings(self, cls2z: torch.Tensor) -> torch.Tensor:
+    def _get_pathway_embeddings(self, cls2z: torch.Tensor, indices: torch.Tensor | None = None) -> torch.Tensor:
         """Aggregate gene embeddings into pathway embeddings"""
-        cls2pw = self.cls2pw[:cls2z.size(0)]
-        n_pathways = cls2pw.max().item() + 1
+        cls2pw = self.cls2pw
+        if indices is not None:
+            cls2pw = cls2pw[indices]
+        n_pathways = cls2pw.unique().shape[0]
         pathway_embs = torch.zeros(n_pathways, cls2z.size(1), device=cls2z.device)
         
         for i in range(n_pathways):
@@ -526,13 +628,58 @@ class XPert(VAE):
         return F.normalize(pathway_embs, dim=-1)
     
     def _get_unseen_label_idx(self):
-        return getattr(self, 'unseen_gene_indices')
+        return getattr(self, 'unseen_gene_indices', None)
     
     def _get_unseen_module_idx(self):
         return getattr(self, 'unseen_module_indices')
     
     def _get_unseen_pathway_idx(self):
         return getattr(self, 'unseen_pathway_indices')
+    
+    def _build_dense_masks(self):
+        # number of modules, pathways, genes
+        C_mod = int(self.cls2module.max()) + 1
+        C_pw  = int(self.cls2pw.max()) + 1
+        C_g   = len(self.cls2module)
+        device = self.cls2module.device
+
+        # -------- pathway → module mask (for masking) --------
+        self.pw2module_mask = torch.zeros(C_pw, C_mod, dtype=torch.bool, device=device)
+        for pw in range(C_pw):
+            modules = self.pw2module[pw]           # list[int]
+            self.pw2module_mask[pw, modules] = True
+
+        # -------- module → gene mask (for masking) --------
+        self.module2gene_mask = torch.zeros(C_mod, C_g, dtype=torch.bool, device=device)
+        for mod in range(C_mod):
+            genes = self.module_children[mod]      # list[int]
+            self.module2gene_mask[mod, genes] = True
+
+        # -------- gene → module aggregation (G2M) --------
+        G2M = torch.zeros(C_g, C_mod, device=device)
+        for g, mod in enumerate(self.cls2module.tolist()):
+            G2M[g, mod] = 1.
+
+        # Normalize (mean of child genes)
+        col_sums = G2M.sum(dim=0, keepdim=True)
+        col_sums[col_sums == 0] = 1.
+        G2M = G2M / col_sums
+
+        # -------- module → pathway aggregation (M2P) --------
+        M2P = torch.zeros(C_mod, C_pw, device=device)
+        for pw in range(C_pw):
+            mods = self.pw2module[pw]              # list of modules under this pathway
+            M2P[mods, pw] = 1.
+
+        # Normalize (mean of child modules)
+        col_sums = M2P.sum(dim=0, keepdim=True)
+        col_sums[col_sums == 0] = 1.
+        M2P = M2P / col_sums
+
+        # Store
+        self.G2M = G2M
+        self.M2P = M2P
+
 
     def draw_module(self):
         return
@@ -650,7 +797,7 @@ class XPert(VAE):
         # Add context embedding
         ctx_emb = self.ctx_emb.weight
         # Perform forward pass through encoder
-        inference_out: dict[str, torch.Tensor] = self.z_encoder(encoder_input, *categorical_input, g=g, context_emb=ctx_emb)
+        inference_out: dict[str, torch.Tensor] = self.z_encoder(encoder_input, *categorical_input, g=g, ctx_label=batch_index, context_emb=ctx_emb)
         # Unpack encoder output
         qz = inference_out[MODULE_KEYS.QZ_KEY]
         z = inference_out[MODULE_KEYS.Z_KEY]
@@ -908,7 +1055,16 @@ class XPert(VAE):
         return_logits: bool = True
     ):  
         # Use pathway predictions
-        if self.use_hierachical_labels and io.non_zero(module_temp) and io.non_zero(pathway_temp):
+        if self.use_hierachical_labels and self.use_hierachical_clip:
+            predictions = self._hierarchical_predict(
+                z_shared, gene_emb=cls2z, 
+                gene_temperature=gene_temp,
+                module_temperature=module_temp,
+                pathway_temperature=pathway_temp
+            )
+            # Return gene prediction logits only
+            predictions = predictions[PREDICTION_KEYS.SOFT_PREDICTION_KEY]
+        elif self.use_hierachical_labels and io.non_zero(module_temp) and io.non_zero(pathway_temp):
             predictions = self._predict_hierarchical(
                 z_shared, 
                 cls2z, 
@@ -921,6 +1077,96 @@ class XPert(VAE):
         # Return predictions
         return predictions
     
+    @torch.no_grad()
+    def _hierarchical_predict(
+        self,
+        z: torch.Tensor,
+        gene_emb: torch.Tensor,
+        gene_temperature: float = 0.1,
+        module_temperature: float = 0.25,
+        pathway_temperature: float = 1.0,
+        aggregated_logits: bool = False,
+    ):
+        """
+        Hierarchical inference consistent with HARD hierarchical_clip_loss():
+        pathway -> module -> gene (hard top-down decoding).
+        """
+
+        # --------------------------------------------------
+        # Normalize
+        # --------------------------------------------------
+        z = F.normalize(z, dim=-1)
+        gene_emb = F.normalize(gene_emb, dim=-1)
+
+        if self.use_learnable_hierarchy_temperatures:
+            gene_temperature = 1.0 / self.log_t_gene.exp().clamp(min=1e-6)
+            module_temperature = 1.0 / self.log_t_module.exp().clamp(min=1e-6)
+            pathway_temperature = 1.0 / self.log_t_pathway.exp().clamp(min=1e-6)
+
+        # --------------------------------------------------
+        # Gene logits
+        # --------------------------------------------------
+        logits_gene = (z @ gene_emb.T) / gene_temperature          # (B, C_gene)
+
+        # --------------------------------------------------
+        # Module + pathway logits
+        # --------------------------------------------------
+        if aggregated_logits:
+            logits_module  = logits_gene @ self.G2M               # (B, C_mod)
+            logits_pathway = logits_module @ self.M2P             # (B, C_pw)
+        else:
+            module_emb  = F.normalize(self._get_module_embeddings(gene_emb), dim=-1)
+            pathway_emb = F.normalize(self._get_pathway_embeddings(gene_emb), dim=-1)
+
+            logits_module  = (z @ module_emb.T)  / module_temperature
+            logits_pathway = (z @ pathway_emb.T) / pathway_temperature
+
+        # --------------------------------------------------
+        # 1) Predict pathway (flat)
+        # --------------------------------------------------
+        pred_pathway = logits_pathway.argmax(dim=1)               # (B,)
+
+        # --------------------------------------------------
+        # 2) Mask modules by predicted pathway
+        # --------------------------------------------------
+        pw2mod = self.pw2module_mask                              # (C_pw, C_mod)
+        mod_mask = pw2mod[pred_pathway].bool()                    # (B, C_mod)
+
+        masked_logits_module = logits_module.masked_fill(
+            ~mod_mask, -1e9
+        )
+
+        # --------------------------------------------------
+        # 3) Predict module
+        # --------------------------------------------------
+        pred_module = masked_logits_module.argmax(dim=1)          # (B,)
+
+        # --------------------------------------------------
+        # 4) Mask genes by predicted module
+        # --------------------------------------------------
+        mod2gene = self.module2gene_mask                           # (C_mod, C_gene)
+        gene_mask = mod2gene[pred_module].bool()                  # (B, C_gene)
+
+        masked_logits_gene = logits_gene.masked_fill(
+            ~gene_mask, -1e9
+        )
+
+        # --------------------------------------------------
+        # 5) Predict gene
+        # --------------------------------------------------
+        pred_gene = masked_logits_gene.argmax(dim=1)
+
+        return {
+            "pathway": pred_pathway,
+            "module": pred_module,
+            PREDICTION_KEYS.PREDICTION_KEY: pred_gene,
+            PREDICTION_KEYS.SOFT_PREDICTION_KEY: masked_logits_gene,
+            "logits_module": masked_logits_module,
+            "logits_pathway": logits_pathway,
+        }
+
+
+
     def _predict_hierarchical(
         self,
         z_shared: torch.Tensor | None = None,
@@ -1599,7 +1845,10 @@ class XPert(VAE):
         loss_z2c_unseen = None
         if use_unseen_negatives and len(unseen_indices) > 0 and n_unseen > 0:
             # Sample random unseen embeddings
-            n_unseen_eff = min(n_unseen, len(unseen_indices))
+            n_unseen_eff = int(min(n_unseen, len(unseen_indices)))
+            # Move indices to current device
+            unseen_indices = unseen_indices.to(device)
+            # Randomly sample unseen indices to use
             sampled_unseen_indices = unseen_indices[torch.randperm(len(unseen_indices), device=device)[:n_unseen_eff]]
             unseen_sample = emb_norm[sampled_unseen_indices]  # (n_unseen, d)
             
@@ -1752,6 +2001,170 @@ class XPert(VAE):
             return o[LOSS_KEYS.LOSS]
         # Return full output
         return o
+    
+    def hierarchical_clip_loss(
+        self,
+        z: torch.Tensor,
+        labels: torch.Tensor,
+        gene_emb: torch.Tensor,
+        gene_temperature: float = 0.1,
+        module_temperature: float = 0.25,
+        pathway_temperature: float = 1.0,
+        pw_weight: float = 0.5,
+        module_weight: float = 0.3,
+        label_smoothing: float = 0.0,
+        reduce: bool = True,
+        return_losses: bool = False,
+    ):
+        """
+        Hierarchical CLIP loss with *hard* top-down masking:
+        pathway -> module -> gene, using batch-local proxies.
+
+        Compared to the previous version, this:
+        - removes soft routing via P_pw, P_mod
+        - uses hard label-based masks to enforce hierarchy
+        - makes pathway/module supervision much stronger
+        """
+
+        # ----------------------------------------------------------
+        # 1) Normalize
+        # ----------------------------------------------------------
+        z = F.normalize(z, dim=-1)
+        gene_emb = F.normalize(gene_emb, dim=-1)
+
+        # ----------------------------------------------------------
+        # 2) Select in-batch unique classes + remap
+        # ----------------------------------------------------------
+        unique_classes = labels.unique()
+        gene_emb_local = gene_emb[unique_classes]             # (C_local, d)
+
+        # map global → local ids
+        mapping = {g.item(): i for i, g in enumerate(unique_classes)}
+        gene_labels_local = torch.tensor(
+            [mapping[g.item()] for g in labels],
+            device=z.device,
+            dtype=torch.long,
+        )  # shape (B,)
+
+        # ----------------------------------------------------------
+        # 3) Local module + pathway labels (still global IDs here)
+        # ----------------------------------------------------------
+        cls2module_local = self.cls2module[unique_classes]    # (C_local,)
+        cls2pw_local     = self.cls2pw[unique_classes]        # (C_local,)
+
+        module_labels_global  = self.cls2module[labels]       # (B,)
+        pathway_labels_global = self.cls2pw[labels]           # (B,)
+
+        # Unique modules and pathways present in this batch (global IDs)
+        modules_in_batch  = cls2module_local.unique()
+        pathways_in_batch = cls2pw_local.unique()
+
+        Cm = len(modules_in_batch)
+        Cp = len(pathways_in_batch)
+        Cg = len(unique_classes)
+
+        # Build mapping: global module ID → local compact index [0..Cm-1]
+        mod_map = {m.item(): i for i, m in enumerate(modules_in_batch)}
+        pw_map  = {p.item(): i for i, p in enumerate(pathways_in_batch)}
+
+        # Remap module + pathway labels for samples to dense local IDs
+        module_labels_local = torch.tensor(
+            [mod_map[m.item()] for m in module_labels_global],
+            device=z.device, dtype=torch.long
+        )  # (B,)
+
+        pathway_labels_local = torch.tensor(
+            [pw_map[p.item()] for p in pathway_labels_global],
+            device=z.device, dtype=torch.long
+        )  # (B,)
+
+        # ----------------------------------------------------------
+        # 4) Build LOCAL structure matrices
+        # ----------------------------------------------------------
+        # mod2gene_local: (Cm, Cg), row m has 1s for genes belonging to module m
+        mod2gene_local = torch.zeros(Cm, Cg, device=z.device)
+        for g in range(Cg):
+            global_mod = cls2module_local[g].item()      # global module id
+            local_mod = mod_map[global_mod]             # local module id
+            mod2gene_local[local_mod, g] = 1.0
+        mod2gene_local /= mod2gene_local.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+        # pw2mod_local: (Cp, Cm), row p has 1s for modules belonging to pathway p
+        pw2mod_local = torch.zeros(Cp, Cm, device=z.device)
+        for global_mod in modules_in_batch:
+            m_global = global_mod.item()
+            local_mod = mod_map[m_global]
+            # pick any gene belonging to this module to determine its pathway
+            mask = (cls2module_local == m_global)
+            pw_global = cls2pw_local[mask][0].item()
+            local_pw = pw_map[pw_global]
+            pw2mod_local[local_pw, local_mod] = 1.0
+        pw2mod_local /= pw2mod_local.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+        # ----------------------------------------------------------
+        # 5) Compute logits per level
+        # ----------------------------------------------------------
+        # Gene level
+        logits_gene = (z @ gene_emb_local.T) / gene_temperature            # (B, Cg)
+
+        # Module level (aggregated from genes)
+        module_emb = F.normalize(mod2gene_local @ gene_emb_local, dim=-1)  # (Cm, d)
+        logits_module = (z @ module_emb.T) / module_temperature            # (B, Cm)
+
+        # Pathway level (aggregated from modules)
+        pathway_emb = F.normalize(pw2mod_local @ module_emb, dim=-1)       # (Cp, d)
+        logits_pathway = (z @ pathway_emb.T) / pathway_temperature         # (B, Cp)
+
+        # ----------------------------------------------------------
+        # 6) HARD top-down masking using TRUE labels
+        # ----------------------------------------------------------
+        # Module mask per sample: allow only modules in the *true pathway*
+        # pw2mod_local: (Cp, Cm) → index by true pathway (B,) → (B, Cm)
+        mod_mask = pw2mod_local[pathway_labels_local].bool()               # (B, Cm)
+
+        # Gene mask per sample: allow only genes in the *true module*
+        # mod2gene_local: (Cm, Cg) → index by true module (B,) → (B, Cg)
+        gene_mask = mod2gene_local[module_labels_local].bool()             # (B, Cg)
+
+        # Apply hard masking
+        masked_logits_module = logits_module.masked_fill(~mod_mask, -1e9)  # (B, Cm)
+        masked_logits_gene   = logits_gene.masked_fill(~gene_mask, -1e9)   # (B, Cg)
+
+        # ----------------------------------------------------------
+        # 7) Loss terms
+        # ----------------------------------------------------------
+        loss_pw = F.cross_entropy(
+            logits_pathway, pathway_labels_local,
+            label_smoothing=label_smoothing,
+            reduction="none"
+        )
+
+        loss_mod = F.cross_entropy(
+            masked_logits_module, module_labels_local,
+            reduction="none"
+        )
+
+        loss_gene = F.cross_entropy(
+            masked_logits_gene, gene_labels_local,
+            reduction="none"
+        )
+
+        # You can tune these; for strong hierarchy you may want pw=0.6, mod=0.3, gene=0.1
+        gene_weight = max(1e-3, 1.0 - (pw_weight + module_weight))
+
+        loss = pw_weight * loss_pw + module_weight * loss_mod + gene_weight * loss_gene
+
+        if reduce:
+            loss = self._reduce_loss(loss, self.non_elbo_reduction)
+            loss_pw = self._reduce_loss(loss_pw, self.non_elbo_reduction)
+            loss_mod = self._reduce_loss(loss_mod, self.non_elbo_reduction)
+            loss_gene = self._reduce_loss(loss_gene, self.non_elbo_reduction)
+
+        if return_losses:
+            return loss_pw, loss_mod, loss_gene, masked_logits_gene
+
+        return loss, masked_logits_gene
+
 
     def loss(
         self,
@@ -1781,9 +2194,10 @@ class XPert(VAE):
         local_predictions: bool = True,
         # Hierachical parameters
         module_weight: float = 0.3,
-        module_t: float = 0.4,
-        pw_weight: float = 0.2,
+        module_t: float = 0.25,
+        pw_weight: float = 0.5,
         pw_t: float = 0.8,
+        orthogonal_weight: float = 1.0,
         **kwargs,
     ) -> LossOutput:
         # ---- DEBUG ----
@@ -1876,6 +2290,8 @@ class XPert(VAE):
             'true_labels': cls,
             'n_obs_minibatch': n_obs_minibatch
         }
+        # Monitor latent space ranks
+        extra_metrics['z_rank'] = torch.linalg.matrix_rank(z).float().mean()
 
         # Collect extra outputs
         extra_outputs = {}
@@ -1900,6 +2316,7 @@ class XPert(VAE):
         # Only do alignment part if loss > 0
         predictions = None
         cls_t = 1.0
+        logits = None
         if io.non_zero(ctx_align_weight) or io.non_zero(cls_align_weight) or io.non_zero(joint_align_weight):
             # Get class embedding transformer output
             cls_emb = self.cached_cls_emb
@@ -1959,7 +2376,7 @@ class XPert(VAE):
                 )
                 # Get full logits
                 joint_logits = cls_out[MODULE_KEYS.JOINT_LOGITS_KEY]
-                logits = cls_out[MODULE_KEYS.CLS_LOGITS_KEY]
+                #logits = cls_out[MODULE_KEYS.CLS_LOGITS_KEY]
                 # Add to overall alignment loss
                 align_loss = joint_loss * joint_align_weight
             else:
@@ -1980,6 +2397,8 @@ class XPert(VAE):
                     )
                     # Do second forward pass through the vae encoder and update z_shared
                     z_shared_clip = self._regular_inference(x_, batch_index, label, g=g, cont_covs=cont_covs, cat_covs=cat_covs)[MODULE_KEYS.Z_KEY]
+                    # Update reference labels
+                    lo_kwargs['true_labels'] = label
                 else:
                     z_shared_clip, label = z_shared, cls.flatten()
                 # Get temperature for class clip
@@ -1987,116 +2406,152 @@ class XPert(VAE):
                     cls_t = T_align
                 else:
                     cls_t = self.aligner.cls_temperature
-
-                # Get unseen indices
-                # Calculate clip loss for class embedding
-                cls_clip_loss_out = self.clip_loss(
-                    z_shared_clip, 
-                    y=label.flatten(), 
-                    emb=cls2z, 
-                    T=cls_t,
-                    k=hard_negatives,
-                    use_reverse=use_reverse,
-                    n_unseen=n_unseen,
-                    unseen_weight=unseen_weight,
-                    unseen_indices=self._get_unseen_label_idx(),
-                    reduce=False,
-                    return_logits=True,
-                )
-                # Extract losses
-                loss_z2c_ps = cls_clip_loss_out[LOSS_KEYS.Z2C]
-                loss_c2z_ps = cls_clip_loss_out[LOSS_KEYS.C2Z]
-                loss_z2c_unseen_ps = cls_clip_loss_out[LOSS_KEYS.UNSEEN_Z2C]
-                cls_logits = cls_clip_loss_out[LOSS_KEYS.Z2C_LOGITS]
-                # Combine losses
-                loss_z2c = self._reduce_loss(loss_z2c_ps, reduction=self.non_elbo_reduction)
-                loss_c2z = self._reduce_loss(loss_c2z_ps, reduction=self.non_elbo_reduction)
-                loss_z2c_unseen = self._reduce_loss(loss_z2c_unseen_ps, reduction=self.non_elbo_reduction)
-                cls_loss = 0.5 * (loss_z2c + loss_c2z)
-                # Add unseen loss if not None
-                if loss_z2c_unseen is not None:
-                    cls_loss = (1-unseen_weight) * cls_loss + unseen_weight * loss_z2c_unseen
-                    extra_metrics[f'z2c_loss_unseen'] = loss_z2c_unseen
-                # Apply reductions
-                ctx_loss = self._reduce_loss(ctx_loss_ps, reduction=self.non_elbo_reduction)
-                # Add to extra metrics
-                extra_metrics[LOSS_KEYS.CLIP_CTX_CLS_LOSS] = ctx_loss
-                extra_metrics[LOSS_KEYS.CLIP_CLS_LOSS] = cls_loss
-                # Log individual parts of clip loss
-                extra_metrics[f'z2c_loss'] = loss_z2c
-                extra_metrics[f'c2z_loss'] = loss_c2z
-                # Add hierachical losses
-                hierachical_losses = []
-                ex_weight_sum = torch.tensor(0.0)
-                # Module level, Medium temperature
-                if module_weight > 0 and module_t is not None and module_t > 0 and self.use_hierachical_labels:
-                    # Use hierachical module labels instead of genes
-                    loss_module = self.clip_loss(
-                        z_shared, 
-                        y=self.cls2module[cls.flatten()], 
-                        emb=self._get_module_embeddings(cls2z), 
-                        T=cls_t,
-                        k=0,                                 # Don't use hard negatives here
-                        use_reverse=False,                   # Reverse can't be applied to aggregated proxies
-                        n_unseen=n_unseen,
-                        unseen_weight=unseen_weight,
-                        unseen_indices=self._get_unseen_module_idx(),
-                    )
-                    # Get reduced loss
-                    hierachical_losses.append(loss_module * module_weight)
-                    # Add to logging
-                    extra_metrics['module_loss'] = loss_module
-                    # Update weights
-                    ex_weight_sum = ex_weight_sum + module_weight
-                    # Update instance weight
-                    self.module_weight = module_weight
-                # Pathway level, Highest temperature
-                if pw_weight > 0 and pw_t is not None and pw_t > 0 and self.use_hierachical_labels:
-                    # Use hierachical pathway labels instead of genes
-                    loss_pw = self.clip_loss(
-                        z_shared, 
-                        y=self.cls2pw[cls.flatten()],
-                        emb=self._get_pathway_embeddings(cls2z), 
-                        T=cls_t,
-                        k=0,                                 # Don't use hard negatives here
-                        use_reverse=False,                   # Reverse can't be applied to aggregated proxies
-                        n_unseen=n_unseen,
-                        unseen_weight=unseen_weight,
-                        unseen_indices=self._get_unseen_pathway_idx(),
-                    )
-                    # Get reduced loss
-                    hierachical_losses.append(loss_pw * pw_weight)
-                    extra_metrics['pathway_loss'] = loss_pw
-                    ex_weight_sum = ex_weight_sum + pw_weight
-                    # Update instance weight
-                    self.pathway_weight = pw_weight
                 
-                # Update classification loss
-                if len(hierachical_losses) > 0:
-                    # Get remaining weight for gene loss
-                    h_cls_w = 1 - ex_weight_sum
-                    hierachical_losses.append(cls_loss * h_cls_w)
-                    # Combine cls losses
-                    cls_loss = torch.stack(hierachical_losses).mean()
+                # Use default clip
+                if not self.use_hierachical_clip or not self.use_hierachical_labels:
+                    # Get unseen indices
+                    # Calculate clip loss for class embedding
+                    cls_clip_loss_out = self.clip_loss(
+                        z_shared_clip, 
+                        y=label.flatten(), 
+                        emb=cls2z, 
+                        T=cls_t,
+                        k=hard_negatives,
+                        use_reverse=use_reverse,
+                        n_unseen=n_unseen,
+                        unseen_weight=unseen_weight,
+                        unseen_indices=self._get_unseen_label_idx(),
+                        reduce=False,
+                        return_logits=True,
+                    )
+                    # Extract losses
+                    loss_z2c_ps = cls_clip_loss_out[LOSS_KEYS.Z2C]
+                    loss_c2z_ps = cls_clip_loss_out[LOSS_KEYS.C2Z]
+                    loss_z2c_unseen_ps = cls_clip_loss_out[LOSS_KEYS.UNSEEN_Z2C]
+                    cls_logits = cls_clip_loss_out[LOSS_KEYS.Z2C_LOGITS]
+                    # Combine losses
+                    loss_z2c = self._reduce_loss(loss_z2c_ps, reduction=self.non_elbo_reduction)
+                    loss_c2z = self._reduce_loss(loss_c2z_ps, reduction=self.non_elbo_reduction)
+                    loss_z2c_unseen = self._reduce_loss(loss_z2c_unseen_ps, reduction=self.non_elbo_reduction)
+                    cls_loss = 0.5 * (loss_z2c + loss_c2z)
+                    # Add unseen loss if not None
+                    if loss_z2c_unseen is not None:
+                        cls_loss = (1-unseen_weight) * cls_loss + unseen_weight * loss_z2c_unseen
+                        extra_metrics[f'z2c_loss_unseen'] = loss_z2c_unseen
+                    # Apply reductions
+                    ctx_loss = self._reduce_loss(ctx_loss_ps, reduction=self.non_elbo_reduction)
+                    # Add to extra metrics
+                    extra_metrics[LOSS_KEYS.CLIP_CTX_CLS_LOSS] = ctx_loss
+                    extra_metrics[LOSS_KEYS.CLIP_CLS_LOSS] = cls_loss
+                    # Log individual parts of clip loss
+                    extra_metrics[f'z2c_loss'] = loss_z2c
+                    extra_metrics[f'c2z_loss'] = loss_c2z
+                    # Add hierachical losses
+                    hierachical_losses = []
+                    ex_weight_sum = torch.tensor(0.0)
+                    # Module level, Medium temperature
+                    if module_weight > 0 and module_t is not None and module_t > 0 and self.use_hierachical_labels:
+                        # Use hierachical module labels instead of genes
+                        loss_module = self.clip_loss(
+                            z_shared, 
+                            y=self.cls2module[cls.flatten()], 
+                            emb=self._get_module_embeddings(cls2z), 
+                            T=cls_t,
+                            k=0,                                 # Don't use hard negatives here
+                            use_reverse=False,                   # Reverse can't be applied to aggregated proxies
+                            n_unseen=n_unseen,
+                            unseen_weight=unseen_weight,
+                            unseen_indices=self._get_unseen_module_idx(),
+                        )
+                        # Get reduced loss
+                        hierachical_losses.append(loss_module * module_weight)
+                        # Add to logging
+                        extra_metrics['module_loss'] = loss_module
+                        # Update weights
+                        ex_weight_sum = ex_weight_sum + module_weight
+                        # Update instance weight
+                        self.module_weight = module_weight
+                    # Pathway level, Highest temperature
+                    if pw_weight > 0 and pw_t is not None and pw_t > 0 and self.use_hierachical_labels:
+                        # Use hierachical pathway labels instead of genes
+                        loss_pw = self.clip_loss(
+                            z_shared, 
+                            y=self.cls2pw[cls.flatten()],
+                            emb=self._get_pathway_embeddings(cls2z), 
+                            T=cls_t,
+                            k=0,                                 # Don't use hard negatives here
+                            use_reverse=False,                   # Reverse can't be applied to aggregated proxies
+                            n_unseen=n_unseen,
+                            unseen_weight=unseen_weight,
+                            unseen_indices=self._get_unseen_pathway_idx(),
+                        )
+                        # Get reduced loss
+                        hierachical_losses.append(loss_pw * pw_weight)
+                        extra_metrics['pathway_loss'] = loss_pw
+                        ex_weight_sum = ex_weight_sum + pw_weight
+                        # Update instance weight
+                        self.pathway_weight = pw_weight
+                    
+                    # Update classification loss
+                    if len(hierachical_losses) > 0:
+                        # Get remaining weight for gene loss
+                        h_cls_w = 1 - ex_weight_sum
+                        hierachical_losses.append(cls_loss * h_cls_w)
+                        # Combine cls losses
+                        cls_loss = torch.stack(hierachical_losses).mean()
+                        
+                # TODO: in testing - masked hierarchical loss
+                else:
+                    # Use learnable parameters instead of fixed ones
+                    if self.use_learnable_hierarchy_temperatures:
+                        cls_t = 1.0 / self.log_t_gene.exp().clamp(min=1e-6)
+                        module_t = 1.0 / self.log_t_module.exp().clamp(min=1e-6)
+                        pw_t = 1.0 / self.log_t_pathway.exp().clamp(min=1e-6)
+                    # Calculate hierachical loss
+                    loss_pw, loss_module, loss_gene, _ = self.hierarchical_clip_loss(
+                        z_shared_clip,
+                        labels=label.flatten(),
+                        gene_emb=cls2z,
+                        gene_temperature=cls_t,
+                        module_temperature=module_t,
+                        pathway_temperature=pw_t,
+                        pw_weight=pw_weight,
+                        module_weight=module_weight,
+                        return_losses=True
+                    )
+                    # Calculate gene weight and compute hierachical loss
+                    gene_weight = 1 - (pw_weight + module_weight)
+                    cls_loss = pw_weight * loss_pw + module_weight * loss_module + gene_weight * loss_gene
+                    extra_metrics[LOSS_KEYS.CLIP_CLS_LOSS] = cls_loss
+                    extra_metrics['pathway_loss'] = loss_pw
+                    extra_metrics['module_loss'] = loss_module
+                    extra_metrics['gene_loss'] = loss_gene
+                    ctx_loss = torch.tensor(0.0)
                 
                 # Set logits to class embedding logits
-                logits = cls_logits
+                #logits = cls_logits
                 
                 # Combine alignment losses
                 align_loss = ctx_loss * ctx_align_weight + cls_loss * cls_align_weight
             
             # Get predictions
-            logits = self.predict(
-                z_shared=z_shared, cls2z=cls2z,
-                gene_temp=cls_t, module_temp=cls_t, pathway_temp=cls_t, 
-                return_logits=True
-            )
+            if logits is None:
+                logits = self.predict(
+                    z_shared=z_shared, cls2z=cls2z,
+                    gene_temp=cls_t, module_temp=module_weight, pathway_temp=pw_weight, 
+                    return_logits=True
+                )
             # Only return predictions of observable classes
             if local_predictions:
                 logits = logits[:,:self.n_labels]
             # Add class predictions to extra output
-            extra_outputs[PREDICTION_KEYS.PREDICTION_KEY] = logits.squeeze(-1).detach()
+            extra_outputs[PREDICTION_KEYS.PREDICTION_KEY] = logits.argmax(dim=-1).flatten().detach()
             
+            # Add adapter orthogonality loss
+            if self.use_adapter and orthogonal_weight > 0:
+                ortho_reg_loss = self.cls_emb.orthogonal_reg()
+                extra_metrics['ortho_reg_loss'] = ortho_reg_loss
+                align_loss = align_loss + ortho_reg_loss * orthogonal_weight
             # Add additional regularization losses
             if pseudo_latent_frac > 0 and pseudo_latent_weight > 0:
                 # Enforce model to not be biased towards observed classes
@@ -2143,3 +2598,140 @@ class XPert(VAE):
         # need this if <1.1 model is resaved with >=1.1 as new registry is
         # updated on setup
         manager.registry[_constants._SCVI_VERSION_KEY] = source_version
+
+    def visualize_hierarchy(self, gene_names=None, figsize=(10, 12)):
+        """
+        Visualize hierarchy as 3 aligned vertical columns:
+        Pathway → Module → Gene
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        pw = self.cls2pw.cpu().numpy()
+        mod = self.cls2module.cpu().numpy()
+        C = len(pw)
+
+        if gene_names is None:
+            gene_names = [f"gene_{i}" for i in range(C)]
+
+        # Unique sorted clusters
+        pathways = np.unique(pw)
+        modules = np.unique(mod)
+
+        # Build layout positions
+        pw_y = {p: i for i, p in enumerate(pathways)}
+        mod_y = {m: i for i, m in enumerate(modules)}
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        # Draw nodes (pathways / modules / genes)
+        # ------------------------------------------------
+        # Pathway nodes (left column)
+        for p in pathways:
+            ax.text(0.1, pw_y[p], f"PW {p}", fontsize=10,
+                    bbox=dict(boxstyle="round", fc="lightblue"))
+
+        # Module nodes (middle column)
+        for m in modules:
+            ax.text(0.5, mod_y[m], f"MOD {m}", fontsize=10,
+                    bbox=dict(boxstyle="round", fc="lightgreen"))
+
+        # Gene nodes (right column)
+        for g in range(C):
+            ax.text(0.9, g, gene_names[g], fontsize=8,
+                    bbox=dict(boxstyle="round", fc="lightgray"))
+
+        # Draw edges pathway → module
+        # ------------------------------------------------
+        for m in modules:
+            parent = pw[mod == m][0]
+            ax.plot([0.15, 0.45], [pw_y[parent], mod_y[m]], 'k-', alpha=0.4)
+
+        # Draw edges module → gene
+        # ------------------------------------------------
+        for g in range(C):
+            parent = mod[g]
+            ax.plot([0.55, 0.85], [mod_y[parent], g], 'k-', alpha=0.1)
+
+        ax.set_ylim(-1, max(C, len(modules), len(pathways)) + 1)
+        ax.set_xlim(0, 1)
+        ax.axis("off")
+        plt.title("Hierarchy Visualization (Matplotlib)")
+        plt.show()
+
+    def visualize_hierarchy_blocks(self):
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        pw2mod = self.pw2module_mask.float().cpu()
+        mod2gene = self.module2gene_mask.float().cpu()
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        sns.heatmap(pw2mod, cmap="Blues", ax=axes[0])
+        axes[0].set_title("Pathway → Module Mask")
+        axes[0].set_xlabel("Modules")
+        axes[0].set_ylabel("Pathways")
+
+        sns.heatmap(mod2gene, cmap="Greens", ax=axes[1])
+        axes[1].set_title("Module → Gene Mask")
+        axes[1].set_xlabel("Genes")
+        axes[1].set_ylabel("Modules")
+
+        plt.tight_layout()
+        plt.show()
+        
+    def visualize_hierarchy_networkx(self, gene_names=None):
+        import matplotlib.pyplot as plt
+        import networkx as nx
+        import numpy as np
+
+        pw = self.cls2pw.cpu().numpy()
+        mod = self.cls2module.cpu().numpy()
+        C = len(pw)
+
+        if gene_names is None:
+            gene_names = [f"gene_{i}" for i in range(C)]
+
+        G = nx.DiGraph()
+
+        # Create nodes
+        pathways = np.unique(pw)
+        modules = np.unique(mod)
+
+        for p in pathways:
+            G.add_node(f"PW {p}", level=0)
+        for m in modules:
+            G.add_node(f"MOD {m}", level=1)
+        for g in range(C):
+            G.add_node(gene_names[g], level=2)
+
+        # pathway → module
+        for m in modules:
+            parent = pw[mod == m][0]
+            G.add_edge(f"PW {parent}", f"MOD {m}")
+
+        # module → gene
+        for g in range(C):
+            G.add_edge(f"MOD {mod[g]}", gene_names[g])
+
+        # Position nodes by hierarchy
+        pos = {}
+        for node, data in G.nodes(data=True):
+            level = data["level"]
+            if level == 0:
+                pos[node] = (0, list(G.nodes()).index(node))
+            elif level == 1:
+                pos[node] = (1, list(G.nodes()).index(node))
+            else:
+                pos[node] = (2, list(G.nodes()).index(node))
+
+        plt.figure(figsize=(14, 12))
+        nx.draw(G, pos,
+                with_labels=True,
+                node_size=800,
+                node_color="lightblue",
+                font_size=8,
+                arrows=False)
+        plt.title("Hierarchy (NetworkX)")
+        plt.show()

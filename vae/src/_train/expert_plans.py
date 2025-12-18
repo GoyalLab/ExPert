@@ -741,6 +741,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 batch_size=batch_size,
                 prog_bar=False,
             )
+        # Log hierarchical temperatures
+        if self.module.use_learnable_hierarchy_temperatures:
+            t_gene = 1.0 / self.module.log_t_gene.exp().clamp(min=1e-6)
+            self.log('t_gene', t_gene, on_epoch=True, batch_size=batch_size, prog_bar=False)
+            t_module = 1.0 / self.module.log_t_module.exp().clamp(min=1e-6)
+            self.log('t_module', t_module, on_epoch=True, batch_size=batch_size, prog_bar=False)
+            t_pathway = 1.0 / self.module.log_t_pathway.exp().clamp(min=1e-6)
+            self.log('t_pathway', t_pathway, on_epoch=True, batch_size=batch_size, prog_bar=False)
 
     def step(self, split, batch, batch_idx):
         """Step for supervised training"""
@@ -1146,18 +1154,29 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
 
         # --- plotting helper
         def _scatter_base(ax, data, hue, title, legend=True, plot_proxy=True, proxy_color="black", proxy_legend=True):
+            data_sorted = pd.concat([
+                data[~data.is_proxy],                                     # normal cells
+                data[(data.is_proxy) & (~data.is_observed)],              # unobserved proxies
+                data[(data.is_proxy) & (data.is_observed)],               # observed proxies (TOP)
+            ])
             sns.scatterplot(
-                data=data[~data.is_proxy],
+                data=data_sorted[~data_sorted.is_proxy],
                 x="UMAP1", y="UMAP2", hue=hue,
                 s=6, alpha=0.6, ax=ax, legend=legend
             )
-            # overlay proxies as crosses
+            # overlay proxies as crosses (always plot observed on top of unobserved)
             if plot_proxy:
                 sns.scatterplot(
-                    data=data[data.is_proxy],
+                    data=data_sorted[(data_sorted.is_proxy) & (~data_sorted.is_observed)],
+                    x="UMAP1", y="UMAP2", hue=hue,
+                    s=40, marker="X", ax=ax, legend=False,
+                    edgecolor=proxy_color, linewidth=0.5
+                )
+                sns.scatterplot(
+                    data=data_sorted[(data_sorted.is_proxy) & (data_sorted.is_observed)],
                     x="UMAP1", y="UMAP2", hue=hue,
                     s=40, marker="X", ax=ax, legend=proxy_legend,
-                    edgecolor=proxy_color, linewidth=0.5
+                    edgecolor=proxy_color, linewidth=0.8
                 )
             ax.set_title(title)
             ax.set_xlabel("UMAP1")
@@ -1171,9 +1190,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                     markerscale=2,
                     fontsize="small"
                 )
+                
+        # Check if model has pathway and module information
+        has_pathways = hasattr(self.module, 'cls2pw')
+        has_modules = hasattr(self.module, 'cls2module')
 
         # --- create figure grid
-        fig, axes = plt.subplots(2, 2, figsize=(12, 9), dpi=150)
+        N = 3 if has_modules or has_pathways else 2
+        D = int(N * 4)
+        fig, axes = plt.subplots(N, 2, figsize=(12, D), dpi=150)
 
         # 1. by modes (splits)
         _scatter_base(axes[0, 0], df, "mode", f"Splits @ Epoch {self.current_epoch}")
@@ -1191,6 +1216,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # 4. by covariates (contexts)
         _scatter_base(axes[1, 1], df, "cov", f"Contexts @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False)
 
+        # 5. by pathways (if they exist)
+        if has_pathways:
+            df["pw"] = self.module.cls2pw[df.label_id].cpu().numpy().astype(str)
+            _scatter_base(axes[2, 0], df, "pw", f"Pathways @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False, legend=False)
+        # 6. by modules (if they exist)
+        if has_modules:
+            df["module"] = self.module.cls2module[df.label_id].cpu().numpy().astype(str)
+            _scatter_base(axes[2, 1], df, "module", f"Modules @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False, legend=False)
         plt.tight_layout()
         self.logger.experiment.add_figure(f"{mode}_{emb_key}_umap", fig, self.current_epoch)
         plt.close(fig)

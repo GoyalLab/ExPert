@@ -92,7 +92,7 @@ def _train(
         config: dict, 
         cls_label: str = 'cls_label',
         batch_key: str = 'context',
-        verbose: bool = False,
+        verbose: bool = True,
         context_filter: list[str] | None = None,
         cls_texts_p: str | None = None,
         **train_kwargs
