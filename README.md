@@ -1,6 +1,6 @@
 # ExPert
 
-Part A: A Snakemake pipeline for analyzing and integrating perturbation sequencing experiments.
+Part A: A Snakemake pipeline for downloading and merging perturbation screening experiments.
 Part B: AI framework for perturbation prediction in scRNA-seq data.
 
 ## 🚀 A: Quick Start
@@ -20,10 +20,10 @@ mamba activate ExPert
 snakemake --cores 10 --verbose --configfile "config/defaults.yaml" --use-conda
 
 # On SLURM
-snakemake --cores 10 --verbose --configfile "config/defaults.yaml" --profile "workflow/profiles/slurm" --use-conda
+snakemake --cores 1 --verbose --configfile "config/defaults.yaml" --profile "workflow/profiles/slurm" --use-conda
 ```
 
-## B: Training an ExPert Model
+## 🚀 B: Training an ExPert Model
 
 Our Variational Autoencoder (VAE) model predicts genetic perturbations in single-cell RNA sequencing data.
 
@@ -34,15 +34,15 @@ Our Variational Autoencoder (VAE) model predicts genetic perturbations in single
 
 ### Core Architecture
 
-- **Main Module**: `vae/src/modules/_jedvae.py`
-- **Model Implementation**: `vae/src/models/_jedvi.py`
+- **Main Module**: `vae/src/modules/_xpert.py`
+- **Model Implementation**: `vae/src/models/_expert.py`
 - **Neural Network Components**:
   - Located in `vae/src/modules/_base.py`
-  - Includes: Encoder, DecoderSCVI, MultiHeadAttention, FunnelFCLayers, Block
+  - Includes: Encoder, DecoderSCVI, ContextClassAligner, MultiHeadAttention, FunnelFCLayers, Block
 
 ### Training
 
-- **Training Plan**: `vae/src/_train/plan.py::ContrastiveSupervisedTrainingPlan`
+- **Training Plan**: `vae/src/_train/expert_plans.py::ContrastiveSupervisedTrainingPlan`
 - **Contrastive Learning**:
   - Sampler: `vae/src/data/_contrastive_sampler.py`
   - Loader: `vae/src/data/_contrastive_loader.py`
