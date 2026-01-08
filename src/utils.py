@@ -75,7 +75,7 @@ def download_file(url, output_path, cache=True) -> str:
 
             return f"Successfully downloaded file: {output_path}"
         except requests.exceptions.RequestException as e:
-            return f"Error downloading file: {e}"
+            raise ConnectionError(f"Error downloading file: {e}")
     else:
         return "Cached dataset"
 

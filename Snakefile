@@ -52,10 +52,11 @@ MODEL_FILE = os.path.join(MODEL_DIR, 'model.pt')
 # define final pipeline endpoint, i.e. merged dataset or harmonized dataset
 OUTPUT_FILE = MERGED_OUTPUT_FILE if config['correction_method']=='skip' else HARMONIZED_OUTPUT_FILE
 # add gene embedding to output file
-if os.path.exists(config['gene_embedding']):
+if config['gene_embedding'] is not None and config['gene_embedding'] != '' and os.path.exists(config['gene_embedding']):
     OUTPUT_FILE_W_EMB = f"{OUTPUT_FILE.rstrip('.h5ad')}_w_emb.h5ad"
     ENPOINT = OUTPUT_FILE_W_EMB
 else:
+    OUTPUT_FILE_W_EMB = None
     ENPOINT = OUTPUT_FILE
 
 
@@ -276,18 +277,19 @@ rule harmonize:
         "workflow/scripts/harmonize.py"
 
 # 8. Add gene embedding to merged dataset if that was given in params (optional)
-rule add_gene_embedding:
-    input:
-        input_file = OUTPUT_FILE
-    output:
-        output_file = OUTPUT_FILE_W_EMB
-    log:
-        os.path.join(LOG, "add_emb.log")
-    params:
-        gene_embedding_file = config['gene_embedding'],
-        ctx_embedding_file = config['context_embedding'],
-        add_emb_for_features = config['add_emb_for_features'],
-    resources:
-        **get_job_resources(config['resources'], job_name='add_gene_embedding')
-    script:
-        "workflow/scripts/add_gene_embedding.py"
+if OUTPUT_FILE_W_EMB is not None:
+    rule add_gene_embedding:
+        input:
+            input_file = OUTPUT_FILE
+        output:
+            output_file = OUTPUT_FILE_W_EMB
+        log:
+            os.path.join(LOG, "add_emb.log")
+        params:
+            gene_embedding_file = config['gene_embedding'],
+            ctx_embedding_file = config['context_embedding'],
+            add_emb_for_features = config['add_emb_for_features'],
+        resources:
+            **get_job_resources(config['resources'], job_name='add_gene_embedding')
+        script:
+            "workflow/scripts/add_gene_embedding.py"

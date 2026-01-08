@@ -20,6 +20,7 @@ mamba activate ExPert
 snakemake --cores 10 --verbose --configfile "config/defaults.yaml" --use-conda
 
 # On SLURM
+# Specify slurm account in: workflow/profiles/slurm/settings.json
 snakemake --cores 1 --verbose --configfile "config/defaults.yaml" --profile "workflow/profiles/slurm" --use-conda
 ```
 
