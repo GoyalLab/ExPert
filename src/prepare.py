@@ -69,7 +69,7 @@ def prepare_merge(input_pth: str, pool_genes: Iterable[str], out: str, zero_pad:
             logging.info('Converting to CSR matrix.')
             adata.X = sp.csr_matrix(adata.X.compute())
         # Filter for a minimum number of cells per perturbation
-        mcpp = kwargs.get('min_cells_per_perturbation')
+        mcpp = kwargs.get('min_cells_per_class', 0)
         if mcpp > 0:
             p_col = kwargs.get('perturbation_col', 'perturbation')
             cpp = adata.obs[p_col].value_counts()

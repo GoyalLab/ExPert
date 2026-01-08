@@ -122,7 +122,7 @@ rule process_dataset:
         use_feature_pool = config['use_feature_pool'],
         z_score_filter = config['z_score_filter'],
         control_neighbor_threshold = config['control_neighbor_threshold'],
-        min_cells_per_class = config['min_cells_per_class'],
+        min_cells_per_class = config['min_cells_per_perturbation'],
         single_perturbations_only = config['single_perturbations_only'],
         p_col = config['perturbation_col'],
         ctrl_key = config['ctrl_key'],

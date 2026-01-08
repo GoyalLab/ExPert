@@ -4,29 +4,6 @@ output_dir: 'test/output'
 cache_dir: 'test/data'
 log_dir: 'test/logs'
 
-# Pre-processing
-qc: true
-norm: false
-log_norm: false
-scale: false
-hvg: false
-n_hvg: 2000                                 # Number of highly variable genes to consider
-n_ctrl: 10000                               # Sample fixed number of control cells
-single_perturbations_only: true
-use_perturbation_pool: true                 # Filter datasets for shared perturbations, or keep all of them
-use_feature_pool: true                      # Filter each dataset for genes that are shared across all datasets
-z_score_filter: false                        # Filter cells based on euclidian distance to mean control expression in dataset
-control_neighbor_threshold: 0.0               # Filter cells based on percentage of neighbors that are from the same class, set to 0.0 to ignore
-min_cells_per_class: 50
-# Filtering
-mixscale_filter: true                       # Filter cells by knockdown efficiency (based on mixscale: https://www.biorxiv.org/content/10.1101/2024.01.29.576933v2)
-min_deg: 5                                  # Minimum amount of differentially expressed genes compared to control cells for each perturbation to pass filtering
-ctrl_dev: 0.0                               # Minimum standart deviation of perturbed cells mixscale score to control
-# Merge & Harmonize
-zero_padding: false
-correction_method: 'skip'
-var_merge: 'intersection'
-
 # Slurm config
 resources:
   memory:
