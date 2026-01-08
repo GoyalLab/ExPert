@@ -20,7 +20,7 @@ subset_hvg: false                           # Directly subset to hvgs (not recom
 n_ctrl: 10000                               # Maximum number of control cells, randomly draw n_ctrl if there are more control cells than that, keep all if less
 single_perturbations_only: true             # Exclude multiple perturbations from dataset
 z_score_filter: false                        # Filter cells based on euclidian distance to mean control expression in dataset
-control_neighbor_threshold: 0.1               # Filter cells based on percentage of neighbors that are from the same class, set to 0.0 to ignore
+control_neighbor_threshold: 0.0               # Filter cells based on percentage of neighbors that are from the same class, set to 0.0 to ignore
 min_cells_per_class: 50                     # Filter perturbations for a minimum number of cells
 
 ## Mixscale filter:
