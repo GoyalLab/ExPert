@@ -5,7 +5,7 @@ channels:
   - defaults
 dependencies:
   - r-base=4.4.0
-  - r-seurat
+  - r-seurat=5.3.0
   - r-pma
   - r-protoclust
   - r-argparse
