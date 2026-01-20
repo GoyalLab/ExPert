@@ -33,16 +33,19 @@ def _perturbation_cols():
     return [
         'perturbation',
         'gene',
+        'perturbed_gene_name',
         'perturbation_1',
         'target',
-        'gene_target'
+        'gene_target',
+        'guides_collapsed_by_gene'
     ]
 
 def _ctrl_keys():
     return [
         'control',
         'non-targeting',
-        'nt'
+        'nt',
+        'ntc'
     ]
 
 def _misc_labels_keys():

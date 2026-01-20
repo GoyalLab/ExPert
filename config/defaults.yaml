@@ -27,7 +27,7 @@ min_cells_per_class: 100                    # Minimum number of cells per class 
 ## Mixscale filter:
 mixscale_filter: true                       # Filter cells by knockdown efficiency (based on mixscale: https://www.biorxiv.org/content/10.1101/2024.01.29.576933v2)
 min_deg: 5                                  # Minimum amount of differentially expressed genes compared to control cells for each perturbation to pass filtering
-ctrl_dev: 0.5                               # Minimum standart deviation of perturbed cells mixscale score to control
+ctrl_dev: 0.0                               # Minimum standart deviation of perturbed cells mixscale score to control
 
 ## Merge & Harmonize:
 zero_padding: false                          # Keep genes that are not overlapping with genes from other experiments (assign 0 to them)

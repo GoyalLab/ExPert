@@ -51,6 +51,7 @@ seurat_obj <- mixscale_pipeline(
   verbose = T,
   n_cores = n_cores,
 )
+
 # 3. Write filtered object to disk (optional)
 if (save_seurat) {
   seurat_out_p <- paste0(file_path_sans_ext(out_p), '.all.h5seurat')
@@ -89,15 +90,24 @@ seurat_obj <- subset(seurat_obj, subset = mixscale_mask)
 
 # 5. Save only raw counts and convert to h5ad
 message("Saving filtered dataset to file.")
-tmp_out_p <- paste0(file_path_sans_ext(out_p), '.h5seurat')
-seurat_obj@assays$originalexp@scale.data <- matrix()
-seurat_obj@assays$originalexp@data <- seurat_obj@assays$originalexp@counts
-seurat_obj@assays$originalexp@counts <- matrix()
-# 6. Convert meta data factors to characters to avoid numeric conversion
+tmp_out_p <- paste0(file_path_sans_ext(out_p), ".h5seurat")
+
+# Convert metadata factors safely
 seurat_obj@meta.data <- convert_factors_to_characters(seurat_obj@meta.data)
-seurat_obj[["originalexp"]]@meta.features <- convert_factors_to_characters(seurat_obj[["originalexp"]]@meta.features)
-SaveH5Seurat(seurat_obj, filename = tmp_out_p)
-Convert(tmp_out_p, dest = 'h5ad', assay = "originalexp", X.layer = "data", overwrite = T)
-rm_tmp_seurat_file <- file.remove(tmp_out_p)
+seurat_obj[["originalexp"]]@meta.features <- convert_factors_to_characters(
+  seurat_obj[["originalexp"]]@meta.features
+)
+# Save file as seurat
+SaveH5Seurat(seurat_obj, filename = tmp_out_p, overwrite = T)
+# Convert to .h5ad on disk
+Convert(
+  tmp_out_p,
+  dest = "h5ad",
+  assay = "originalexp",
+  X.layer = "counts",
+  overwrite = T
+)
+# Remove temporary seurat file
+file.remove(tmp_out_p)
 # Print session info
 sessionInfo()

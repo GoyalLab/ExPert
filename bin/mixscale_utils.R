@@ -1,11 +1,11 @@
 ## Util functions
 # Set Seurat object version
-options(Seurat.object.assay.version = 'v3') 
+#options(Seurat.object.assay.version = 'v3') 
 # Load libraries
 library(Seurat)
+library(SeuratDisk)
 library(ggridges)
 library(Mixscale)
-library(SeuratDisk)
 library(ggplot2)
 library(tools)
 library(zellkonverter)

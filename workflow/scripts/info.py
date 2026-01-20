@@ -11,7 +11,9 @@ if __name__ == "__main__":
         create_meta_summary(
             input_files=snakemake.input.input_files,
             perturbation_pool_file=snakemake.output.perturbation_pool_file,
+            dataset_sheet=snakemake.params.dataset_sheet,
             feature_pool_file=snakemake.output.feature_pool_file,
+            min_cells_per_class=snakemake.params.min_cells_per_class,
             plt_dir=snakemake.params.plt_dir,
         )
     except NameError:

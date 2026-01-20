@@ -92,6 +92,8 @@ rule meta_info:
     log:
         os.path.join(LOG, 'meta_info.log')
     params:
+        min_cells_per_class = config['min_cells_per_class'],
+        dataset_sheet = DATASET_SHEET,
         plt_dir = PLT_DIR
     resources:
         **get_job_resources(config['resources'], job_name='meta_info')
@@ -122,7 +124,7 @@ rule process_dataset:
         use_feature_pool = config['use_feature_pool'],
         z_score_filter = config['z_score_filter'],
         control_neighbor_threshold = config['control_neighbor_threshold'],
-        min_cells_per_class = config['min_cells_per_perturbation'],
+        min_cells_per_perturbation = config['min_cells_per_perturbation'],
         single_perturbations_only = config['single_perturbations_only'],
         p_col = config['perturbation_col'],
         ctrl_key = config['ctrl_key'],
@@ -140,7 +142,7 @@ if config['mixscale_filter']:
     # Setup mixscale environment for mixscale runs
     rule setup_mixscale:
         output:
-            setup_status = os.path.join(LOG, ".mixscale_setup.txt")
+            setup_status = os.path.join(".snakemake/conda", ".mixscale_setup.txt")
         conda:
             "workflow/envs/mixscale.yaml"
         resources:
@@ -154,7 +156,7 @@ if config['mixscale_filter']:
     rule filter_cells_by_efficiency:
         input:
             dataset_file = os.path.join(PROCESS_DIR, "{dataset}.h5ad"),
-            setup_status = os.path.join(LOG, ".mixscale_setup.txt")
+            setup_status = os.path.join(".snakemake/conda", ".mixscale_setup.txt")
         output:
             filtered_file = os.path.join(FILTER_DIR, "{dataset}.h5ad")
         conda:

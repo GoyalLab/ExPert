@@ -4,8 +4,9 @@ channels:
   - bioconda
   - defaults
 dependencies:
-  - r-base=4.4.0
+  - r-base=4.4.3
   - r-seurat=5.3.0
+  - r-seuratobject=5.1.0
   - r-pma
   - r-protoclust
   - r-argparse
@@ -16,6 +17,7 @@ dependencies:
   - r-foreach
   - r-doparallel
   - r-dosnow
+  - r-hdf5r
   - bioconductor-glmgampoi
   - bioconductor-singlecellexperiment
   - bioconductor-zellkonverter

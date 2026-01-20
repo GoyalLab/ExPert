@@ -37,7 +37,7 @@ if __name__ == "__main__":
             use_feature_pool=snakemake.params.use_feature_pool,
             z_score_filter=snakemake.params.z_score_filter,
             control_neighbor_threshold=snakemake.params.control_neighbor_threshold,
-            min_cells_per_class=snakemake.params.min_cells_per_class,
+            min_cells_per_perturbation=snakemake.params.min_cells_per_perturbation,
             single_perturbations_only=snakemake.params.single_perturbations_only,
             p_col=snakemake.params.p_col,
             ctrl_key=snakemake.params.ctrl_key,

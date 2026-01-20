@@ -353,7 +353,7 @@ def get_adata_meta(adata: ad.AnnData, p_col: str = 'perturbation', ctrl_key: str
     obs[p_col] = clean_perturbation_labels(obs[p_col], keep_versions=False)
     # Extract .var
     var = adata.var.copy()
-    if adata.var_names.str.lower().str.startswith('ens').all():
+    if adata.var_names.str.lower().str.startswith('ens').sum() / adata.n_vars > 0.9:
         logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
         var = ens_to_symbol(adata).var.copy()
     return obs, var
@@ -436,7 +436,7 @@ def preprocess_dataset(
         use_feature_pool: bool = True,
         z_score_filter: bool = False,
         control_neighbor_threshold: float = 0.1,
-        min_cells_per_class: int | None = 50,
+        min_cells_per_perturbation: int | None = 50,
         p_col: str = OBS_KEYS.PERTURBATION_KEY,
         ctrl_key: str = OBS_KEYS.CTRL_KEY,
         min_genes: int = 5_000,
@@ -502,7 +502,7 @@ def preprocess_dataset(
         sc.pp.scale(adata)
     logging.info(f'Found {np.sum(adata.var.highly_variable)} highly variable genes out of {adata.n_vars} total genes')
     # check if .var indices are gene symbols or ensembl ids
-    if adata.var_names.str.lower().str.startswith('ens').all():
+    if adata.var_names.str.lower().str.startswith('ens').sum() / adata.n_vars > 0.9:
         logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
         adata = ens_to_symbol(adata).copy()
     # Filter for feature pool if option is given
@@ -520,8 +520,8 @@ def preprocess_dataset(
         logging.info(f'Filtering cells based on control z-score.')
         filter_by_distance_to_control(adata, condition_col=p_col, ctrl_key=ctrl_key, normalize=not norm)
     # Filter perturbations based on minimum number of support
-    if min_cells_per_class is not None and min_cells_per_class > 0:
-        logging.info(f'Filtering for at least {min_cells_per_class} cells per perturbation.')
-        filter_min_number_of_cells_per_class(adata, condition_col=p_col, min_cells=min_cells_per_class)
+    if min_cells_per_perturbation is not None and min_cells_per_perturbation > 0:
+        logging.info(f'Filtering for at least {min_cells_per_perturbation} cells per perturbation.')
+        filter_min_number_of_cells_per_class(adata, condition_col=p_col, min_cells=min_cells_per_perturbation)
     logging.info(f'Pre-processed adata shape: {adata.shape}')
     return adata
