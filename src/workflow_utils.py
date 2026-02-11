@@ -61,6 +61,28 @@ def get_default_resources(resource_config: dict, default_key: str = 'default') -
         o['partition'] = partition
     return o
 
+def estimate_resources(file_p: str, resource_config: dict, factor: int = 2) -> str:
+    # Return dict with partition and mem
+    max_mem = resource_config['memory']['max_mem']
+    min_mem = resource_config['memory']['min_mem']
+    default_partition = resource_config['partitions']['default']
+    highmem_partition = resource_config['partitions']['high_mem']
+    # Get file size
+    bytes = os.path.getsize(file_p) * factor
+    # Convert to GB
+    gb_mem = round(bytes / 1024 ** 3)
+    # Assign partition
+    partition = default_partition if gb_mem < max_mem else highmem_partition
+    # Fall back to minimum memory if its below that
+    gb_mem = min_mem if gb_mem < min_mem else gb_mem
+    # Add gb string
+    mem_str = f'{gb_mem}GB'
+    # Return estimated resources
+    return {
+        'mem': mem_str,
+        'partition': partition
+    }
+
 def get_job_resources(resource_config: dict, job_name: str, partition_prio: str | None = None) -> dict[str, str]:
     # Check if there are resource specification for that job name
     if job_name not in resource_config['jobs']:

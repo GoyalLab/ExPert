@@ -30,10 +30,10 @@ min_deg: 5                                  # Minimum amount of differentially e
 ctrl_dev: 0.0                               # Minimum standart deviation of perturbed cells mixscale score to control
 
 ## Merge & Harmonize:
-zero_padding: false                          # Keep genes that are not overlapping with genes from other experiments (assign 0 to them)
+zero_padding: true                          # Keep genes that are not overlapping with genes from other experiments (assign 0 to them)
 correction_method: 'skip'                   # How to harmonize the data over the different experiments, can be one of: 'scANVI', 'scanorama', 'harmonypy', 'skip'
 merge_method: 'dask'                        # Whether to merge on-disk (dask) or in memory (memory)
-var_merge: 'intersection'                   # Choose intersection or union of genes for merged dataset
+var_merge: 'union'                   # Choose intersection or union of genes for merged dataset
 ## Pre-computed embeddings
 gene_embedding: ''                          # Set path to gene embedding to add to meta-set, will be used to describe perturbations
 context_embedding: ''                       # Set path to context embedding TODO: (scTab will be used by default)

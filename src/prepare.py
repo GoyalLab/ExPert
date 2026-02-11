@@ -63,7 +63,7 @@ def prepare_merge(input_pth: str, pool_genes: Iterable[str], out: str, zero_pad:
         adata.obs_names = adata.obs_names + ';' + name
         adata.obs['dataset'] = name
         # subset to pre-calculated gene pool
-        adata = _filter(adata, name, pool_genes, zero_pad=zero_pad)
+        adata = _filter(adata, name, pool_genes)
         # Convert adata.X to csr
         if not isinstance(adata.X, sp.csr_matrix):
             logging.info('Converting to CSR matrix.')

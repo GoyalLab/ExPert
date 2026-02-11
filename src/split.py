@@ -73,6 +73,7 @@ def save_splits(
         min_mixscale: list[int] = [0, 1, 2],
         ctx_col: str = 'context',
         cls_col: str = 'cls_label',
+        **kwargs
     ) -> None:
     """Create a training dataset for each data filtering combination."""
     # Ensure output directory exists
@@ -85,7 +86,8 @@ def save_splits(
             min_cells=mc,
             min_contexts=mctx,
             min_mixscale_score=mms,
-            inplace=False
+            inplace=False,
+            **kwargs
         ).copy()
         # Save dataset to disk
         nctx = filtered.obs[ctx_col].nunique()

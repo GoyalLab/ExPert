@@ -1,5 +1,13 @@
 import os
-from src.workflow_utils import load_configs, get_param_hash, save_config, read_data_sheet, check_config, get_job_resources
+from src.workflow_utils import (
+    load_configs, 
+    get_param_hash, 
+    save_config, 
+    read_data_sheet, 
+    check_config, 
+    get_job_resources,
+    estimate_resources
+)
 from src.statics import DATA_SHEET_KEYS
 import numpy as np
 
@@ -168,8 +176,16 @@ if config['mixscale_filter']:
             min_deg = config['min_deg'],
         resources:
             time = config['resources']['jobs']['filter_cells_by_efficiency']['time'],
-            mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
-            partition = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.PARTITION],
+            mem = lambda wc: estimate_resources(
+                os.path.join(PROCESS_DIR, f"{wc.dataset}.h5ad"),
+                resource_config=config["resources"],
+                factor=6
+            )['mem'],
+            partition = lambda wc: estimate_resources(
+                os.path.join(PROCESS_DIR, f"{wc.dataset}.h5ad"),
+                resource_config=config["resources"],
+                factor=6
+            )['partition'],
             cpus_per_task = int(config['resources']['jobs']['filter_cells_by_efficiency'].get('threads', 1)),
         shell:
             """
@@ -232,8 +248,16 @@ rule prepare_dataset:
         kwargs = config,
     resources:
         time = config['resources']['jobs']['prepare_dataset']['time'],
-        mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
-        partition = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.PARTITION],
+        mem = lambda wc: estimate_resources(
+            os.path.join(FILTER_DIR, f"{wc.dataset}.h5ad"),
+            resource_config=config["resources"],
+            factor=2
+        )['mem'],
+        partition = lambda wc: estimate_resources(
+            os.path.join(FILTER_DIR, f"{wc.dataset}.h5ad"),
+            resource_config=config["resources"],
+            factor=2
+        )['partition'],
     script:
         "workflow/scripts/prepare_dataset.py"
 

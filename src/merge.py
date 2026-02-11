@@ -129,7 +129,7 @@ def merge(input_pths, out_pth: str, obs: pd.DataFrame, var: pd.DataFrame, method
     if method == 'dask':
         metaset = _dask_vstack(input_pths, obs=obs, var=var)
         logging.info(f'Saving metaset AnnData to {out_pth}')
-        metaset.write_h5ad(out_pth, compression='gzip')
+        metaset.write_h5ad(out_pth)
     elif method=='on_disk':
         _on_disk(input_pths, out_pth, obs=obs, var=var)
     elif method=='in_memory':

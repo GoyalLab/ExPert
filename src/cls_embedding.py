@@ -160,11 +160,12 @@ class EmbeddingProcessor:
         
     def _add_emb_to_varm(self, adata: ad.AnnData, raw_emb: pd.DataFrame):
         """Add embedding to .varm for feature annotation"""
+        logging.info('Adding gene embeddings to .varm')
         # Check if embedding is not directional
         self.assert_not_directional()
         """Add embedding to .varm for feature annotation"""
-        # Filter genes for embeddings genes
-        adata = adata[:,adata.var_names.intersection(raw_emb.index)].copy()
+        # Filter genes for embedding genes
+        adata._inplace_subset_var(adata.var_names.intersection(raw_emb.index))
         # Add gene embedding to .obsm
         adata.varm[self.gene_embedding_varm_key] = raw_emb.loc[adata.var_names,:]
         # Add names to dimensions
@@ -270,7 +271,7 @@ class EmbeddingProcessor:
         self._add_direction_to_emb(adata)
         logging.info(f'Adding embedding to adata.')
         self._add_emb_to_uns(adata)
-        logging.info(f'Removin empty cells or genes from adata.')
+        logging.info(f'Removing empty cells or genes from adata.')
         # Remove genes with no counts (zero-padded)
         sc.pp.filter_genes(adata, min_counts=1)
         sc.pp.filter_cells(adata, min_counts=1)
