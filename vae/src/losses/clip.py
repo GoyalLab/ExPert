@@ -245,6 +245,7 @@ def loss(
     reduction: str = 'mean',
     training: bool = True,
     n_unseen: int = 0,
+    weight_tau: float = 1.0,
 ):
     # Flatten class labels
     y = y.flatten()
@@ -300,6 +301,17 @@ def loss(
     loss_z2c = hard_negative_ce(
         logits, targets, k, label_smoothing
     )
+    
+    # Weight logits based on margin to others (certainty)
+    if training and weight_tau > 0:
+        with torch.no_grad():
+            pos = logits.gather(1, targets.unsqueeze(1)).squeeze(1)
+            top2 = torch.topk(logits, k=2, dim=-1).values
+            neg = torch.where(top2[:, 0] == pos, top2[:, 1], top2[:, 0])
+            margin_vals = pos - neg
+            weights = torch.sigmoid(margin_vals * weight_tau)
+        # Update cell loss based on margin to others
+        loss_z2c = loss_z2c * weights
 
     # ---------- reverse ----------
     if use_reverse and inv is not None:

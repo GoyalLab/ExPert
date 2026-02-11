@@ -909,9 +909,17 @@ class SplitEncoder(nn.Module):
         var_eps: float = 1e-4,
         var_activation: Callable | None = None,
         use_funnel_zlocal: bool = True,
+        feature_masks: torch.Tensor | None = None,
         **kwargs,
     ):
         super().__init__()
+        
+        # Double input dimension if we are using input masks
+        self.use_feature_masks = feature_masks is not None
+        if self.use_feature_masks:
+            n_input = int(n_input * 2)
+            # Save feature masks as buffer
+            self.register_buffer("feature_masks", feature_masks)
 
         # -------------------------
         # Global path (reconstruction)
@@ -971,8 +979,12 @@ class SplitEncoder(nn.Module):
 
         return C ** 2
 
-
-    def forward(self, x: torch.Tensor, *cat_list, g: torch.Tensor, **kwargs):
+    def forward(self, x: torch.Tensor, *cat_list, g: torch.Tensor | None = None, ctx_label: torch.Tensor | None = None, **kwargs):
+        # Use feature masks if given and enabled
+        if self.use_feature_masks and ctx_label is not None:
+            feat_mask = self.feature_masks[ctx_label.flatten()]
+            x_masked = x * feat_mask
+            x = torch.cat([x_masked, feat_mask], dim=-1)
         # ---- global (decoder) ----
         h_g = self.global_encoder(x, *cat_list)
         mu_g = self.global_mu(h_g)

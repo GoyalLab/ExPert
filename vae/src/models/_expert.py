@@ -140,6 +140,7 @@ class ExPert(
             cls_text_dict=self.cls_text_dict,
             ctrl_class_idx=self.ctrl_class_idx,
             ctx_emb=self.ctx_emb,
+            feat_masks=self.feat_masks,
             dropout_rate=dropout_rate,
             n_continuous_cov=self.summary_stats.get('n_extra_continuous_covs', 0),
             n_cats_per_cov=n_cats_per_cov,
@@ -170,10 +171,7 @@ class ExPert(
         if self.ctrl_class is not None and self.ctrl_class_idx is not None:
             self._model_summary_string += f"\nctrl_class: {self.ctrl_class}\n"
         
-    def _setup(self):
-        """Setup adata for training. Prepare embeddings."""
-        # Initialize both embeddings as None
-        self.gene_emb, self.cls_emb = None, None
+    def _setup_gene_emb(self):
         # Assign gene embedding
         if self.use_gene_emb:
             # Get gene embedding from adata
@@ -190,12 +188,51 @@ class ExPert(
                 gene_emb = gene_emb.todense()
             # Convert to tensor
             self.gene_emb = io.to_tensor(gene_emb)
-
+            
+    def _setup_feature_masks(self):
+        # Add feature mask if given
+        feat_masks_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.FEAT_MASK_KEY, {})
+        self.feat_masks = None
+        if len(feat_masks_registry) == 0:
+            return
+        # Get registry keys for context embedding in adata
+        ext_feat_mask_key = feat_masks_registry.get('original_key')
+        feat_mask_key = feat_masks_registry['data_registry'].get('attr_key') if ext_feat_mask_key is None else ext_feat_mask_key
+        # Get the matrix from .uns and check type
+        feat_masks = self.adata.uns[feat_mask_key]
+        if not isinstance(feat_masks, np.ndarray):
+            raise ValueError(f'Feature mask has to be an np.ndarray with contexs as index, got {feat_masks.__class__}.')
+        # Get mask indices from .uns if they exist
+        feat_mask_idx = self.adata.uns.get(REGISTRY_KEYS.FEAT_MASK_IDX_KEY)
+        if feat_mask_idx is None:
+            raise KeyError(f'Missing feature mask index in adata.uns[{REGISTRY_KEYS.FEAT_MASK_IDX_KEY}]')
+        # Ensure ordering is the same as index to batch order
+        ordered_masks = []
+        # Check each batch index
+        for batch_idx in range(len(self.idx_to_batch)):
+            dataset_name = self.idx_to_batch.iloc[batch_idx]
+            # Error if training data index is missing in feature mask index
+            if dataset_name not in feat_mask_idx:
+                raise KeyError(f"Batch '{dataset_name}' not found in feature mask index.")
+            # Match indices
+            mask_row_idx = feat_mask_idx[dataset_name]
+            ordered_masks.append(feat_masks[mask_row_idx])
+        # Stack masks
+        ordered_masks = np.stack(ordered_masks)
+        # Final shape sanity check
+        if ordered_masks.shape[0] != len(self.idx_to_batch):
+            raise RuntimeError("Feature mask ordering mismatch with batch mapping.")
+        # Store as tensor
+        self.feat_masks = torch.tensor(ordered_masks, dtype=torch.float32)
+            
+    def _setup_batch_labels(self):
         # Assign batch labels
         batch_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY)
         self.original_batch_key = batch_state_registry.original_key
         self._batch_mapping = batch_state_registry.categorical_mapping
         self.idx_to_batch = pd.Series(self._batch_mapping)
+
+    def _setup_ctx_emb(self):
         # Add context embedding if given
         ctx_emb_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CTX_EMB_KEY, {})
         self.ctx_emb = None
@@ -204,12 +241,12 @@ class ExPert(
             # Get registry keys for context embedding in adata
             ext_ctx_emb_key = ctx_emb_registry.get('original_key')
             ctx_emb_key = ctx_emb_registry['data_registry'].get('attr_key') if ext_ctx_emb_key is None else ext_ctx_emb_key
+            # Extract context embedding from adata
+            ctx_emb: pd.DataFrame = self.adata.uns[ctx_emb_key]
             # Get the embedding from adata and check if it's a dataframe
             if not isinstance(self.adata.uns[ctx_emb_key], pd.DataFrame):
                 raise ValueError(f'Context embedding has to be a dataframe with contexs as index, got {ctx_emb.__class__}.')
 
-            # Extract context embedding from adata
-            ctx_emb: pd.DataFrame = self.adata.uns[ctx_emb_key]
             # Get observed and unobserved context labels
             _obs_contexts_mask = self.idx_to_batch.isin(ctx_emb.index)
             if _obs_contexts_mask.sum() != self.idx_to_batch.shape[0]:
@@ -224,127 +261,139 @@ class ExPert(
             # Convert to tensor
             self.ctx_emb = io.to_tensor(ctx_emb)
             
-        # Assign class embedding
+    def _setup_labels(self):
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
         self._label_mapping = labels_state_registry.categorical_mapping
-        self.n_unseen_labels = None
         self._code_to_label = dict(enumerate(self._label_mapping))
-        # Check if adata has an external class embedding registered
-        cls_emb_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CLS_EMB_KEY, {})
+        self.idx_to_label = np.array(self._label_mapping)
+        self.n_labels = len(self._label_mapping)
+
+    def _setup_class_embeddings(self):
+        cls_emb_registry = self.adata_manager.registry["field_registries"].get(
+            REGISTRY_KEYS.CLS_EMB_KEY, {}
+        )
+
         if len(cls_emb_registry) == 0:
-            raise ValueError('ExPert requires class embeddings to be registered.')
-        # Get adata.uns key for embedding, fall back to attribute key if no original key is given
-        ext_cls_emb_key = cls_emb_registry.get('original_key')
-        cls_emb_key = cls_emb_registry['data_registry'].get('attr_key') if ext_cls_emb_key is None else ext_cls_emb_key
-        # Check if adata has already been registered with this model class
-        if REGISTRY_KEYS.CLS_EMB_INIT in self.adata.uns and self._name == self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.MODEL_KEY]:
-            log.info(f'Adata has already been initialized with {self.__class__}, loading model settings from adata.')
-            # Set to embeddings found in adata
-            self.cls_emb = io.to_tensor(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
-            self.cls_sim = io.to_tensor(self.adata.uns.get(REGISTRY_KEYS.CLS_SIM_KEY))
-            # Init train embeddings from adata
-            self.n_train_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY]
-            self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
-            if self.cls_sim is not None:
-                self.train_cls_sim = self.cls_sim[:self.n_train_labels,:self.n_train_labels]
-            else:
-                self.train_cls_sim = None
-            # Set indices
-            self.idx_to_label = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT][EXT_CLS_EMB_INIT.LABELS_KEY])
-            # Set control class index
-            self.ctrl_class = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT].get(EXT_CLS_EMB_INIT.CTRL_CLASS_KEY)
-            self.ctrl_class_idx = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT].get(EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY)
-        else:
-            # Register adata's class embedding with this model
-            cls_emb: pd.DataFrame = self.adata.uns[cls_emb_key]
-            if not isinstance(cls_emb, pd.DataFrame):
-                raise ValueError(f'Class embedding has to be a dataframe with labels as index, got {cls_emb.__class__}.')
-            # Order external embedding to match label mapping and convert to csr matrix
-            _label_series = pd.Series(self._code_to_label.values())
-            _label_overlap = _label_series.isin(cls_emb.index)
-            _shared_labels = _label_series[_label_overlap].values
-            _unseen_labels = cls_emb.index.difference(_shared_labels)
-
-            # Remove control embedding if given
-            ctrl_class_idx_matches = np.where(_label_series==self.ctrl_class)[0]
-            ctrl_exists_in_data = len(ctrl_class_idx_matches) > 0
-            if not ctrl_exists_in_data:
-                log.warning(f'Specified control label {self.ctrl_class} is not in adata class labels, ignoring parameter.')
-            if self.ctrl_class is not None and ctrl_exists_in_data:
-                # Find control index
-                self.ctrl_class_idx = ctrl_class_idx_matches[0]
-                # Create empty embedding for control
-                if self.ctrl_class not in _shared_labels:
-                    log.info(f'Adding empty control external class embedding, will be learned by model.')
-                    # Create empty embedding at last slot
-                    dummy_emb = pd.DataFrame(np.zeros((1, cls_emb.shape[-1])), index=[self.ctrl_class], columns=cls_emb.columns)
-                    # Add dummy embedding as 
-                    _shared_cls_emb = cls_emb.loc[_shared_labels]
-                    _unseen_cls_emb = cls_emb.loc[_unseen_labels]
-                    cls_emb = pd.concat((_shared_cls_emb, dummy_emb, _unseen_cls_emb), axis=0)
-                    # Set control index to first embedding index
-                    _shared_labels = np.concatenate((
-                        np.array(_shared_labels), np.array([self.ctrl_class])
-                    ))
-                else:
-                    log.info(f'Overwriting existing external control class embedding, will be learned by model.')
-                # Reset label overlap
-                _label_overlap = _label_series.isin(_shared_labels)
-            else:
-                # Set no label as control class
-                self.ctrl_class_idx = None
-            
-            self.n_train_labels = _shared_labels.shape[0]
-            self.n_unseen_labels = _unseen_labels.shape[0]
-            n_missing = _label_overlap.shape[0] - _label_overlap.sum()
-            if n_missing > 0:
-                raise ValueError(f'Found {n_missing} missing labels in external class embedding: {_label_series[~_label_overlap]}')
-            # Re-order embedding: first training labels then rest
-            cls_emb = pd.concat([cls_emb.loc[_shared_labels], cls_emb.loc[_unseen_labels]], axis=0)
-            # Set gene embedding as class parameter
-            self.cls_emb = torch.tensor(cls_emb.values, dtype=torch.float32)
+            self.cls_emb = None
+            self.train_cls_emb = None
             self.cls_sim = None
-            # Save in adata for caching
-            self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = self.cls_emb
-            # Save train embeddings and similarities as class parameters
-            self.train_cls_emb = self.cls_emb[:self.n_train_labels,:]
             self.train_cls_sim = None
-            # Get full list of perturbations for embedding
-            self.idx_to_label = cls_emb.index.values
-            # Save registration with this model
-            self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT] = {
-                EXT_CLS_EMB_INIT.MODEL_KEY: self._name,
-                EXT_CLS_EMB_INIT.LABELS_KEY: self.idx_to_label,
-                EXT_CLS_EMB_INIT.N_TRAIN_LABELS_KEY: self.n_train_labels, 
-                EXT_CLS_EMB_INIT.N_UNSEEN_LABELS_KEY: self.n_unseen_labels,
-                EXT_CLS_EMB_INIT.CTRL_CLASS_KEY: self.ctrl_class,
-                EXT_CLS_EMB_INIT.CTRL_CLASS_IDX_KEY: self.ctrl_class_idx,
-            }
-        # Order class texts according to model
-        if self.use_raw_text:
-            # Sort text dictionary
-            _obs_keys, _unobs_keys = [], []
-            for k in self.cls_text_dict:
-                if k in self._label_mapping:
-                    _obs_keys.append(k)
-                else:
-                    _unobs_keys.append(k)
-            # Check if all classes are in texts
-            if len(_obs_keys) != self.n_labels:
-                raise ValueError(f'Text descriptions are missing classes.')
-            # Sort keys
-            _obs_keys = sorted(_obs_keys)
-            _unobs_keys = sorted(_unobs_keys)
-            # Combine keys
-            _obs_keys.extend(_unobs_keys)
-            # Sort dictionary
-            self.cls_text_dict = {k: self.cls_text_dict[k] for k in _obs_keys}
-            self.idx_to_label = np.array([*self.cls_text_dict.keys()])
-            log.info(f'Registered {len(self.cls_text_dict)} class texts.')
-        # Set embedding dimension
-        self.ext_class_embed_dim = self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY].shape[1]
+            self.n_train_labels = self.n_labels
+            self.n_unseen_labels = 0
+            return
 
+        ext_key = cls_emb_registry.get("original_key")
+        cls_emb_key = (
+            cls_emb_registry["data_registry"].get("attr_key")
+            if ext_key is None
+            else ext_key
+        )
+
+        cls_emb_df = self.adata.uns[cls_emb_key]
+        if not isinstance(cls_emb_df, pd.DataFrame):
+            raise ValueError("Class embedding must be a DataFrame.")
+
+        # Align embedding to label order
+        label_series = pd.Series(self.idx_to_label)
+        shared = label_series[label_series.isin(cls_emb_df.index)].values
+        unseen = cls_emb_df.index.difference(shared).values
+
+        if len(shared) != len(label_series):
+            missing = label_series[~label_series.isin(shared)]
+            raise ValueError(f"Missing labels in embedding: {missing}")
+
+        ordered_df = pd.concat(
+            [cls_emb_df.loc[shared], cls_emb_df.loc[unseen]], axis=0
+        )
+
+        self.cls_emb = torch.tensor(ordered_df.values, dtype=torch.float32)
+        self.train_cls_emb = self.cls_emb[: len(shared)]
+        self.cls_sim = None
+        self.train_cls_sim = None
+
+        self.n_train_labels = len(shared)
+        self.n_unseen_labels = len(unseen)
+        self.idx_to_label = ordered_df.index.values
+
+        self.ext_class_embed_dim = self.cls_emb.shape[1]
+        
+    def _setup_class_texts(self):
+        if not self.use_raw_text:
+            self.cls_text_dict = None
+            return
+
+        if self.cls_text_dict is None:
+            raise ValueError("Raw text mode enabled but no text dictionary provided.")
+
+        observed = [k for k in self.cls_text_dict if k in self._label_mapping]
+        unseen = [k for k in self.cls_text_dict if k not in self._label_mapping]
+
+        if len(observed) != self.n_labels:
+            raise ValueError("Missing class texts for observed labels.")
+
+        ordered_keys = sorted(observed) + sorted(unseen)
+        self.cls_text_dict = {k: self.cls_text_dict[k] for k in ordered_keys}
+
+        self.idx_to_label = np.array(ordered_keys)
+        self.n_train_labels = len(observed)
+        self.n_unseen_labels = len(unseen)
+
+        log.info(f"Registered {len(self.cls_text_dict)} class texts.")
+        
+    def _setup_control_class(self):
+        self.ctrl_class_idx = None
+
+        if self.ctrl_class is None:
+            return
+
+        # Ensure labels exist
+        if self.idx_to_label is None:
+            raise RuntimeError("Labels must be initialized before setting control class.")
+
+        matches = np.where(self.idx_to_label == self.ctrl_class)[0]
+
+        if len(matches) == 0:
+            log.warning(
+                f"Specified control class '{self.ctrl_class}' not found in labels. Ignoring."
+            )
+            self.ctrl_class = None
+            return
+
+        self.ctrl_class_idx = int(matches[0])
+
+        # Optional: if embeddings exist and control embedding should be learned
+        if self.cls_emb is not None:
+            if self.ctrl_class_idx >= self.n_train_labels:
+                log.info(
+                    "Control class is not in training labels; embedding will be learned."
+                )
+
+        log.info(
+            f"Registered control class '{self.ctrl_class}' at index {self.ctrl_class_idx}."
+        )
+
+    def _setup(self):
+        """Setup adata for training. Prepare embeddings."""
+        # Initialize both embeddings as None
+        self.gene_emb, self.cls_emb = None, None
+        # Setup gene embedding
+        self._setup_gene_emb()
+        # Setup batch labels
+        self._setup_batch_labels()
+        # Setup feature masks
+        self._setup_feature_masks()
+        # Setup context embedding
+        self._setup_ctx_emb()
+        # Setup class labels
+        self._setup_labels()
+        # Setup class embeddings
+        self._setup_class_embeddings()
+        # Setup class texts
+        self._setup_class_texts()
+        # Setup control class
+        self._setup_control_class()
+        
     def print_summary(self, max_depth: int = 3) -> None:
         """Print overview of module"""
         from pytorch_lightning.utilities.model_summary import ModelSummary
@@ -674,6 +723,7 @@ class ExPert(
             labels. Otherwise, uses a sample from the posterior distribution - this
             means that the predictions will be stochastic.
         """
+        # TODO: adjust feature mask if model was trained with it!!
         from tqdm import tqdm
         # Check if model has been trained
         self._check_if_trained(warn=False)
@@ -702,7 +752,6 @@ class ExPert(
         # Use model's context labels and embedding
         else:
             ctx_labels = self.idx_to_batch
-            ctx_emb = self.module.ctx_emb.weight
         # Use new class embedding at inference
         if cls_emb is not None:
             log.info(f'Using new class embedding: {cls_emb.shape}')
@@ -710,7 +759,6 @@ class ExPert(
         # Use model's class labels and embedding
         else:
             cls_labels = self.idx_to_label
-            cls_emb = self.module.cached_cls_emb
    
         # Add control embedding
         if self.module.ctrl_class_idx is not None:
@@ -1787,6 +1835,7 @@ class ExPert(
         context_emb_uns_key: str | None = 'ctx_embedding',
         class_emb_uns_key: str | None = 'cls_embedding',
         gene_emb_varm_key: str | None = None,
+        feature_mask_uns_key: str | None = None,
         size_factor_key: str | None = None,
         cast_to_csr: bool = True,
         raw_counts: bool = True,
@@ -1823,6 +1872,10 @@ class ExPert(
         if gene_emb_varm_key is not None and gene_emb_varm_key in adata.varm:
             log.info(f'Registered gene embedding from adata.varm[{gene_emb_varm_key}].')
             anndata_fields.append(VarmField(REGISTRY_KEYS.GENE_EMB_KEY, gene_emb_varm_key))
+        # Add dataset-specific feature masks
+        if feature_mask_uns_key is not None and feature_mask_uns_key in adata.uns:
+            log.info(f'Registered gene embedding from adata.uns[{feature_mask_uns_key}].')
+            anndata_fields.append(StringUnsField(REGISTRY_KEYS.FEAT_MASK_KEY, feature_mask_uns_key))
         # Register latent fields of adata is minified
         adata_minify_type = _get_adata_minify_type(adata)
         if adata_minify_type is not None:

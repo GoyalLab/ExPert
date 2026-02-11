@@ -72,6 +72,7 @@ class XPert(VAE):
         cls_sim: torch.Tensor | None = None,
         cls_text_dict: dict | None = None,
         ctrl_class_idx: int | None = None,
+        feat_masks: torch.Tensor | None = None,
         use_adapter: bool = False,
         use_reconstruction_control: bool = False,
         use_kl_control: bool = False,
@@ -183,13 +184,24 @@ class XPert(VAE):
         self.use_decoded_augmentation = use_decoded_augmentation
         self.shuffle_context = shuffle_context
 
+        # Setup feature masks
+        if feat_masks is not None:
+            self.register_buffer('feat_masks', feat_masks)
+        else:
+            self.feat_masks = None
+        
         # Setup external embeddings
         self.ctx_emb = torch.nn.Embedding.from_pretrained(ctx_emb, freeze=True) if ctx_emb is not None else None
         self.use_adapter = use_adapter
         if use_adapter and not link_latents:
             extra_cls_emb_kwargs['n_output'] = n_latent
-        self.pretrained_emb = cls_emb
-        self.cls_emb = ClassEmbedding(pretrained_emb=cls_emb, class_texts=cls_text_dict, **extra_cls_emb_kwargs)
+        # Setup class embedding
+        if cls_emb is not None or cls_text_dict is not None:
+            self.cls_emb = ClassEmbedding(pretrained_emb=cls_emb, class_texts=cls_text_dict, **extra_cls_emb_kwargs)
+            self.n_cls, self.n_cls_dim = self.cls_emb.shape
+        else:
+            self.cls_emb = None
+            self.n_cls, self.n_cls_dim = 0, 0
         self.cls_sim = torch.nn.Embedding.from_pretrained(cls_sim, freeze=True) if cls_sim is not None  else None
         # Hierarchical clustering parameters
         self.module_quantile = module_quantile
@@ -204,8 +216,6 @@ class XPert(VAE):
             self.n_ctx, self.n_ctx_dim = ctx_emb.shape
         else:
             self.n_ctx, self.n_ctx_dim = 0, 0
-        self.n_cls = self.cls_emb.shape[0]
-        self.n_cls_dim = self.cls_emb.shape[-1]
         self.use_joint = False
         # Set latent dimension to text encoder output dim
         if link_latents:
@@ -247,7 +257,8 @@ class XPert(VAE):
             'use_batch_norm': use_batch_norm_encoder,
             'use_layer_norm': use_layer_norm_encoder,
             'var_activation': var_activation,
-            'n_dim_context_emb': self.n_ctx_dim
+            'n_dim_context_emb': self.n_ctx_dim,
+            'feature_masks': feat_masks,
         }
         if encoder_type == 'default':
             encoder_cls = Encoder
@@ -2113,6 +2124,7 @@ class XPert(VAE):
         n_unseen: int = 0,
         ctx_momentum: float = 0.98,
         top_k: int = 20,
+        weight_tau: float = 1.0,
         **kwargs,
     ) -> LossOutput:
         # ---- DEBUG ----
@@ -2135,6 +2147,13 @@ class XPert(VAE):
         kl_divergence_z_mat = kl_divergence(qz, pz)
         # Calculate reconstruction loss over batch and all features
         reconst_loss_mat = -px.log_prob(x)
+        
+        # Apply feature masking to loss        
+        if self.feat_masks is not None:
+            mask_batch = self.feat_masks[ctx.flatten()]
+            reconst_loss_mat = reconst_loss_mat * mask_batch
+            valid_feat_count = mask_batch.sum(-1).clamp(min=1.0)
+        
         # Clamp KL to a minimum if option is provided
         if self.min_kl is not None:
             kl_divergence_z_mat = torch.clamp(kl_divergence_z_mat, min=self.min_kl)
@@ -2146,7 +2165,11 @@ class XPert(VAE):
         elif self.reduction == 'mean':
             kl_divergence_z = kl_divergence_z_mat.mean(-1) # (b,)
             kl_div_per_latent = kl_divergence_z_mat.mean(0) # (l,)
-            reconst_loss = reconst_loss_mat.mean(-1) * reconst_loss_mat.size(1)
+            # Normalize by valid features per cell
+            if self.feat_masks is not None:
+                reconst_loss = (reconst_loss_mat.sum(-1) / valid_feat_count) * reconst_loss_mat.size(1)
+            else:
+                reconst_loss = reconst_loss_mat.mean(-1) * reconst_loss_mat.size(1)
         else:
             raise ValueError(f'reduction has to be either "batchmean" or "mean", got {self.reduction}')
 
@@ -2323,6 +2346,7 @@ class XPert(VAE):
                 use_reverse=False,
                 T=T_align,
                 n_unseen=n_unseen,
+                weight_tau=weight_tau,
                 training=self.training,
                 reduction=self.non_elbo_reduction
             )
