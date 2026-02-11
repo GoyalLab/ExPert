@@ -87,6 +87,7 @@ class ExPert(
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         use_full_cls_emb: bool = False,
+        use_gene_emb: bool = False,
         ctrl_class: str | None = None,
         **model_kwargs,
     ):
@@ -95,8 +96,9 @@ class ExPert(
         # Save class text information for manual transformer training
         self.cls_text_dict = cls_text_dict
         self.use_raw_text = cls_text_dict is not None
-        # Fall back to transformer if raw data is provided
-        self.use_gene_emb = self.adata_manager.registry.get('field_registries', {}).get(REGISTRY_KEYS.GENE_EMB_KEY, None) is not None
+        # Check if gene embedding is in field registry and option is enabled
+        has_gene_emb = self.adata_manager.registry.get('field_registries', {}).get(REGISTRY_KEYS.GENE_EMB_KEY, None) is not None
+        self.use_gene_emb = use_gene_emb and has_gene_emb
         # Set number of classes
         self.n_labels = self.summary_stats.n_labels
         # Whether to use the full class embedding
@@ -158,7 +160,7 @@ class ExPert(
             f"n_unseen_classes: {self.n_unseen_labels}, \n"
             f"n_contexts: {n_batch}, "
             f"n_unseen_contexts: {self.n_unobs_ctx}, \n" if self.n_unobs_ctx > 0 else "\n"
-            f"use_gene_emb: {self.use_gene_emb}"
+            f"use_gene_emb: {self.use_gene_emb}, \n"
             f"use_raw_text: {self.use_raw_text}"
         )
         # Include covariate information
@@ -180,14 +182,14 @@ class ExPert(
             ext_en_kw = self._model_kwargs.get('extra_encoder_kwargs', {})
             emb_dim = gene_emb.shape[1]
             ext_en_kw['use_ext_emb'] = True
-            ext_en_kw['gene_emb_dim'] = emb_dim
+            ext_en_kw['n_dim_gene_emb'] = emb_dim
             self._model_kwargs['extra_encoder_kwargs'] = ext_en_kw
             log.info(f'Initialized gene embedding with {emb_dim} dimensions')
             # Convert to dense if sparse
             if sp.issparse(gene_emb):
                 gene_emb = gene_emb.todense()
             # Convert to tensor
-            self.gene_emb = torch.Tensor(gene_emb).T
+            self.gene_emb = io.to_tensor(gene_emb)
 
         # Assign batch labels
         batch_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY)
@@ -198,30 +200,29 @@ class ExPert(
         ctx_emb_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.CTX_EMB_KEY, {})
         self.ctx_emb = None
         self.n_unobs_ctx = 0
-        if len(ctx_emb_registry) == 0:
-            raise ValueError('ExPert requires context embeddings to be registered.')
-        # Get registry keys for context embedding in adata
-        ext_ctx_emb_key = ctx_emb_registry.get('original_key')
-        ctx_emb_key = ctx_emb_registry['data_registry'].get('attr_key') if ext_ctx_emb_key is None else ext_ctx_emb_key
-        # Get the embedding from adata and check if it's a dataframe
-        if not isinstance(self.adata.uns[ctx_emb_key], pd.DataFrame):
-            raise ValueError(f'Context embedding has to be a dataframe with contexs as index, got {ctx_emb.__class__}.')
+        if len(ctx_emb_registry) != 0:
+            # Get registry keys for context embedding in adata
+            ext_ctx_emb_key = ctx_emb_registry.get('original_key')
+            ctx_emb_key = ctx_emb_registry['data_registry'].get('attr_key') if ext_ctx_emb_key is None else ext_ctx_emb_key
+            # Get the embedding from adata and check if it's a dataframe
+            if not isinstance(self.adata.uns[ctx_emb_key], pd.DataFrame):
+                raise ValueError(f'Context embedding has to be a dataframe with contexs as index, got {ctx_emb.__class__}.')
 
-        # Extract context embedding from adata
-        ctx_emb: pd.DataFrame = self.adata.uns[ctx_emb_key]
-        # Get observed and unobserved context labels
-        _obs_contexts_mask = self.idx_to_batch.isin(ctx_emb.index)
-        if _obs_contexts_mask.sum() != self.idx_to_batch.shape[0]:
-            raise ValueError(f'Missing contexts in external context embedding. {self.idx_to_batch[~_obs_contexts_mask].values}')
-        _obs_ctx_labels = self.idx_to_batch[_obs_contexts_mask]
-        _unobs_ctx_labels = ctx_emb.index.difference(_obs_ctx_labels)
-        self.n_unobs_ctx = _unobs_ctx_labels.shape[0]
-        # Order embedding by observed contexts and unobserved after and update class variable
-        ctx_emb = pd.concat([ctx_emb.loc[_obs_ctx_labels], ctx_emb.loc[_unobs_ctx_labels]], axis=0)
-        # Set context labels appropriately
-        self.idx_to_batch = ctx_emb.index.values
-        # Convert to tensor
-        self.ctx_emb = io.to_tensor(ctx_emb)
+            # Extract context embedding from adata
+            ctx_emb: pd.DataFrame = self.adata.uns[ctx_emb_key]
+            # Get observed and unobserved context labels
+            _obs_contexts_mask = self.idx_to_batch.isin(ctx_emb.index)
+            if _obs_contexts_mask.sum() != self.idx_to_batch.shape[0]:
+                raise ValueError(f'Missing contexts in external context embedding. {self.idx_to_batch[~_obs_contexts_mask].values}')
+            _obs_ctx_labels = self.idx_to_batch[_obs_contexts_mask]
+            _unobs_ctx_labels = ctx_emb.index.difference(_obs_ctx_labels)
+            self.n_unobs_ctx = _unobs_ctx_labels.shape[0]
+            # Order embedding by observed contexts and unobserved after and update class variable
+            ctx_emb = pd.concat([ctx_emb.loc[_obs_ctx_labels], ctx_emb.loc[_unobs_ctx_labels]], axis=0)
+            # Set context labels appropriately
+            self.idx_to_batch = ctx_emb.index.values
+            # Convert to tensor
+            self.ctx_emb = io.to_tensor(ctx_emb)
             
         # Assign class embedding
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
@@ -322,8 +323,23 @@ class ExPert(
             }
         # Order class texts according to model
         if self.use_raw_text:
-            # TODO: make this work without the need for an external embedding pls
-            self.cls_text_dict = {cls: self.cls_text_dict[cls] for cls in self.idx_to_label if cls in self.cls_text_dict}
+            # Sort text dictionary
+            _obs_keys, _unobs_keys = [], []
+            for k in self.cls_text_dict:
+                if k in self._label_mapping:
+                    _obs_keys.append(k)
+                else:
+                    _unobs_keys.append(k)
+            # Check if all classes are in texts
+            if len(_obs_keys) != self.n_labels:
+                raise ValueError(f'Text descriptions are missing classes.')
+            # Sort keys
+            _obs_keys = sorted(_obs_keys)
+            _unobs_keys = sorted(_unobs_keys)
+            # Combine keys
+            _obs_keys.extend(_unobs_keys)
+            # Sort dictionary
+            self.cls_text_dict = {k: self.cls_text_dict[k] for k in _obs_keys}
             self.idx_to_label = np.array([*self.cls_text_dict.keys()])
             log.info(f'Registered {len(self.cls_text_dict)} class texts.')
         # Set embedding dimension
@@ -633,7 +649,7 @@ class ExPert(
         adata: AnnData | None = None,
         indices: Sequence[int] | None = None,
         batch_size: int | None = None,
-        use_posterior_mean: bool | None = None,
+        use_posterior_mean: bool = True,
         ctx_emb: torch.Tensor | None = None,
         cls_emb: torch.Tensor | None = None,
         return_latents: bool = True,
@@ -719,6 +735,8 @@ class ExPert(
         # Collect batch labels
         data_ctx_labels = []
         data_cls_labels = []
+        # Collect predictions
+        predictions = []
         # Add progress bar to classification if toggled
         if progress_bar:
             dl_it = tqdm(enumerate(scdl), unit='batch')
@@ -759,23 +777,31 @@ class ExPert(
                     cls_emb=cls_emb,
                     return_logits=True
                 )
+
+                # Check if there are predictions in the output
+                if PREDICTION_KEYS.PREDICTION_KEY in cls_output:
+                    predictions.extend(cls_output[PREDICTION_KEYS.PREDICTION_KEY].flatten().cpu().numpy())
                 # Get regular classifier logits
                 _z_cls_logits = cls_output['logits'].cpu()
                 # Unpack context and perturbation classification output
-                _ctx_logits = cls_output[MODULE_KEYS.CTX_LOGITS_KEY].cpu()
+                if MODULE_KEYS.CTX_LOGITS_KEY in cls_output:
+                    _ctx_logits = cls_output[MODULE_KEYS.CTX_LOGITS_KEY].cpu()
+                    ctx_logits.append(_ctx_logits)
+                # Add classification output
                 _cls_logits = cls_output[MODULE_KEYS.CLS_LOGITS_KEY].cpu()
+                cls_logits.append(_cls_logits)
                 # Add batch predictions to overall predictions
                 z_cls_logits.append(_z_cls_logits)
-                ctx_logits.append(_ctx_logits)
-                cls_logits.append(_cls_logits)
                 # Unpack shared latent spaces
                 _z = cls_output[MODULE_KEYS.Z_KEY].cpu()
                 _z_shared = cls_output[MODULE_KEYS.Z_SHARED_KEY].cpu()
-                _ctx2z = cls_output[MODULE_KEYS.CTX_PROJ_KEY].cpu()
+                # Check projections
+                if MODULE_KEYS.CTX_PROJ_KEY in cls_output:
+                    _ctx2z = cls_output[MODULE_KEYS.CTX_PROJ_KEY].cpu()
+                    ctx2z.append(_ctx2z)
                 _cls2z = cls_output[MODULE_KEYS.CLS_PROJ_KEY].cpu()
                 zs.append(_z)
                 z_shared.append(_z_shared)
-                ctx2z.append(_ctx2z)
                 cls2z.append(_cls2z)
                 # Collect labels
                 if batch is not None:
@@ -789,11 +815,16 @@ class ExPert(
         log.info(f'Aggregating predictions')
         # Concatenate batch results
         z_cls_logits = torch.cat(z_cls_logits).numpy()
-        ctx_logits = torch.cat(ctx_logits).numpy()
+        if ctx_logits:
+            ctx_logits = torch.cat(ctx_logits).numpy()# Set nans to 0s
+            ctx_logits = np.nan_to_num(ctx_logits, -np.inf)
+        # Concatenate batched logits and replace nans
         cls_logits = torch.cat(cls_logits).numpy()
+        cls_logits = np.nan_to_num(cls_logits, -np.inf)
         zs = torch.cat(zs).numpy()
         z_shared = torch.cat(z_shared).numpy()
-        ctx2z = torch.stack(ctx2z, dim=0).mean(0).numpy()
+        if ctx2z:
+            ctx2z = torch.stack(ctx2z, dim=0).mean(0).numpy()
         cls2z = torch.stack(cls2z, dim=0).mean(0).numpy()
         # Map indices back to labels
         ctx_ls, cls_ls = None, None
@@ -803,14 +834,11 @@ class ExPert(
         if data_cls_labels:
             data_cls_labels = torch.cat(data_cls_labels).numpy()
             cls_ls = cls_labels[data_cls_labels]
-
-        # Set nans to 0s
-        ctx_logits = np.nan_to_num(ctx_logits, -np.inf)
-        cls_logits = np.nan_to_num(cls_logits, -np.inf)
         
         # Subset to observed classes only
         if obs_only:
-            ctx_logits = ctx_logits[:,:self.module.n_batch]
+            if ctx_logits:
+                ctx_logits = ctx_logits[:,:self.module.n_batch]
             cls_logits = cls_logits[:,:self.module.n_labels]
 
         # Add classifier predictions
@@ -822,12 +850,17 @@ class ExPert(
         z_cls_predictions = z_cls_soft_predictions.columns[np.argmax(z_cls_soft_predictions.values, axis=-1)]
 
         # Add context predictions
-        ctx_soft_predictions = pd.DataFrame(
-            ctx_logits,
-            columns=ctx_labels[:ctx_logits.shape[-1]],
-            index=adata.obs_names[indices],
-        )
-        ctx_predictions = ctx_soft_predictions.columns[np.argmax(ctx_soft_predictions.values, axis=-1)]
+        if ctx_logits:
+            ctx_soft_predictions = pd.DataFrame(
+                ctx_logits,
+                columns=ctx_labels[:ctx_logits.shape[-1]],
+                index=adata.obs_names[indices],
+            )
+            ctx_predictions = ctx_soft_predictions.columns[np.argmax(ctx_soft_predictions.values, axis=-1)]
+        else:
+            # Set empty placeholders
+            ctx_soft_predictions, ctx_predictions = None, ''
+
         # Add class predictions
         cls_soft_predictions = pd.DataFrame(
             cls_logits,
@@ -835,6 +868,9 @@ class ExPert(
             index=adata.obs_names[indices],
         )
         cls_predictions = cls_soft_predictions.columns[np.argmax(cls_soft_predictions.values, axis=-1)]
+        # Overwrite predictions if they are given by batch
+        if predictions:
+            cls_predictions = cls_soft_predictions.columns[np.array(predictions)]
         
         # Return all model predictions
         o = {
@@ -1078,8 +1114,13 @@ class ExPert(
             # Get adata slot
             attr_key = reg.get('data_registry', {}).get('attr_key', '')
             slot = reg.get('data_registry', {}).get('attr_name', '')
+            # Handle library size factor
+            if field == REGISTRY_KEYS.SIZE_FACTOR_KEY:
+                if attr_key not in adata.obs and attr_key is not None and attr_key != '':
+                    log.info(f'Adding placeholder for missing .obs[{attr_key}]')
+                    adata.obs[attr_key] = 1.0
             # Handle extra covariates
-            if field == REGISTRY_KEYS.CAT_COVS_KEY:
+            elif field == REGISTRY_KEYS.CAT_COVS_KEY:
                 cat_covs = reg.get('state_registry').get('field_keys', [])
                 for catc in cat_covs:
                     if catc not in adata.obs:
@@ -1094,7 +1135,7 @@ class ExPert(
             # Handle .obs fields
             elif slot == 'obs':
                 # Pick first value
-                val = reg['state_registry']['categorical_mapping'][0]
+                val = reg['state_registry'].get('categorical_mapping', [None])[0]
                 key = reg['state_registry']['original_key']
                 if key not in adata.obs:
                     log.info(f'Added placeholder for missing .obs[{key}]')
@@ -1298,7 +1339,8 @@ class ExPert(
         po = self.predict(return_latents=True)
         # Save context predictions
         self.adata.obs[PREDICTION_KEYS.CTX_PREDICTION_KEY] = po[PREDICTION_KEYS.CTX_PREDICTION_KEY]
-        self.adata.obsm[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY]
+        if PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY in po and po[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY] is not None:
+            self.adata.obsm[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY] = po[PREDICTION_KEYS.CTX_SOFT_PREDICTION_KEY]
         # Save regular classification predictions to model adata
         if self.module.align_ext_emb_loss_strategies is None or use_z:
             # Use classifier predictions
@@ -1313,7 +1355,8 @@ class ExPert(
         # Register aligned latent spaces with model's adata
         self.adata.obsm[self._LATENT_Z_KEY] = po[MODULE_KEYS.Z_KEY]
         self.adata.obsm[self._LATENT_Z_SHARED_KEY] = po[MODULE_KEYS.Z_SHARED_KEY]
-        self.adata.uns[self._LATENT_CTX_PROJ_KEY] = po[MODULE_KEYS.CTX_PROJ_KEY]
+        if MODULE_KEYS.CTX_PROJ_KEY in po and po[MODULE_KEYS.CTX_PROJ_KEY] is not None:
+            self.adata.uns[self._LATENT_CTX_PROJ_KEY] = po[MODULE_KEYS.CTX_PROJ_KEY]
         self.adata.uns[self._LATENT_CLS_PROJ_KEY] = po[MODULE_KEYS.CLS_PROJ_KEY]
         # Calculate top N predictions over model data
         self._register_top_n_predictions()

@@ -32,7 +32,12 @@ class FCParams(NamedTuple):
     N_HIDDEN: int = 128
     N_LAYERS: int = 1
     DROPOUT: float = 0.1
-
+    
+def mean_pairwise_cosine(z):
+    z = F.normalize(z, dim=-1)
+    sim = z @ z.T
+    B = z.size(0)
+    return (sim.sum() - B) / (B * (B - 1))
 
 def zscore(x: torch.Tensor, dim: int = -1, eps: float = 1e-8):
     mu = x.mean(dim=dim, keepdim=True)

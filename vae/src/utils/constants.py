@@ -83,6 +83,8 @@ class _MODULE_KEYS(NamedTuple):
     R2_VAR_KEY: str = "r2_var"
     # prediction
     PREDICTION_KEY: str = "cls_prediction"
+    # augmentation
+    AUG_KEY: str = "aug_batch"
 
 class _TRAINING_KEYS_NT(NamedTuple):
     MODEL_KEY: str = "model"

@@ -81,7 +81,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         weight_decay: float = 1e-6,
         n_steps_warmup: int | None = None,
         n_epochs_warmup: int | None = 400,
-        reduce_lr_on_plateau: bool = False,
+        reduce_lr_on_plateau: bool = True,
         lr_factor: float = 0.6,
         lr_patience: int = 30,
         lr_threshold: float = 0.0,
@@ -92,11 +92,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         compile_kwargs: dict | None = None,
         average: str = "macro",
         top_k: int = 1,
+        auto_temperature_args: dict | None = None,
         use_posterior_mean: Literal["train", "val", "both"] | None = "val",
         log_class_distribution: bool = False,
         freeze_modules: dict[str, float] | None = None,
         freeze_encoder_epoch: int | None = None,
         freeze_decoder_epoch: int | None = None,
+        soft_freeze_lr: float | None = None,
         gene_emb: torch.Tensor | None = None,
         anneal_schedules: dict[str, dict[str | float]] | None = None,
         multistage_kl_frac: float = 0.1,
@@ -104,19 +106,32 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         use_local_stage_warmup: bool = False,
         batch_labels: np.ndarray | None = None,
         # Full log options
-        log_full: list[str] | None = ['val', 'test'],
-        full_log_every_n_epoch: int = 10,
+        log_full: list[str] | None = ['val'],
+        full_log_every_n_epoch: int = 1,
         # Plotting options
-        plot_kl_distribution: bool = True,
-        log_random_predictions: bool = True,            # Monitor zero-shot capability
+        plot_kl_distribution: bool = False,
+        log_random_predictions: bool = False,            # Monitor zero-shot capability
         plot_umap: bool = False,
-        plot_umap_key: str = 'z_shared',
+        plot_umap_key: str | list[str] = 'z_shared',
+        plot_f1_dist: bool = True,
+        plot_cm: bool = True,
+        plot_every_n_epochs: int = 10,
         # Caching options
         cache_n_epochs: int | None = 1,
         n_train_step_cache: int = 64,
         save_cache: bool = False,
         **loss_kwargs,
     ):
+        # Set custom learning rates for zlocal encoder if auto temperature is enabled
+        if auto_temperature_args is not None:
+            # Set default learning rate of local encoder to overall learning rate
+            auto_conf = {
+                'local_encoder': lr, 'local_mu': lr, 'local_var': lr
+            }
+            if freeze_modules is None:
+                freeze_modules = auto_conf
+            else:
+                freeze_modules.update(auto_conf)
         # Get custom optimizer for soft freezing if argument is provided
         optimizer, optimizer_fn = self._optimizer_creator_fn_custom(module_lrs=freeze_modules)
         if optimizer == 'Custom':
@@ -161,14 +176,26 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.log_class_distribution = log_class_distribution
         self.freeze_encoder_epoch = freeze_encoder_epoch
         self.freeze_decoder_epoch = freeze_decoder_epoch
+        self.soft_freeze_lr = soft_freeze_lr
+        if auto_temperature_args is not None:
+            from src._train.controller import ClipTemperatureController
+            self.auto_temp_controller = ClipTemperatureController(**auto_temperature_args)
+            # Add empty schedule key to be filled by controller
+            self.anneal_schedules['T_align'] = None
+        else:
+            self.auto_temp_controller = None
+            
         # Misc
         self.average = average                                                      # How to reduce the classification metrics
         self.top_k = top_k                                                          # How many top predictions to consider for metrics
         self.plot_umap = plot_umap
-        self.plot_umap_key = plot_umap_key
+        self.plot_umap_key = plot_umap_key if isinstance(plot_umap_key, list) else [plot_umap_key]
+        self.plot_f1_dist = plot_f1_dist
+        self.plot_cm = plot_cm
         self.plot_kl_distribution = plot_kl_distribution
         self.log_full = log_full
         self.full_log_every_n_epoch = full_log_every_n_epoch
+        self.plot_every_n_epochs = plot_every_n_epochs
         self.batch_labels = batch_labels
         self.log_random_predictions = log_random_predictions
         # Save classes that have been seen during training
@@ -271,7 +298,24 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             )
 
         return "Custom", _creator
+    
+    def _scale_lr(self, group_name: str, factor: float, error: bool = True):
+        optimizer = self.optimizers()
 
+        for pg in optimizer.param_groups:
+            if pg.get("name", None) == group_name:
+                old_lr = pg["lr"]
+                pg["lr"] = old_lr * factor
+                self.log(
+                    f"lr/{group_name}",
+                    pg["lr"],
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=True,
+                )
+                return old_lr, pg["lr"]
+        if error:
+            raise ValueError(f"Optimizer param group '{group_name}' not found.")
 
     @property
     def n_obs_test(self):
@@ -311,18 +355,26 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             if mode == 'train' and len(self.epoch_cache[mode][MODULE_KEYS.Z_KEY]) > self.n_train_step_cache:
                 return
             self.epoch_cache[mode][MODULE_KEYS.Z_KEY].append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
-            self.epoch_cache[mode][REGISTRY_KEYS.LABELS_KEY].append(inference_outputs[REGISTRY_KEYS.LABELS_KEY].cpu())
-            self.epoch_cache[mode][REGISTRY_KEYS.BATCH_KEY].append(inference_outputs[REGISTRY_KEYS.BATCH_KEY].cpu())
+            self.epoch_cache[mode][REGISTRY_KEYS.LABELS_KEY].append(inference_outputs[MODULE_KEYS.LABEL_KEY].cpu())
+            self.epoch_cache[mode][REGISTRY_KEYS.BATCH_KEY].append(inference_outputs[MODULE_KEYS.BATCH_INDEX_KEY].cpu())
             if loss_output.logits is not None:
                 self.epoch_cache[mode][PREDICTION_KEYS.PREDICTION_KEY].append(torch.argmax(loss_output.logits, dim=-1).cpu())
                 self.epoch_cache[mode][MODULE_KEYS.CLS_LOGITS_KEY].append(loss_output.logits.cpu())
+            if PREDICTION_KEYS.PREDICTION_KEY in loss_output.extra_metrics['extra_outputs']:
+                self.epoch_cache[mode][PREDICTION_KEYS.PREDICTION_KEY].append(loss_output.extra_metrics['extra_outputs'][PREDICTION_KEYS.PREDICTION_KEY].cpu())
             # Add shared latent space to cache
             if MODULE_KEYS.Z_SHARED_KEY in loss_output.extra_metrics['extra_outputs']:
                 self.epoch_cache[mode][MODULE_KEYS.Z_SHARED_KEY].append(loss_output.extra_metrics['extra_outputs'][MODULE_KEYS.Z_SHARED_KEY].cpu())
             # Add class projection to cache
             if MODULE_KEYS.CLS_PROJ_KEY in loss_output.extra_metrics['extra_outputs']:
                 self.epoch_cache[mode][MODULE_KEYS.CLS_PROJ_KEY].append(loss_output.extra_metrics['extra_outputs'][MODULE_KEYS.CLS_PROJ_KEY].cpu())
-
+            # Add pathway latent to cache
+            if 'z_s' in loss_output.extra_metrics['extra_outputs']:
+                self.epoch_cache[mode]['z_s'].append(loss_output.extra_metrics['extra_outputs']['z_s'].cpu())
+            # Add pathway projection to cache
+            if 't_s' in loss_output.extra_metrics['extra_outputs']:
+                self.epoch_cache[mode]['t_s'].append(loss_output.extra_metrics['extra_outputs']['t_s'].cpu())
+                
     def _process_epoch_cache(self, mode: str) -> dict[str, np.ndarray]:
         """Process and clear the epoch cache, returning concatenated arrays."""
         cache = self.epoch_cache.get(mode, None)
@@ -340,11 +392,16 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Add mean cached class projections to outuput
         if MODULE_KEYS.CLS_PROJ_KEY in cache:
             processed[MODULE_KEYS.CLS_PROJ_KEY] = torch.stack(cache.get(MODULE_KEYS.CLS_PROJ_KEY), dim=0).mean(dim=0).numpy()
-
         if cache.get(PREDICTION_KEYS.PREDICTION_KEY, []):
             processed[PREDICTION_KEYS.PREDICTION_KEY] = torch.cat(cache[PREDICTION_KEYS.PREDICTION_KEY], dim=0).numpy().squeeze()
+        if MODULE_KEYS.CLS_LOGITS_KEY in cache:
             processed[MODULE_KEYS.CLS_LOGITS_KEY] = torch.cat(cache[MODULE_KEYS.CLS_LOGITS_KEY], dim=0).numpy().squeeze()
-        
+        # Add cached pathway-level latent space to output
+        if 'z_s' in cache:
+            processed['z_s'] = torch.cat(cache.get('z_s'), dim=0).numpy()
+        # Add cached pathway-level projections to output
+        if 't_s' in cache:
+            processed['t_s'] = torch.stack(cache.get('t_s'), dim=0).mean(dim=0).numpy()
         # Add to historical cache
         for k, v in processed.items():
             self.history_cache[mode][k].append(v)
@@ -506,6 +563,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Return non-default weights
         if key == 'kl_weight':
             return self.get_kl_weight()
+        # Get alignment temperature from controller if active
+        if key == 'T_align' and self.auto_temp_controller is not None:
+            return self._get_alignment_temp()
         # Init default args
         sched_kwargs = {'n_epochs_warmup': self.n_epochs_warmup, 'n_steps_warmup': self.n_steps_warmup}
         # Add scheduling params if given
@@ -519,6 +579,26 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         return (
             klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
         )
+        
+    def _update_alignment_temp(self, val_f1: float):
+        # Only change temperature based on validation
+        if self.training or self.auto_temp_controller is None:
+            return
+        # Update T and get it from controller
+        updated = self.auto_temp_controller.update(
+            current_epoch=self.current_epoch,
+            val_f1=val_f1,
+        )
+        # Update learning rate
+        if updated:
+            self._scale_lr('local_encoder', factor=0.5)
+            self._scale_lr('local_mu', factor=0.5)
+            self._scale_lr('local_var', factor=0.5)
+    
+    def _get_alignment_temp(self):
+        if self.auto_temp_controller is None:
+            return None
+        return self.auto_temp_controller.T
 
     @property
     def weights(self) -> dict[str, torch.Tensor]:
@@ -604,6 +684,30 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             f'clip_{METRIC_KEYS.ACCURACY_KEY}': 0.0,
             f'clip_{METRIC_KEYS.F1_SCORE_KEY}': 0.0,
         }
+        # Log context prediction if available
+        ctx_pred = loss_output.extra_metrics['extra_outputs'].pop('ctx_pred', None)
+        if ctx_pred is not None:
+            ctx_labels = loss_output.extra_metrics['extra_outputs'].pop('ctx_labels')
+            # Calculate F1 score over predicted and true labels
+            ctx_f1 = tmf.classification.multiclass_f1_score(
+                ctx_pred,
+                ctx_labels,
+                self.module.n_batch,
+                average=self.average,
+            )
+            metrics_dict[f'ctx_{METRIC_KEYS.F1_SCORE_KEY}'] = ctx_f1
+        # Log adversial context prediction if available
+        adv_ctx_pred = loss_output.extra_metrics['extra_outputs'].pop('adv_ctx_pred', None)
+        if adv_ctx_pred is not None:
+            adv_ctx_labels = loss_output.extra_metrics['extra_outputs'].pop('adv_ctx_labels')
+            # Calculate F1 score over predicted and true labels
+            adv_ctx_f1 = tmf.classification.multiclass_f1_score(
+                adv_ctx_pred,
+                adv_ctx_labels,
+                self.module.n_batch,
+                average=self.average,
+            )
+            metrics_dict[f'adv_ctx_{METRIC_KEYS.F1_SCORE_KEY}'] = adv_ctx_f1
         # Get number of classes
         n_classes = self.n_classes
         # Get true class labels
@@ -670,6 +774,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 # Assign unknown to classes that are outside of the training classes
                 clip_cls_pred = clip_cls_pred.masked_fill(unknown_mask, n_classes)
                 n_classes += 1
+
             # Assign unknown to classes that are outside of the training classes
             clip_cls_pred = clip_cls_pred.masked_fill((clip_cls_pred >= n_classes), n_classes)
             # Calculate accuracy over predicted and true labels
@@ -689,6 +794,50 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             # Update metrics
             metrics_dict[f'clip_{METRIC_KEYS.ACCURACY_KEY}'] = accuracy
             metrics_dict[f'clip_{METRIC_KEYS.F1_SCORE_KEY}'] = f1
+            # Include top k predictions as well
+            clip_logits = loss_output.extra_metrics['extra_outputs'].pop(PREDICTION_KEYS.SOFT_PREDICTION_KEY, None)
+            if self.top_k > 1 and clip_logits is not None and self.full_log_every_n_epoch > 0 and self.current_epoch % self.full_log_every_n_epoch == 0:
+                top_k_acc_key = f'clip_{METRIC_KEYS.ACCURACY_KEY}_top_{self.top_k}'
+                top_k_f1_key = f'clip_{METRIC_KEYS.F1_SCORE_KEY}_top_{self.top_k}'
+                top_k_accuracy = tmf.classification.multiclass_accuracy(
+                    clip_logits,
+                    true_labels,
+                    n_classes,
+                    average=self.average,
+                    top_k=self.top_k,
+                )
+                top_k_f1 = tmf.classification.multiclass_f1_score(
+                    clip_logits,
+                    true_labels,
+                    n_classes,
+                    average=self.average,
+                    top_k=self.top_k,
+                )
+                metrics_dict[top_k_acc_key] = top_k_accuracy
+                metrics_dict[top_k_f1_key] = top_k_f1
+        # Add hierarchical predictions
+        pw_pred = loss_output.extra_metrics['extra_outputs'].pop('pw_pred', None)
+        pw_y = loss_output.extra_metrics['extra_outputs'].pop('pw_y', None)
+        n_pw = getattr(self.module, 'n_pw', None)
+        if pw_pred is not None and pw_y is not None and n_pw is not None:
+            # Pathway f1 including misc categories
+            pw_f1 = tmf.classification.multiclass_f1_score(
+                pw_pred,
+                pw_y,
+                n_pw,
+                average=self.average,
+            )
+            metrics_dict[f'pw_all_{METRIC_KEYS.F1_SCORE_KEY}'] = pw_f1
+            # Remove misc pathways from stats
+            if self.module.misc_pw_idx > -1:
+                pw_f1_no_misc = tmf.classification.multiclass_f1_score(
+                    pw_pred,
+                    pw_y,
+                    n_pw,
+                    average=self.average,
+                    ignore_index=self.module.misc_pw_idx
+                )
+                metrics_dict[f'pw_{METRIC_KEYS.F1_SCORE_KEY}'] = pw_f1_no_misc
         # Add metrics to extra metrics for internal logging
         loss_output.extra_metrics.update(metrics_dict)
         # Remove all extra outputs from metrics for super logging
@@ -839,9 +988,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def on_train_epoch_start(self):        
         # Freeze module encoder at a certain epoch if option is enabled
         if self.freeze_encoder_epoch is not None and self.current_epoch >= self.freeze_encoder_epoch and not getattr(self.module.z_encoder, 'frozen', False):
-            self.module.freeze_module('z_encoder')
+            self.module.freeze_module('z_encoder', soft_lr=self.soft_freeze_lr, optim=self.optimizers())
         if self.freeze_decoder_epoch is not None and self.current_epoch >= self.freeze_decoder_epoch and not getattr(self.module.decoder, 'frozen', False):
-            self.module.freeze_module('decoder')
+            self.module.freeze_module('decoder', soft_lr=self.soft_freeze_lr, optim=self.optimizers())
         # Compute class embeddings once per epoch
         if self.module.cls_emb.encoder is not None and self._get_schedule_weight('cls_align_weight') > 0:
             self.module.reset_cached_cls_emb()
@@ -955,6 +1104,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 continue
             # Calculate performance metrics over entire set
             self._log_full_metrics(mode, mode_data)
+            if self.plot_every_n_epochs > 0 and self.current_epoch % self.plot_every_n_epochs == 0:
+                # Plot f1-score distributions
+                if self.plot_f1_dist:
+                    self._plt_f1_per_ctx_boxplots(mode_data)
+                # Plot confusion matrices
+                if self.plot_cm:
+                    self._plt_confusion(mode, mode_data)
             # Save used mode
             _modes.extend([mode])
             # Combine modes only if we plot
@@ -968,10 +1124,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                     data[k] = np.concatenate((v, new_v), axis=0)
             
         # If data is not empty and we want to plot
-        if len(_modes) > 0 and self.plot_umap:
-            # Plot UMAP for all splits TODO: fix full name label
-            full_name = '-'.join(_modes) if len(_modes) > 1 else _modes[0]
-            self._plt_umap(full_name, data)
+        if self.plot_every_n_epochs > 0 and self.current_epoch % self.plot_every_n_epochs == 0:
+            if len(_modes) > 0 and self.plot_umap:
+                # Plot UMAP for all splits TODO: fix full name label
+                full_name = '-'.join(_modes) if len(_modes) > 1 else _modes[0]
+                # Plot all specified latent spaces
+                for z_key in self.plot_umap_key:
+                    if z_key in data:
+                        self._plt_umap(full_name, data, z_key=z_key)
 
     # Calculate accuracy & f1 for entire validation set, not just per batch
     def on_validation_epoch_end(self):
@@ -1023,6 +1183,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             on_epoch=True,
             prog_bar=False,
         )
+        # Update automatic alignment temperature
+        if mode == 'val':
+            self._update_alignment_temp(f1)
         # Include top k predictions as well
         if self.top_k > 1:
             logits = torch.tensor(mode_data.get(MODULE_KEYS.CLS_LOGITS_KEY))
@@ -1054,8 +1217,248 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 on_epoch=True,
                 prog_bar=False,
             )
+    
+    def _plt_confusion(self, mode: str, mode_data: dict[str, np.ndarray]):
+        """
+        Plot confusion matrices:
+        - Per context: cm/{mode}/{ctx}
+        - Combined: cm/{mode}/all
+        """
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import torch
+        from sklearn.metrics import confusion_matrix
 
-    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray]):
+        preds = mode_data.get(PREDICTION_KEYS.PREDICTION_KEY)
+        if preds is None:
+            return
+
+        labels = mode_data[REGISTRY_KEYS.LABELS_KEY]
+        contexts = mode_data[REGISTRY_KEYS.BATCH_KEY]
+
+        df = pd.DataFrame({
+            "pred": preds,
+            "label": labels,
+            "context": contexts,
+        })
+
+        # Optional context names
+        if self.batch_labels is not None:
+            df["context"] = self.batch_labels[df["context"]]
+
+        # -----------------------------------
+        # Helper to plot one confusion matrix
+        # -----------------------------------
+        def _plot_cm(cm, title, tag):
+            fig, ax = plt.subplots(figsize=(6, 5))
+
+            sns.heatmap(
+                cm,
+                cmap="Blues",
+                vmin=0,
+                vmax=1,
+                square=True,
+                cbar=True,
+                ax=ax,
+            )
+
+            ax.set_title(title)
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("True")
+
+            plt.tight_layout()
+
+            self.logger.experiment.add_figure(
+                tag=tag,
+                figure=fig,
+                global_step=self.current_epoch,
+            )
+            plt.close(fig)
+
+        # -----------------------------------
+        # Global confusion matrix
+        # -----------------------------------
+        cm_all = confusion_matrix(
+            df["label"],
+            df["pred"],
+            labels=list(range(self.n_classes)),
+        ).astype(float)
+
+        # Row normalize
+        row_sums = cm_all.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        cm_all_norm = cm_all / row_sums
+
+        _plot_cm(
+            cm_all_norm,
+            title=f"{mode} | Confusion Matrix (all contexts)",
+            tag=f"cm/{mode}/all",
+        )
+
+        # -----------------------------------
+        # Per-context confusion matrices
+        # -----------------------------------
+        for ctx, sdf in df.groupby("context"):
+            if len(sdf) == 0:
+                continue
+
+            cm_ctx = confusion_matrix(
+                sdf["label"],
+                sdf["pred"],
+                labels=list(range(self.n_classes)),
+            ).astype(float)
+
+            row_sums = cm_ctx.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0
+            cm_ctx_norm = cm_ctx / row_sums
+
+            _plot_cm(
+                cm_ctx_norm,
+                title=f"{mode} | Confusion Matrix ({ctx})",
+                tag=f"cm/{mode}/{ctx}",
+            )
+
+    
+    def _plt_f1_per_ctx_boxplots(self, mode_data: dict[str, np.ndarray]):
+        import pandas as pd
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+        import torch
+        import numpy as np
+        from torchmetrics.functional.classification import multiclass_f1_score
+        from matplotlib.colors import Normalize
+        from matplotlib.cm import ScalarMappable
+
+        preds = mode_data.get(PREDICTION_KEYS.PREDICTION_KEY)
+        if preds is None:
+            return
+
+        labels = mode_data[REGISTRY_KEYS.LABELS_KEY]
+        contexts = mode_data[REGISTRY_KEYS.BATCH_KEY]
+        splits = mode_data[REGISTRY_KEYS.SPLIT_KEY]
+
+        df = pd.DataFrame({
+            "pred": preds,
+            "label": labels,
+            "context": contexts,
+            "split": splits,
+        })
+
+        # Optional context names
+        if self.batch_labels is not None:
+            df["context"] = self.batch_labels[df["context"]]
+
+        records = []
+
+        # (split, context) → per-class F1 + support
+        for (split, ctx), g in df.groupby(["split", "context"]):
+            if g["label"].nunique() < 2:
+                continue  # F1 meaningless
+
+            labels_t = torch.tensor(g["label"].values)
+            preds_t = torch.tensor(g["pred"].values)
+
+            f1_per_class = multiclass_f1_score(
+                preds_t,
+                labels_t,
+                num_classes=self.n_classes,
+                average="none",
+            ).cpu().numpy()
+
+            # class support within this context
+            support = (
+                g["label"]
+                .value_counts()
+                .reindex(range(self.n_classes), fill_value=0)
+                .values
+            )
+
+            for cls_id, (f1, sup) in enumerate(zip(f1_per_class, support)):
+                if sup == 0:
+                    continue
+                records.append({
+                    "split": split,
+                    "class": cls_id,
+                    "context": ctx,
+                    "f1": f1,
+                    "support": sup,
+                })
+
+        if not records:
+            return
+
+        f1_df = pd.DataFrame(records)
+
+        n_ctx = f1_df.context.nunique()
+
+        for split, sdf in f1_df.groupby("split"):
+            fig, ax = plt.subplots(figsize=(max(8, n_ctx * 0.25), 4))
+
+            # --- boxplot (distribution) ---
+            sns.boxplot(
+                data=sdf,
+                x="context",
+                y="f1",
+                ax=ax,
+                showfliers=False,
+                boxprops=dict(alpha=.5)
+            )
+
+            # --- scatter with support-based coloring ---
+            ctx_order = list(sdf["context"].unique())
+            ctx_to_x = {ctx: i for i, ctx in enumerate(ctx_order)}
+
+            x = sdf["context"].map(ctx_to_x).values
+            y = sdf["f1"].values
+            support = sdf["support"].values
+
+            norm = Normalize(vmin=support.min(), vmax=support.max())
+            cmap = plt.cm.viridis
+
+            # --- size scaling based on support ---
+            s_min, s_max = 10, 80
+            sizes = np.sqrt(support)
+            sizes = (sizes - sizes.min()) / (sizes.max() - sizes.min() + 1e-6)
+            sizes = s_min + sizes * (s_max - s_min)
+            # add jitter points
+            sc = ax.scatter(
+                x + np.random.uniform(-0.15, 0.15, size=len(x)),  # jitter
+                y,
+                c=support,
+                s=sizes,
+                cmap=cmap,
+                norm=norm,
+                alpha=0.7,
+                linewidths=0,
+            )
+
+            # --- colorbar ---
+            cbar = fig.colorbar(
+                ScalarMappable(norm=norm, cmap=cmap),
+                ax=ax,
+                pad=0.01,
+            )
+            cbar.set_label("Class support within context", rotation=90)
+
+            ax.set_title(f"{split} | per-context F1 (colored by class support)")
+            ax.set_xlabel("Context")
+            ax.set_ylabel("F1")
+            ax.set_ylim(0, 1)
+            ax.set_xticks(range(len(ctx_order)))
+            ax.set_xticklabels(ctx_order, rotation=45, ha="right")
+
+            plt.tight_layout()
+            self.logger.experiment.add_figure(
+                tag=f"f1_per_class_boxplot/{split}",
+                figure=fig,
+                global_step=self.current_epoch,
+            )
+            plt.close(fig)
+
+
+    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray], z_key: str = MODULE_KEYS.Z_KEY):
         """Plot UMAP of latent space (with proxies) into TensorBoard."""
         import os
         import umap
@@ -1065,22 +1468,28 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         import matplotlib.pyplot as plt
 
         # Get shared latent embedding and annotation data, fall back to z if not in cached data
-        emb_key = self.plot_umap_key if self.plot_umap_key in mode_data else MODULE_KEYS.Z_KEY
-        embeddings = mode_data[emb_key]
+        embeddings = mode_data[z_key]
         labels = mode_data[REGISTRY_KEYS.LABELS_KEY]
         covs = mode_data[REGISTRY_KEYS.BATCH_KEY]
         modes = pd.Categorical(mode_data[REGISTRY_KEYS.SPLIT_KEY])
+        
+        # Check if model has pathway and module information
+        has_pathways = getattr(self.module, 'cls2pw') is not None
+        has_modules = getattr(self.module, 'cls2module') is not None
 
         # --- Subset: remove control cells
-        if self.module.ctrl_class_idx is not None:
+        if getattr(self.module, 'ctrl_class_idx') is not None:
             mask = labels != self.module.ctrl_class_idx
             embeddings, labels, covs, modes = embeddings[mask], labels[mask], covs[mask], modes[mask]
         # Add batch annotation
         if self.batch_labels is not None:
             covs = self.batch_labels[covs]
-        # --- Add class proxies if they exist (no alignment yet)
-        if MODULE_KEYS.CLS_PROJ_KEY in mode_data:
+        # --- Add class proxies if they exist
+        if MODULE_KEYS.CLS_PROJ_KEY in mode_data and z_key != MODULE_KEYS.Z_KEY:
             cls_proxies = mode_data[MODULE_KEYS.CLS_PROJ_KEY]
+            # Aggregate into smaller shapes if needed
+            if cls_proxies.ndim == 3:
+                cls_proxies = cls_proxies.mean(1)
             n_proxies = cls_proxies.shape[0]
 
             # proxy label ids
@@ -1123,8 +1532,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
 
         # --- cached UMAP transform
         cache = self.cache.setdefault("umap_cache", {})
-        transformer_key = f"{mode}_umap_transformer"
-        ref_key = f"{mode}_umap_reference"
+        transformer_key = f"{z_key}_{mode}_umap_transformer"
+        ref_key = f"{z_key}_{mode}_umap_reference"
 
         if transformer_key not in cache:
             reducer = umap.UMAP(n_components=2)
@@ -1151,30 +1560,64 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
 
         # Add umap coordinates to dataframe
         df["UMAP1"], df["UMAP2"] = emb_2d[:, 0], emb_2d[:, 1]
+        
+        # Create pathway-level UMAP if given
+        if has_pathways:
+            pw_z = mode_data['z_s']
+            pw_prox = mode_data['t_s']
+            # Stack data
+            pw_emb = np.concatenate((pw_z, pw_prox), axis=0)
+            # Calculate UMAP over latent dimensions
+            if pw_emb.shape[1] > 2:
+                pw_emb = umap.UMAP(n_components=2).fit_transform(pw_emb)
+            # Add pathway umap to plotting data frame
+            n_proxies = pw_prox.shape[0]
+
+            # proxy label ids
+            pw_labels = self.module.cls2pw[labels].cpu().numpy().astype(str)
+            proxy_labels = np.arange(n_proxies)
+            proxy_covs = np.repeat("proxy", n_proxies)
+            proxy_modes = np.repeat("proxy", n_proxies)
+            proxy_is_obs = np.array(
+                [True] * self.module.n_observed_pw + [False] * (n_proxies - self.module.n_observed_pw)
+            )[:n_proxies]
+
+            # --- combine into a unified DataFrame
+            df_pw = pd.DataFrame({
+                "UMAP_input_idx": np.arange(len(pw_labels) + n_proxies),
+                "label_id": np.concatenate((pw_labels, proxy_labels)),
+                "cov": np.concatenate((covs, proxy_covs)),
+                "mode": np.concatenate((modes, proxy_modes)),
+                "is_proxy": np.concatenate((np.zeros(len(pw_labels), dtype=bool), np.ones(n_proxies, dtype=bool))),
+                "is_observed": np.concatenate((np.ones(len(pw_labels), dtype=bool), proxy_is_obs))
+            })
+            # Add UMAP projection to plotting df
+            df_pw["UMAP1"], df_pw["UMAP2"] = pw_emb[:, 0], pw_emb[:, 1]
 
         # --- plotting helper
-        def _scatter_base(ax, data, hue, title, legend=True, plot_proxy=True, proxy_color="black", proxy_legend=True):
+        def _scatter_base(ax, data, hue, title, legend=True, plot_proxy=True, proxy_color="black", proxy_legend=True, umap_key='UMAP'):
             data_sorted = pd.concat([
                 data[~data.is_proxy],                                     # normal cells
                 data[(data.is_proxy) & (~data.is_observed)],              # unobserved proxies
                 data[(data.is_proxy) & (data.is_observed)],               # observed proxies (TOP)
             ])
+            u1, u2 = f'{umap_key}1', f'{umap_key}2'
             sns.scatterplot(
                 data=data_sorted[~data_sorted.is_proxy],
-                x="UMAP1", y="UMAP2", hue=hue,
+                x=u1, y=u2, hue=hue,
                 s=6, alpha=0.6, ax=ax, legend=legend
             )
             # overlay proxies as crosses (always plot observed on top of unobserved)
             if plot_proxy:
                 sns.scatterplot(
                     data=data_sorted[(data_sorted.is_proxy) & (~data_sorted.is_observed)],
-                    x="UMAP1", y="UMAP2", hue=hue,
+                    x=u1, y=u2, hue=hue,
                     s=40, marker="X", ax=ax, legend=False,
                     edgecolor=proxy_color, linewidth=0.5
                 )
                 sns.scatterplot(
                     data=data_sorted[(data_sorted.is_proxy) & (data_sorted.is_observed)],
-                    x="UMAP1", y="UMAP2", hue=hue,
+                    x=u1, y=u2, hue=hue,
                     s=40, marker="X", ax=ax, legend=proxy_legend,
                     edgecolor=proxy_color, linewidth=0.8
                 )
@@ -1190,10 +1633,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                     markerscale=2,
                     fontsize="small"
                 )
-                
-        # Check if model has pathway and module information
-        has_pathways = hasattr(self.module, 'cls2pw')
-        has_modules = hasattr(self.module, 'cls2module')
 
         # --- create figure grid
         N = 3 if has_modules or has_pathways else 2
@@ -1218,14 +1657,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
 
         # 5. by pathways (if they exist)
         if has_pathways:
-            df["pw"] = self.module.cls2pw[df.label_id].cpu().numpy().astype(str)
-            _scatter_base(axes[2, 0], df, "pw", f"Pathways @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False, legend=False)
+            _scatter_base(axes[2, 0], df_pw, "label_id", f"Pathways @ Epoch {self.current_epoch}", legend=False, proxy_legend=False)
         # 6. by modules (if they exist)
         if has_modules:
             df["module"] = self.module.cls2module[df.label_id].cpu().numpy().astype(str)
             _scatter_base(axes[2, 1], df, "module", f"Modules @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False, legend=False)
         plt.tight_layout()
-        self.logger.experiment.add_figure(f"{mode}_{emb_key}_umap", fig, self.current_epoch)
+        self.logger.experiment.add_figure(f"{mode}_{z_key}_umap", fig, self.current_epoch)
         plt.close(fig)
 
         # Save data to file
