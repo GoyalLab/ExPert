@@ -16,7 +16,7 @@ class _REGISTRY_KEYS_NT(NamedTuple):
     CLS_EMB_INIT: str = "CLS_EMB_INIT"
     FEAT_MASK_KEY: str = "feature_mask_per_dataset"
     FEAT_MASK_IDX_KEY: str = "dataset_to_mask_idx"
-    CLS_CERT_KEY: str = "cls_certainty"
+    CLS_EFF_KEY: str = "cls_efficiency"
     PROTEIN_EXP_KEY: str = "proteins"
     CAT_COVS_KEY: str = "extra_categorical_covs"
     CONT_COVS_KEY: str = "extra_continuous_covs"

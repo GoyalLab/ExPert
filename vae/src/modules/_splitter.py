@@ -43,10 +43,13 @@ class DataSplitter(pl.LightningDataModule):
         cache_indices: dict[str, np.ndarray] | None = None,
         drop_last: bool = False,
         use_balanced_weights: bool = True,
+        use_balanced_epochs: bool = False,
         use_contrastive_loader: bool = True,
         n_classes_per_batch: int | None = None,
         n_samples_per_class: int | None = None,
         min_contexts_per_class: int | None = None,
+        cap_per_group: int | None = None,
+        min_dataset_fraction: float = 0.5,
         **kwargs,
     ):
         super().__init__()
@@ -64,7 +67,10 @@ class DataSplitter(pl.LightningDataModule):
         self.n_classes_per_batch = n_classes_per_batch
         self.n_samples_per_class = n_samples_per_class
         self.min_contexts_per_class = min_contexts_per_class
+        self.cap_per_group = cap_per_group
+        self.min_dataset_fraction = min_dataset_fraction
         self.use_balanced_weights = use_balanced_weights
+        self.use_balanced_epochs = use_balanced_epochs
         self.use_contrastive_loader = use_contrastive_loader
         
         self.batch_size = batch_size
@@ -195,10 +201,13 @@ class DataSplitter(pl.LightningDataModule):
             "labels": labels,
             "batches": batches,
             "use_balanced_weights": self.use_balanced_weights,
+            "use_balanced_epochs": self.use_balanced_epochs,
             "n_classes_per_batch": self.n_classes_per_batch,
             "n_samples_per_class": self.n_samples_per_class,
             "min_contexts_per_class": self.min_contexts_per_class,
             "use_contrastive_loader": self.use_contrastive_loader,
+            "min_dataset_fraction": self.min_dataset_fraction,
+            "cap_per_group": self.cap_per_group
         }
         
     def _get_dataloader(self, mode: str):

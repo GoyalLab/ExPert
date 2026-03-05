@@ -6,7 +6,46 @@ import gseapy as gp
 from typing import Any
 
 from sklearn.metrics import precision_recall_fscore_support
+from sklearn.mixture import GaussianMixture
 
+
+def compute_zscore_confidence(logits):
+    """
+    Compute per-cell z-score confidence:
+    (top1 similarity - mean similarity) / std similarity
+    """
+
+    top1 = logits.max(dim=-1).values
+    mu = logits.mean(dim=-1)
+    sigma = logits.std(dim=-1) + 1e-6
+
+    zscore = ((top1 - mu) / sigma).detach().cpu().numpy()
+    return zscore
+
+def fit_confidence_gmm(scores):
+    scores = scores.reshape(-1, 1)
+
+    gmm = GaussianMixture(
+        n_components=2,
+        covariance_type="full",
+        random_state=0
+    )
+    gmm.fit(scores)
+
+    means = gmm.means_.flatten()
+
+    # Higher mean = responders
+    responder_idx = np.argmax(means)
+
+    return gmm, responder_idx
+
+def compute_response_probability(logits):
+    scores = compute_zscore_confidence(logits)
+    gmm, responder_idx = fit_confidence_gmm(scores)
+
+    scores = scores.reshape(-1, 1)
+    probs = gmm.predict_proba(scores)
+    return probs[:, responder_idx]
 
 def performance_metric(actual, pred, labels, lib=None, mode='test'):
     # Add pathway overlap

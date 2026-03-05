@@ -17,6 +17,23 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 
 
+class PermissiveLoader(yaml.SafeLoader):
+    pass
+
+def construct_any(loader, tag_suffix, node):
+    try:
+        if isinstance(node, yaml.MappingNode):
+            return loader.construct_mapping(node)
+        elif isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        else:
+            return loader.construct_scalar(node)
+    except Exception:
+        return None
+    
+PermissiveLoader.add_multi_constructor("", construct_any)
+
+
 def performance_metric(actual, pred, labels, lib=None, mode='test'):
     # Add pathway overlap
     if lib is not None:
@@ -266,10 +283,10 @@ def compute_top_n_predictions(
     # Match actual to prediction label indices
     label_to_idx = {label: idx for idx, label in enumerate(predictions.columns)}
     # Get prediction ranks
-    max_idx = np.argsort(predictions, axis=1)
+    max_idx = np.argsort(predictions.values, axis=1)
     # Get random prediction ranks
     random_predictions = pd.DataFrame(np.random.random(predictions.shape), columns=predictions.columns, index=predictions.index)
-    random_max_idx = np.argsort(random_predictions, axis=1)
+    random_max_idx = np.argsort(random_predictions.values, axis=1)
     # Collect top n predictions for all groups
     top_n_predictions = []
     splits = [None] if split_key is None else _adata.obs[split_key].unique()
@@ -313,20 +330,22 @@ def compute_top_n_predictions(
 
 def collect_runs(base_dir: str):
     runs = []
-    for root, _, files in os.walk(base_dir):
-        summary_ps = glob.glob(f'{root}/**/*_eval_summary.csv', recursive=True)
-        if "config.yaml" in files and len(summary_ps) > 0:
-            cfg_path = os.path.join(root, "config.yaml")
-            # Add all run versions
-            for summ_path in summary_ps:
-                runs.append((cfg_path, summ_path))
+    #for root, _, files in os.walk(base_dir):
+    summary_ps = glob.glob(f'{base_dir}/**/*_eval_summary.csv', recursive=True)
+    # Add all run versions
+    for summ_path in summary_ps:
+        # Look for hparams.yaml
+        run_dir = os.path.dirname(summ_path)
+        _cfg_path = os.path.join(run_dir, 'hparams.yaml')
+        if os.path.exists(_cfg_path):
+            runs.append((_cfg_path, summ_path))
     print(f"Found {len(runs)} runs.")
     return runs
 
 def parse_run(cfg_path, summ_path, split="test", metric="f1-score"):
     # Parse config.yaml
     with open(cfg_path, "r") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.load(f, Loader=PermissiveLoader)
 
     # Flatten nested dicts
     def flatten_dict(d, parent_key="", sep="."):
@@ -361,7 +380,7 @@ def build_dataframe(base_dir: str, split: str = "test", metric: str = "f1-score"
         try:
             row = parse_run(cfg_path, summ_path, split=split, metric=metric)
             data.append(row)
-            config_id = os.path.basename(os.path.dirname(cfg_path))
+            config_id = summ_path.replace(base_dir, '').strip('/').split('/')[0]
             version_id = os.path.basename(os.path.dirname(summ_path))
             run_id = str(config_id) + '_' + str(version_id)
             idx.extend([run_id])
@@ -407,7 +426,7 @@ def prepare_features(df, target="f1_test"):
     X_cat = encoder.fit_transform(X[cat_cols]) if cat_cols else np.empty((len(X), 0))
     X_num = scaler.fit_transform(X[num_cols]) if num_cols else np.empty((len(X), 0))
 
-    X_combined = np.hstack([X_num, X_cat])
+    X_combined = np.nan_to_num(np.hstack([X_num, X_cat]))
     feature_names = (
         list(num_cols) +
         list(encoder.get_feature_names_out(cat_cols)) if cat_cols else num_cols
@@ -416,39 +435,52 @@ def prepare_features(df, target="f1_test"):
     print(f"Encoded {len(num_cols)} numeric and {len(cat_cols)} categorical features.")
     return X_combined, y, feature_names
 
-def ridge_importance(X, y, feature_names):
+def ridge_importance(X, y, feature_names, plot_dir: str | None = None):
     model = RidgeCV(alphas=np.logspace(-3, 3, 10)).fit(X, y)
     coefs = pd.Series(model.coef_, index=feature_names).sort_values(key=abs, ascending=False)
-    print("Top linear effects:")
-    print(coefs.head(10))
-    sns.barplot(x=coefs.head(15).values, y=coefs.head(15).index)
+    coefs = coefs.head(15)[coefs.abs() > 0]
+    sns.barplot(x=coefs.values, y=coefs.index)
     plt.title("Ridge Coefficients (Top 15)")
     plt.tight_layout()
-    plt.show()
+    if plot_dir is not None and os.path.exists(plot_dir):
+        plot_p = f'{plot_dir}/ridge_importance.png'
+        plt.savefig(plot_p, bbox_inches='tight', dpi=300)
+    else:
+        plt.show()
+    plt.close()
 
-
-def rf_importance(X, y, feature_names):
+def rf_importance(X, y, feature_names, plot_dir: str | None = None):
     rf = RandomForestRegressor(n_estimators=300, random_state=42)
     rf.fit(X, y)
 
     # --- 1. Built-in feature importance ---
     fi = pd.Series(rf.feature_importances_, index=feature_names).sort_values(ascending=False)
-
+    fi = fi.head(15)[fi > 0]
     plt.figure(figsize=(6, 6))
-    sns.barplot(x=fi.values[:15], y=fi.index[:15])
+    sns.barplot(x=fi.values, y=fi.index)
     plt.title("Random Forest Feature Importances (Top 15)")
     plt.tight_layout()
-    plt.show()
+    if plot_dir is not None and os.path.exists(plot_dir):
+        plot_p = f'{plot_dir}/rf_importance.png'
+        plt.savefig(plot_p, bbox_inches='tight', dpi=300)
+    else:
+        plt.show()
+    plt.close()
 
     # --- 2. Permutation importance (more robust) ---
     result = permutation_importance(rf, X, y, n_repeats=10, random_state=42, n_jobs=-1)
     perm_importances = pd.Series(result.importances_mean, index=feature_names).sort_values(ascending=False)
-
+    perm_importances = perm_importances.head(15)[perm_importances > 0]
     plt.figure(figsize=(6, 6))
-    sns.barplot(x=perm_importances.values[:15], y=perm_importances.index[:15])
+    sns.barplot(x=perm_importances.values, y=perm_importances.index)
     plt.title("Permutation Importances (Top 15)")
     plt.tight_layout()
-    plt.show()
+    if plot_dir is not None and os.path.exists(plot_dir):
+        plot_p = f'{plot_dir}/permutation_importance.png'
+        plt.savefig(plot_p, bbox_inches='tight', dpi=300)
+    else:
+        plt.show()
+    plt.close()
 
     return rf
 
@@ -463,7 +495,13 @@ def pca_plot(X, y):
     plt.tight_layout()
     plt.show()
 
-def analyse_grid_run(run_dir: str, pca: bool = False, split: str = "test", metric: str = "f1-score") -> dict:
+def analyse_grid_run(
+        run_dir: str, 
+        pca: bool = False, 
+        split: str = "test", 
+        metric: str = "f1-score",
+        plot_dir: str | None = None
+    ) -> dict:
     """Analyse main performance drivers in grid runs."""
     df = build_dataframe(run_dir, split=split, metric=metric)
     metric_key = f"{metric}_{split}"
@@ -474,9 +512,11 @@ def analyse_grid_run(run_dir: str, pca: bool = False, split: str = "test", metri
     # correlation screening
     corr = pd.DataFrame({"feature": feature_names, "corr": [np.corrcoef(X[:,i], y)[0,1] for i in range(X.shape[1])]})
     corr["abs_corr"] = corr["corr"].abs()
-
-    ridge_importance(X, y, feature_names)
-    rf = rf_importance(X, y, feature_names)
+    # Plot ridge importance
+    if plot_dir is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+    ridge_importance(X, y, feature_names, plot_dir=plot_dir)
+    rf = rf_importance(X, y, feature_names, plot_dir=plot_dir)
     if pca:
         pca_plot(X, y)
     return {

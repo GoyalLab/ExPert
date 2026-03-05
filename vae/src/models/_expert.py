@@ -1,5 +1,5 @@
 import os
-from src.utils.constants import REGISTRY_KEYS, EXT_CLS_EMB_INIT, PREDICTION_KEYS, MODULE_KEYS
+from src.utils.constants import REGISTRY_KEYS, PREDICTION_KEYS, MODULE_KEYS
 import src.utils.io as io
 import src.utils.performance as pf
 from src.utils._callbacks import DelayedEarlyStopping, PeriodicTestCallback
@@ -13,7 +13,6 @@ from copy import deepcopy
 import torch
 from torch import Tensor
 from torch.distributions import Distribution
-import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
@@ -138,9 +137,11 @@ class ExPert(
             cls_emb=cls_emb,
             cls_sim=cls_sim,
             cls_text_dict=self.cls_text_dict,
+            cls_weights=self.cls_weights,
             ctrl_class_idx=self.ctrl_class_idx,
             ctx_emb=self.ctx_emb,
             feat_masks=self.feat_masks,
+            gene_emb=self.gene_emb if self.use_gene_emb else None,
             dropout_rate=dropout_rate,
             n_continuous_cov=self.summary_stats.get('n_extra_continuous_covs', 0),
             n_cats_per_cov=n_cats_per_cov,
@@ -198,8 +199,8 @@ class ExPert(
         # Get registry keys for context embedding in adata
         ext_feat_mask_key = feat_masks_registry.get('original_key')
         feat_mask_key = feat_masks_registry['data_registry'].get('attr_key') if ext_feat_mask_key is None else ext_feat_mask_key
-        # Get the matrix from .uns and check type
-        feat_masks = self.adata.uns[feat_mask_key]
+        # Get the matrix from .varm and check type
+        feat_masks = self.adata.varm[feat_mask_key].T
         if not isinstance(feat_masks, np.ndarray):
             raise ValueError(f'Feature mask has to be an np.ndarray with contexs as index, got {feat_masks.__class__}.')
         # Get mask indices from .uns if they exist
@@ -325,6 +326,9 @@ class ExPert(
 
         if self.cls_text_dict is None:
             raise ValueError("Raw text mode enabled but no text dictionary provided.")
+        
+        # Remove empty text entries
+        self.cls_text_dict = {k: v for k, v in self.cls_text_dict.items() if isinstance(v, str) and len(v) > 0}
 
         observed = [k for k in self.cls_text_dict if k in self._label_mapping]
         unseen = [k for k in self.cls_text_dict if k not in self._label_mapping]
@@ -372,6 +376,15 @@ class ExPert(
         log.info(
             f"Registered control class '{self.ctrl_class}' at index {self.ctrl_class_idx}."
         )
+        
+    def _setup_class_weights(self):
+        # Get labels from model adata
+        label_counts = self.adata.obs[self.original_label_key].value_counts()
+        # Get counts of assigned trainable labels in same order
+        class_counts = label_counts[self.idx_to_label[:self.n_train_labels]]
+        weights = 1.0 / np.sqrt(class_counts)
+        weights = weights / weights.mean()
+        self.cls_weights = torch.tensor(weights.values, dtype=torch.float32)
 
     def _setup(self):
         """Setup adata for training. Prepare embeddings."""
@@ -393,6 +406,8 @@ class ExPert(
         self._setup_class_texts()
         # Setup control class
         self._setup_control_class()
+        # Setup class weights based on occurence in data
+        self._setup_class_weights()
         
     def print_summary(self, max_depth: int = 3) -> None:
         """Print overview of module"""
@@ -760,16 +775,6 @@ class ExPert(
         else:
             cls_labels = self.idx_to_label
    
-        # Add control embedding
-        if self.module.ctrl_class_idx is not None:
-            log.info('Adding control embedding')
-            if self.module.ctrl_class_idx >= cls_emb.size(0):
-                pad = torch.zeros((1, cls_emb.size(-1)), device=cls_emb.device)
-                cls_emb = torch.cat((cls_emb, pad), dim=0)
-            else:
-                # Reset index to 0s
-                cls_emb[self.module.ctrl_class_idx] = torch.tensor(0.0)
-        
         log.info(f'Classifying.')
         # Collect batch logits
         ctx_logits = []
@@ -785,6 +790,7 @@ class ExPert(
         data_cls_labels = []
         # Collect predictions
         predictions = []
+        response_probs = []
         # Add progress bar to classification if toggled
         if progress_bar:
             dl_it = tqdm(enumerate(scdl), unit='batch')
@@ -823,14 +829,17 @@ class ExPert(
                     inference_outputs=inference_outputs,
                     ctx_emb=ctx_emb,
                     cls_emb=cls_emb,
-                    return_logits=True
+                    return_logits=True,
+                    local_predictions=obs_only
                 )
 
                 # Check if there are predictions in the output
                 if PREDICTION_KEYS.PREDICTION_KEY in cls_output:
                     predictions.extend(cls_output[PREDICTION_KEYS.PREDICTION_KEY].flatten().cpu().numpy())
                 # Get regular classifier logits
-                _z_cls_logits = cls_output['logits'].cpu()
+                if 'logits' in cls_output:
+                    # Add batch predictions to overall predictions
+                    z_cls_logits.append(cls_output['logits'].cpu())
                 # Unpack context and perturbation classification output
                 if MODULE_KEYS.CTX_LOGITS_KEY in cls_output:
                     _ctx_logits = cls_output[MODULE_KEYS.CTX_LOGITS_KEY].cpu()
@@ -838,8 +847,6 @@ class ExPert(
                 # Add classification output
                 _cls_logits = cls_output[MODULE_KEYS.CLS_LOGITS_KEY].cpu()
                 cls_logits.append(_cls_logits)
-                # Add batch predictions to overall predictions
-                z_cls_logits.append(_z_cls_logits)
                 # Unpack shared latent spaces
                 _z = cls_output[MODULE_KEYS.Z_KEY].cpu()
                 _z_shared = cls_output[MODULE_KEYS.Z_SHARED_KEY].cpu()
@@ -856,13 +863,17 @@ class ExPert(
                     data_ctx_labels.append(batch.flatten().cpu())
                 if l is not None:
                     data_cls_labels.append(l.flatten().cpu())
+                # Collect cell response probability
+                if 'response_prob' in cls_output:
+                    response_probs.append(cls_output['response_prob'].flatten())
                 # ---- CLEANUP ----
                 del cls_output, x, l, batch
                 torch.cuda.empty_cache()
         
         log.info(f'Aggregating predictions')
         # Concatenate batch results
-        z_cls_logits = torch.cat(z_cls_logits).numpy()
+        if z_cls_logits:
+            z_cls_logits = torch.cat(z_cls_logits).numpy()
         if ctx_logits:
             ctx_logits = torch.cat(ctx_logits).numpy()# Set nans to 0s
             ctx_logits = np.nan_to_num(ctx_logits, -np.inf)
@@ -882,21 +893,21 @@ class ExPert(
         if data_cls_labels:
             data_cls_labels = torch.cat(data_cls_labels).numpy()
             cls_ls = cls_labels[data_cls_labels]
-        
-        # Subset to observed classes only
-        if obs_only:
-            if ctx_logits:
-                ctx_logits = ctx_logits[:,:self.module.n_batch]
-            cls_logits = cls_logits[:,:self.module.n_labels]
+        # Stack response probabilities
+        if response_probs:
+            response_probs = np.concatenate(response_probs)
 
         # Add classifier predictions
-        z_cls_soft_predictions = pd.DataFrame(
-            z_cls_logits,
-            columns=cls_labels[:z_cls_logits.shape[-1]],
-            index=adata.obs_names[indices],
-        )
-        z_cls_predictions = z_cls_soft_predictions.columns[np.argmax(z_cls_soft_predictions.values, axis=-1)]
-
+        if z_cls_logits is not None and len(z_cls_logits) > 0:
+            z_cls_soft_predictions = pd.DataFrame(
+                z_cls_logits,
+                columns=cls_labels[:z_cls_logits.shape[-1]],
+                index=adata.obs_names[indices],
+            )
+            z_cls_predictions = z_cls_soft_predictions.columns[np.argmax(z_cls_soft_predictions.values, axis=-1)]
+        else:
+            # Set empty placeholders
+            z_cls_soft_predictions, z_cls_predictions = None, ''
         # Add context predictions
         if ctx_logits:
             ctx_soft_predictions = pd.DataFrame(
@@ -921,6 +932,7 @@ class ExPert(
             cls_predictions = cls_soft_predictions.columns[np.array(predictions)]
         
         # Return all model predictions
+        # TODO: reorganize this into .obs and .obsm/.uns or add directly to adata
         o = {
             PREDICTION_KEYS.Z_PREDICTION_KEY: z_cls_predictions,
             PREDICTION_KEYS.Z_SOFT_PREDICTION_KEY: z_cls_soft_predictions,
@@ -932,6 +944,7 @@ class ExPert(
             REGISTRY_KEYS.LABELS_KEY: cls_ls,
             'label_idx': data_cls_labels,
             'indices': indices,
+            'response_probs': response_probs,
         }
         # Add latent spaces to prediction output
         if return_latents:
@@ -961,8 +974,7 @@ class ExPert(
         # Create training plan
         return self._training_plan_cls(
             module=self.module, 
-            n_classes=self.n_labels, 
-            gene_emb=self.gene_emb,
+            n_classes=self.n_labels,
             freeze_modules=freeze_modules,
             **plan_kwargs
         )
@@ -1133,13 +1145,15 @@ class ExPert(
                 'plan_params': plan_kwargs,
                 'train_params': train_params
             }
+            # Clean up hparams before logging
+            hparams = io.sanitize_for_logging(hparams)
             runner.trainer.logger.log_hyperparams(hparams)
         # Save training plan to model
         self.training_plan = training_plan
         # Update model summary to include if it's trained on fixed or full class embedding
         self.use_full_cls_emb = bool(plan_kwargs.get('use_full_cls_emb'))
         if not self.was_pretrained:
-            self._model_summary_string += f"use_full_cls_emb: {self.use_full_cls_emb}"
+            self._model_summary_string += f",\nuse_full_cls_emb: {self.use_full_cls_emb}"
         self.__repr__()
         # Save runner in model
         self.last_runner = runner
@@ -1164,6 +1178,10 @@ class ExPert(
             slot = reg.get('data_registry', {}).get('attr_name', '')
             # Handle library size factor
             if field == REGISTRY_KEYS.SIZE_FACTOR_KEY:
+                if attr_key not in adata.obs and attr_key is not None and attr_key != '':
+                    log.info(f'Adding placeholder for missing .obs[{attr_key}]')
+                    adata.obs[attr_key] = 1.0
+            elif field == REGISTRY_KEYS.CLS_EFF_KEY:
                 if attr_key not in adata.obs and attr_key is not None and attr_key != '':
                     log.info(f'Adding placeholder for missing .obs[{attr_key}]')
                     adata.obs[attr_key] = 1.0
@@ -1400,6 +1418,8 @@ class ExPert(
             soft_predictions = po[PREDICTION_KEYS.SOFT_PREDICTION_KEY]
         self.adata.obs[PREDICTION_KEYS.PREDICTION_KEY] = predictions
         self.adata.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY] = soft_predictions
+        # Register efficiency scores
+        self.adata.obs['response_probs'] = po['response_probs']
         # Register aligned latent spaces with model's adata
         self.adata.obsm[self._LATENT_Z_KEY] = po[MODULE_KEYS.Z_KEY]
         self.adata.obsm[self._LATENT_Z_SHARED_KEY] = po[MODULE_KEYS.Z_SHARED_KEY]
@@ -1421,19 +1441,12 @@ class ExPert(
             ignore_ctrl: bool = True,
             z_shared: bool = True,
             use_z: bool = False,
+            load_from_checkpoint: bool = False,
         ) -> dict[pd.DataFrame] | None:
         """Run model evaluation for all available data splits registered with the model."""
         if self.is_evaluated and not force:
             log.info('This model has already been evaluated, pass force=True to re-evaluate.')
             return
-        # Refactor results mode to always be a list of options or None
-        results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
-        # Run full prediction for all registered data
-        log.info('Running model predictions on all data splits.')
-        self._register_model_predictions(force=force, use_z=use_z)
-        # Run classification report for all data splits
-        log.info('Generating reports.')
-        self._register_classification_report(force=force, ignore_ctrl=ignore_ctrl)
         # Save model to tensorboard logger directory if registered
         if getattr(self, 'model_log_dir', None) is not None:
             base_output_dir = self.model_log_dir
@@ -1447,6 +1460,19 @@ class ExPert(
                 log.warning('Could not find model tensorboard log directory or a specified "output_dir", skipping model saving.')
                 base_output_dir = None
                 model_output_dir = None
+        # Try to load model from checkpoint if option is given and checkpoint directory is available
+        if load_from_checkpoint:
+            log.info('Loading model from checkpoint before evaluation.')
+            self.load_model_checkpoint()
+        # Refactor results mode to always be a list of options or None
+        results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
+        # Run full prediction for all registered data
+        log.info('Running model predictions on all data splits.')
+        self._register_model_predictions(force=force, use_z=use_z)
+        # Run classification report for all data splits
+        log.info('Generating reports.')
+        self._register_classification_report(force=force, ignore_ctrl=ignore_ctrl)
+        
         # Plot evalutation results if specified
         log.info('Plotting evaluation results.')
         if plot:
@@ -1774,6 +1800,29 @@ class ExPert(
     def get_training_classes(self) -> np.ndarray:
         """Get trained class label names. Class labels are sorted by observed and unobserved."""
         return self.idx_to_label[:self.n_train_labels]
+    
+    def load_model_checkpoint(
+        self, 
+        model_dir: str | None = None,
+        n: int = 0,
+        checkpoint_dirname: str = 'checkpoints',
+        model_name: str = 'model.pt',
+    ):
+        import os
+        import glob
+        
+        model_dir = getattr(self, 'model_log_dir', None)
+        if model_dir is None:
+            return
+        # Look for checkpoints
+        checkpoint_dir = os.path.join(model_dir, checkpoint_dirname)
+        if os.path.exists(checkpoint_dir) and n > -1:
+            checkpoint_model_paths = glob.glob(f'{checkpoint_dir}/**/{model_name}')
+            if len(checkpoint_model_paths) > 0:
+                checkpoint_model_p = checkpoint_model_paths[n] if n > 0 and n < len(checkpoint_model_paths) else checkpoint_model_paths[0]
+                log.info(f'Loading model checkpoint {checkpoint_model_p}.')
+                ckpt = torch.load(checkpoint_model_p, map_location="cpu")
+                self.module.load_state_dict(ckpt["state_dict"])
 
     @classmethod
     def load_checkpoint(
@@ -1835,8 +1884,9 @@ class ExPert(
         context_emb_uns_key: str | None = 'ctx_embedding',
         class_emb_uns_key: str | None = 'cls_embedding',
         gene_emb_varm_key: str | None = None,
-        feature_mask_uns_key: str | None = None,
+        feature_mask_varm_key: str | None = None,
         size_factor_key: str | None = None,
+        efficiency_key: str | None = None,
         cast_to_csr: bool = True,
         raw_counts: bool = True,
         layer: str | None = None,
@@ -1857,6 +1907,7 @@ class ExPert(
             CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
             CategoricalObsField(REGISTRY_KEYS.LABELS_KEY, labels_key),
             NumericalObsField(REGISTRY_KEYS.SIZE_FACTOR_KEY, size_factor_key, required=False),
+            NumericalObsField(REGISTRY_KEYS.CLS_EFF_KEY, efficiency_key, required=False),
             CategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys),
             NumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys),
         ]
@@ -1873,9 +1924,9 @@ class ExPert(
             log.info(f'Registered gene embedding from adata.varm[{gene_emb_varm_key}].')
             anndata_fields.append(VarmField(REGISTRY_KEYS.GENE_EMB_KEY, gene_emb_varm_key))
         # Add dataset-specific feature masks
-        if feature_mask_uns_key is not None and feature_mask_uns_key in adata.uns:
-            log.info(f'Registered gene embedding from adata.uns[{feature_mask_uns_key}].')
-            anndata_fields.append(StringUnsField(REGISTRY_KEYS.FEAT_MASK_KEY, feature_mask_uns_key))
+        if feature_mask_varm_key is not None and feature_mask_varm_key in adata.varm:
+            log.info(f'Registered gene embedding from adata.varm[{feature_mask_varm_key}].')
+            anndata_fields.append(VarmField(REGISTRY_KEYS.FEAT_MASK_KEY, feature_mask_varm_key))
         # Register latent fields of adata is minified
         adata_minify_type = _get_adata_minify_type(adata)
         if adata_minify_type is not None:

@@ -11,12 +11,26 @@ from typing import Literal, Iterable, Optional
 from torch.distributions import Normal
 from transformers import AutoTokenizer, AutoModel
 
-from src.utils.constants import MODULE_KEYS, PREDICTION_KEYS
+from src.utils.constants import MODULE_KEYS
 from src.utils.io import to_tensor
 
 from src.modules._blocks import ProjectionBlock, FcBlock
 
 import logging
+
+
+class EfficiencyHead(nn.Module):
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.LayerNorm(latent_dim // 2),
+            nn.GELU(),
+            nn.Linear(latent_dim // 2, 1)
+        )
+
+    def forward(self, z: torch.Tensor):
+        return self.net(z).squeeze(-1)  # (B,)
 
 
 class MemoryQueue:
@@ -269,7 +283,7 @@ class FunnelFCLayers(nn.Module):
     
     def inject_into_layer(self, layer_num) -> bool:
         """Helper to determine if covariates should be injected."""
-        return layer_num==0 or (layer_num > 0 and self.inject_covariates)
+        return layer_num > 0 and self.inject_covariates
 
     def forward(self, x: torch.Tensor, *cat_list: torch.Tensor) -> torch.Tensor:
         # One-hot encode categorical covariates
@@ -642,12 +656,13 @@ class Encoder(nn.Module):
         var_activation: Callable | None = None,
         use_feature_mask: bool = False,
         drop_prob: float = 0.0,
-        noise_sigma: float = 0.0,
+        noise_sigma: float = 0.01,
+        noise_sigma_add: float = 0.01,
         encoder_type: Literal["funnel", "fc", "transformer"] = "funnel",
         context_integration_method : Literal["concat", "film", "attention"] | None = None,
-        use_context_inference: bool = True,
-        use_learnable_temperature: bool = True,
-        temperature: float = 1.0,
+        use_ranks: bool = False,
+        x_weight: float = 0.0,
+        use_emb: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -671,55 +686,88 @@ class Encoder(nn.Module):
         self.use_feature_mask = use_feature_mask
         self.drop_prob = drop_prob
         self.noise_sigma = noise_sigma
+        self.noise_sigma_add = noise_sigma_add
         self.context_integration_method = context_integration_method
-        self.use_context_inference = use_context_inference
-        self.use_learnable_temperature = use_learnable_temperature
+        self.use_ranks = use_ranks
         
-        # Set encoder output to double the latent dimension
-        funnel_out_dim = 2 * n_output
+        # Add gene ranks as secondary input source
+        base_n_input = n_input
+        self.x_weight = x_weight
+        if use_ranks:
+            # Also include raw x (scaled)
+            if x_weight > 0:
+                base_n_input += n_input
+            self.input_ln = nn.LayerNorm(base_n_input)
+        
+        # Set encoder output to double the latent dimension or n_hidden
+        if n_hidden is None or n_hidden < 0:
+            funnel_out_base = 2 * n_output
+        else:
+            funnel_out_base = n_hidden
+        funnel_out_dim = funnel_out_base
         if context_integration_method is not None and self.context_integration_method not in ["concat", "film", "attention"]:
             raise ValueError(f'Invalid context integration method: "{context_integration_method}"')
         # Use concatenated dimensions as input
         if self.context_integration_method == 'concat':
-            encoder_input_dim = n_input + self.n_dim_context_emb
+            encoder_input_dim = base_n_input + self.n_dim_context_emb
         # Use input dimension
         else:
-            encoder_input_dim = n_input
+            encoder_input_dim = base_n_input
+        # Add gene embedding logic
+        self.use_emb = use_emb
+
+        # Use prior or learnable feature information as first projection
+        if self.use_emb:
+            # LLM initialization expected as tensor (G, d_llm)
+            llm_init = kwargs.get("gene_embedding_init", None)
+            self.n_gene_emb = kwargs.get("n_gene_emb", 512)  # target embedding dim
+            self.freeze_llm = kwargs.get("freeze_llm", True)
+            # Init as pre-trained buffer with a small linear projection
+            if llm_init is not None:
+                n_genes, d_llm = llm_init.shape
+                assert n_genes == n_input, \
+                    f"LLM embedding gene count {n_genes} != n_input {n_input}"
+
+                # Store original LLM embeddings as buffer (not trainable unless desired)
+                if self.freeze_llm:
+                    self.register_buffer("gene_embedding", llm_init.clone())
+                else:
+                    self.gene_embedding = nn.Parameter(llm_init.clone())
+
+                # Learnable projection from LLM dim --> desired dim
+                self.gene_proj = nn.Sequential(
+                    nn.Linear(d_llm, self.n_gene_emb*2),
+                    nn.LayerNorm(self.n_gene_emb*2),
+                    nn.GELU(),
+                    nn.Linear(self.n_gene_emb*2, self.n_gene_emb),
+                )
+                # Add normalization
+                self.post_emb_ln = nn.LayerNorm(self.n_gene_emb)
+            # Use learnable embedding
+            else:
+                # If no LLM init provided, learn embedding directly
+                self.gene_embedding = nn.Parameter(
+                    torch.empty(n_input, self.n_gene_emb)
+                )
+                nn.init.xavier_uniform_(self.gene_embedding)
+                self.gene_proj = None
+                self.post_emb_ln = None
+            # Start encoder input from gene embedding space
+            encoder_input_dim = self.n_gene_emb
+        else:
+            # Use full x input dimension
+            encoder_input_dim = base_n_input
 
         # Base encoder layers
         self.encoder = self.fclayers_class(
             n_in=encoder_input_dim,
             n_out=funnel_out_dim,
-            n_hidden=n_hidden,
+            n_hidden=-1,
             n_cat_list=n_cat_list,
             n_layers=n_layers,
             dropout_rate=dropout_rate,
             **kwargs,
         )
-        # Initialize context intergration method:
-        if self.context_integration_method == 'film' and self.n_dim_context_emb > 0:
-            self.ctx_integration = FiLM(feature_dim=encoder_input_dim, context_dim=self.n_dim_context_emb)
-        elif self.context_integration_method == 'attention' and self.n_dim_context_emb > 0:
-            self.ctx_integration = ContextFeatureAttention(n_features=encoder_input_dim, d_ctx=self.n_dim_context_emb, d_hidden=n_hidden)
-        else:
-            # Just concatenate x and context
-            self.ctx_integration = None
-        # Disable context integration if method is set to None
-        if self.context_integration_method is None:
-            self.use_context_inference = False
-        # Add context projection
-        if self.use_context_inference:
-            self.context_proj = nn.Linear(self.n_dim_context_emb, funnel_out_dim)
-        else:
-            # Skip context integration
-            self.context_proj = None
-
-        # Create a learnable temperature scaling
-        if use_learnable_temperature:
-            self._temperature = torch.nn.Parameter(torch.log(torch.tensor(1.0 / temperature)))
-        # Fall back to static default temperature
-        else:
-            self._temperature = temperature
 
         # Create base vae projections
         self.mean_encoder = nn.Linear(funnel_out_dim, n_output)
@@ -729,55 +777,80 @@ class Encoder(nn.Module):
 
         # Debug
         self.c = 0
-
-    @property
-    def temperature(self) -> torch.Tensor:
-        if self.use_learnable_temperature:
-            # Calculate logit scale
-            return 1.0 / self._temperature.clamp(-1, 4.6).exp()
+        
+    def normalize_x(self, x: torch.Tensor, feature_masks: torch.Tensor):
+        if feature_masks is None:
+            # Simple normalization over all features
+            cell_mean = x.mean(dim=1, keepdim=True) 
+            cell_std = x.std(dim=1, keepdim=True) + 1e-6 
+            x_norm = (x - cell_mean) / cell_std 
+            mask = torch.ones_like(x_norm)
         else:
-            return self._temperature
+            # Normalization over observed features only
+            mask = feature_masks.float()
+            # ----- masked stats -----
+            valid_counts = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+            cell_mean = (x * mask).sum(dim=1, keepdim=True) / valid_counts
+            var = ((x - cell_mean) * mask).pow(2).sum(dim=1, keepdim=True) / valid_counts
+            cell_std = torch.sqrt(var + 1e-6)
+            # ----- normalized channel -----
+            x_norm = (x - cell_mean) / cell_std
+        # Add mask dropout
+        if self.training and self.drop_prob > 0:
+            random_drop = torch.bernoulli(torch.full_like(mask, self.drop_prob))
+            mask = mask * (1 - random_drop)
+        # Set masked out features to 0
+        x_norm = x_norm * mask
+        # ----- concat -----
+        if self.x_weight > 0:
+            # ----- scaled raw channel -----
+            x_scaled = x * self.x_weight * mask
+            # ----- combine channels -------
+            x_cat = torch.cat([x_scaled, x_norm], dim=-1)
+            # ----- LayerNorm (optional) ---
+            return self.input_ln(x_cat)
+        else:
+            return x_norm
     
-    def forward(self, x: torch.Tensor, *cat_list: int, g: torch.Tensor | None = None, ctx_label: torch.Tensor | None = None, context_emb: torch.Tensor | None = None):
-        # Optional feature masking
-        if self.training and self.use_feature_mask and self.drop_prob > 0:
-            mask = torch.bernoulli(torch.full((self.n_input,), 1 - self.drop_prob, device=x.device)).view(1, -1)
-            x = x * mask.expand(x.shape[0], -1)
-        # Optional noise injection
+    def forward(self, x: torch.Tensor, *cat_list: int, feature_masks: torch.Tensor | None = None, **kwargs):
+        # Optional multiplicative noise injection
         if self.training and self.noise_sigma:
             noise = torch.exp(
                 torch.randn_like(x) * self.noise_sigma
             )
             x = x * noise
+        
+        # Add ranks to input data
+        if self.use_ranks:
+            # Normalize x by feature mask and introduce soft ranking
+            x = self.normalize_x(x, feature_masks)
+        
+        # Optional additive noise injection on normalized x
+        if self.training and self.noise_sigma_add:
+            x = x + torch.randn_like(x) * self.noise_sigma_add
+        
+        # Use gene embedding as projection
+        if self.use_emb:
+            # Scale by number of active genes (important!)
+            if feature_masks is not None:
+                n_active = feature_masks.sum(dim=1, keepdim=True).clamp(min=1.0)
+                x = x / torch.sqrt(n_active)
 
-        # Concatenate or modulate by context
-        ctx_logits, b_ctx_emb = None, None
-        if self.n_dim_context_emb > 0 and context_emb is not None and self.use_context_inference:
-            # Add context integration to batch
-            if self.ctx_integration is not None:
-                # Encode x only TODO: try separate linear projection for disentanglement
-                h_x = self.encoder(x, *cat_list) if self.encoder_type != "transformer" else self.encoder(x, *cat_list, gene_embedding=g)
-                # Normalize latent space for cosine similarity
-                h_x = F.normalize(h_x, dim=-1)
-                # Project contexts to shared dimensionality
-                h_c = F.normalize(self.context_proj(context_emb), dim=-1)            # (n_contexts, d_h)
-                # Calculate context similarity
-                ctx_logits = h_x @ h_c.T / self.temperature         # (b, d_h) @ (d_h, n_contexts) = (b, n_contexts)
-                # Select batch-relevant context information based on highest softmax (b, d_h)
-                b_ctx_emb = (torch.softmax(ctx_logits, dim=-1).unsqueeze(-1) * context_emb.unsqueeze(0)).sum(dim=1)
-                
-                # FiLM or attention
-                x = self.ctx_integration(x, b_ctx_emb)
+            # Get pretrained gene embedding projection
+            if self.gene_proj is not None:
+                E = self.gene_proj(self.gene_embedding)  # (G, d_embed)
+            # Use learnable gene embedding
             else:
-                b_ctx_emb = context_emb[ctx_label.flatten()]
-                # Simple concatenation
-                x = torch.cat([x, b_ctx_emb], dim=-1)
-            
-            # Do a second encoder forward pass
-            q = self.encoder(x, *cat_list)
-        else:
-            # Do a simple forward pass with just x and no additional information
-            q = self.encoder(x, *cat_list)
+                E = self.gene_embedding  # already (G, d_embed)
+
+            # Project gene expression into embedding space
+            x = x @ E  # (B, G) @ (G, d_embed) → (B, d_embed)
+            # Normalize output
+            if self.post_emb_ln is not None:
+                x = self.post_emb_ln(x)
+        
+        # Feed x to the encoder
+        q = self.encoder(x, *cat_list)
         
         # Debug
         self.c = self.c + 1
@@ -791,7 +864,6 @@ class Encoder(nn.Module):
             MODULE_KEYS.QZM_KEY: q_m,
             MODULE_KEYS.QZV_KEY: q_v,
             MODULE_KEYS.Z_KEY: z,
-            MODULE_KEYS.CTX_LOGITS_KEY: ctx_logits,
         }
         
         
@@ -895,7 +967,126 @@ class GeneEmbeddingEncoder(nn.Module):
             h_cell = h_x
 
         return h_cell
+    
+
+class GatedConditioner(nn.Module):
+    def __init__(self, dim: int, dropout_rate: float = 0.001, mask_noise: float = 0.05):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim)
+        self.gate_proj = nn.Linear(dim, dim, bias=False)
+        self.dropout_rate = dropout_rate
+        self.mask_noise = mask_noise
+
+        # Initialize gate neutral
+        nn.init.zeros_(self.gate_proj.weight)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+        """
+        x    : (B, G) gene expression
+        mask : (B, G) feature availability mask
+        """
+
+        # ---- Feature dropout (only on available genes) ----
+        if self.training and self.dropout_rate > 0:
+            # Sample dropout mask only where gene is available
+            keep = torch.bernoulli(
+                torch.full_like(x, 1.0 - self.dropout_rate)
+            )
+            keep = keep * mask  # never activate missing genes
+            x = x * keep / (1.0 - self.dropout_rate)
+
+        # ---- Linear projection ----
+        h = self.linear(x)
+
+        # ---- Gating (detach mask to reduce dataset shortcut) ----
+        if self.mask_noise > 0:
+            # Add some noise to the mask to avoid dataset memorzation
+            mask = mask + self.mask_noise * torch.randn_like(mask)
+        gate = torch.sigmoid(self.gate_proj(mask.detach()))
+        # Return gated h
+        return h * (1.0 + 0.1 * (gate - 0.5))
+    
+
+class FiLMConditioner(nn.Module):
+    def __init__(self, dim: int, hidden: int = 64, dropout_rate: float = 0.001, gamma: float = 1.0, beta: float = 0.1):
+        super().__init__()
+
+        self.linear = nn.Linear(dim, dim)
+
+        # mask encoder (small bottleneck prevents dataset memorization)
+        self.mask_net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim * 2)
+        )
+
+        self.dropout_rate = dropout_rate
+
+        # initialize modulation near identity
+        nn.init.zeros_(self.mask_net[-1].weight)
+        nn.init.zeros_(self.mask_net[-1].bias)
         
+        # Scaling parameters
+        self.gamma = gamma
+        self.beta = beta
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+
+        # ---- feature dropout (only available genes) ----
+        if self.training and self.dropout_rate > 0:
+            keep = torch.bernoulli(
+                torch.full_like(x, 1.0 - self.dropout_rate)
+            )
+            keep = keep * mask
+            x = x * keep / (1.0 - self.dropout_rate)
+
+        # ---- base projection ----
+        h = self.linear(x)
+
+        # ---- FiLM modulation ----
+        film = self.mask_net(mask.detach())
+        gamma, beta = film.chunk(2, dim=-1)
+
+        # keep gamma near 1 instead of 0
+        gamma = 1 + self.gamma * torch.tanh(gamma)
+        beta = self.beta * beta
+
+        return gamma * h + beta
+    
+    
+class ConcatConditioner(nn.Module):
+    def __init__(self, mask_dropout: float = 0.05):
+        super().__init__()
+        self.mask_dropout = mask_dropout
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+        # stochastic feature hiding
+        if self.training and self.mask_dropout > 0:
+            drop = (torch.rand_like(mask) < self.mask_dropout).float()
+            mask = mask * (1.0 - drop)
+
+        # masked expression
+        x_masked = x * mask.detach()
+
+        # concat
+        return torch.cat([x_masked, mask], dim=-1)
+    
+    
+class LowRankDecoder(nn.Module):
+    """
+    Predict broad baseline expression from global latent.
+    Low-rank structure prevents encoding fine perturbation effects.
+    """
+
+    def __init__(self, z_dim: int, n_genes: int, rank: int = 32):
+        super().__init__()
+
+        self.proj = nn.Linear(z_dim, rank, bias=False)
+        self.genes = nn.Linear(rank, n_genes, bias=False)
+
+    def forward(self, z):
+        return self.genes(self.proj(z))
+
 
 class SplitEncoder(nn.Module):
     def __init__(
@@ -903,63 +1094,80 @@ class SplitEncoder(nn.Module):
         n_input: int,
         n_output: int,
         n_hidden: int,
-        n_dim_gene_emb: int | None = None,
+        n_layers: int = 2,
         n_cat_list: Iterable[int] = None,
         dropout_rate: float = 0.1,
         var_eps: float = 1e-4,
         var_activation: Callable | None = None,
-        use_funnel_zlocal: bool = True,
-        feature_masks: torch.Tensor | None = None,
+        use_feature_mask: bool = False,
+        feature_mask_method: Literal['gate', 'film', 'concat'] = 'concat',
+        n_output_local: int | None = 64,
+        n_output_global: int | None = 16,
+        enforce_orthogonality: bool = False,
+        local_rec_lambda: float = 0.0,
         **kwargs,
     ):
         super().__init__()
-        
+        # Check if specific output dimension is given for global
+        if n_output_global is None:
+            n_output_global = n_output
+        if n_output_local is None:
+            n_output_local = n_output
+        # Set base global input dimension
+        n_input_global = n_input
+        self.feature_mask_method = feature_mask_method
         # Double input dimension if we are using input masks
-        self.use_feature_masks = feature_masks is not None
-        if self.use_feature_masks:
-            n_input = int(n_input * 2)
-            # Save feature masks as buffer
-            self.register_buffer("feature_masks", feature_masks)
-
-        # -------------------------
-        # Global path (reconstruction)
-        # -------------------------
-        self.global_encoder = FunnelFCLayers(
-            n_in=n_input,
-            n_out=n_output,
-            n_hidden=n_hidden,
-            n_cat_list=n_cat_list,
-            dropout_rate=dropout_rate,
-        )
-
-        self.global_mu = nn.Linear(n_output, n_output)
-        self.global_var = nn.Linear(n_output, n_output)
-
-        # -------------------------
-        # Local path (semantic / CLIP)
-        # -------------------------
-        if use_funnel_zlocal:
-            self.local_encoder = FunnelFCLayers(
-            n_in=n_input,
-            n_out=n_output,
-            n_hidden=n_hidden,
-            n_cat_list=n_cat_list,
-            dropout_rate=dropout_rate,
-        )
+        if use_feature_mask:
+            if feature_mask_method == 'gate':
+                self.gate = GatedConditioner(n_input)
+            elif feature_mask_method == 'film':
+                self.gate = FiLMConditioner(n_input, gamma=0.1, beta=0.1)
+            elif feature_mask_method == 'concat':
+                n_input_global *= 2
+                self.gate = ConcatConditioner()
+            else:
+                raise ValueError(f'Unrecognized argument for "feature_mask_method": "{feature_mask_method}"')
         else:
-            self.local_encoder = GeneEmbeddingEncoder(
-                n_input=n_input,
-                n_output=n_output,
-                n_hidden=n_output,
-                n_dim_gene_emb=n_dim_gene_emb,
-                dropout_rate=dropout_rate,
-            )
-        self.local_mu = nn.Linear(n_output, n_output)
-        self.local_var = nn.Linear(n_output, n_output)
+            self.gate = None
+            
+        # Shared encoder trunk
+        self.trunk = FunnelFCLayers(
+            n_in=n_input_global,
+            n_out=n_hidden,
+            n_hidden=-1,
+            n_layers=n_layers,
+            n_cat_list=n_cat_list,
+            dropout_rate=dropout_rate,
+        )
+
+        # ---------------------------------
+        # Global path (reconstruction)
+        # ---------------------------------
+        self.global_mu = nn.Linear(n_hidden, n_output_global)
+        self.global_var = nn.Linear(n_hidden, n_output_global)
+
+        # ---------------------------------
+        # Local path (semantic / CLIP)
+        # ---------------------------------
+        self.local_mu = nn.Linear(n_hidden, n_output_local)
+        self.local_var = nn.Linear(n_hidden, n_output_local)
         
+        # Small projection heads
+        self.global_proj = nn.Linear(n_hidden, n_hidden)
+        self.local_proj = nn.Linear(n_hidden, n_hidden)
+
+        # Combined sampler
+        full_dim = n_output_global + n_output_local
+        self.full_mu = nn.Linear(full_dim, n_output)
+        self.full_var = nn.Linear(full_dim, n_output)
+   
         # Var activations
-        self.var_activation = torch.exp if var_activation is None else var_activation
+        self.var_activation = torch.nn.functional.softplus if var_activation is None else var_activation
         self.var_eps = var_eps
+        
+        # Options
+        self.enforce_orthogonality = enforce_orthogonality
+        self.local_rec_lambda = local_rec_lambda
         
     def decorrelation_reg(self, z_g: torch.Tensor, z_l: torch.Tensor, eps: float = 1e-6):
         """
@@ -978,35 +1186,71 @@ class SplitEncoder(nn.Module):
         C = (z_g.T @ z_l) / z_g.size(0)
 
         return C ** 2
+    
+    def orthogonalize_subspace(self, z_local, z_global, eps=1e-6):
+        # normalize global vectors
+        g = z_global / (z_global.norm(dim=1, keepdim=True) + eps)
 
-    def forward(self, x: torch.Tensor, *cat_list, g: torch.Tensor | None = None, ctx_label: torch.Tensor | None = None, **kwargs):
-        # Use feature masks if given and enabled
-        if self.use_feature_masks and ctx_label is not None:
-            feat_mask = self.feature_masks[ctx_label.flatten()]
-            x_masked = x * feat_mask
-            x = torch.cat([x_masked, feat_mask], dim=-1)
-        # ---- global (decoder) ----
-        h_g = self.global_encoder(x, *cat_list)
-        mu_g = self.global_mu(h_g)
-        var_g = self.var_activation(self.global_var(h_g)) + self.var_eps
-        qzg = Normal(mu_g, var_g.sqrt())
-        z_g = qzg.rsample()
+        # compute projection matrix per sample
+        proj = (z_local * g).sum(dim=1, keepdim=True)
 
-        # ---- local (CLIP) ----
-        local_out = self.local_encoder(x, g)
-        # Latent heads
-        q_ml = self.local_mu(local_out)
-        q_vl = self.var_activation(self.local_var(local_out)) + self.var_eps
-        qzl = Normal(q_ml, q_vl.sqrt())
-        zl = qzl.rsample()
+        return z_local - proj * g
+    
+    def _sample(self, mu: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+        return mu + torch.sqrt(var) * torch.randn_like(var)
+
+    def forward(self, x: torch.Tensor, *cat_list, feature_masks: torch.Tensor, g: torch.Tensor | None = None, **kwargs):
+        # Gate x
+        if self.gate is not None and feature_masks is not None:
+            x = self.gate(x, feature_masks)
+            
+        # Shared trunk encoder
+        h = self.trunk(x, *cat_list)
+        # TODO: additive mask on projection, positional embeddings?
+        #h = h + self.mask_proj(mask)
+
+        # ---- global latent ----
+        h_g = self.global_proj(h)
+        qm_g = self.global_mu(h_g)
+        qv_g = self.var_activation(self.global_var(h_g)) + self.var_eps
+        qz_g = Normal(qm_g, qv_g.sqrt())
+        z_g = self._sample(qm_g, qv_g)
+        
+        # ---- local latent ----
+        h_l = h + 0.02*torch.randn_like(h) if self.training else h
+        h_l = self.local_proj(h_l)
+        qm_l = self.local_mu(h_l)
+        qv_l = self.var_activation(self.local_var(h_l)) + self.var_eps
+        qz_l = Normal(qm_l, qv_l.sqrt())
+        z_l = self._sample(qm_l, qv_l)
+        
+        # optional orthogonalization
+        if self.enforce_orthogonality:
+            z_l = self.orthogonalize_subspace(z_l, z_g.detach())
+            
+        # optional partial detach of zlocal
+        if self.training and self.local_rec_lambda > 0:
+            mask = (torch.rand_like(z_l[:, :1]) < self.local_rec_lambda).float()
+            rec_z_l = z_l * mask + z_l.detach() * (1 - mask)
+        else:
+            rec_z_l = z_l.detach()
+
+        # Combine both spaces for final reconstruction
+        h_full = torch.cat([z_g, rec_z_l], dim=-1)
+        qm = self.full_mu(h_full)
+        qv = self.var_activation(self.full_var(h_full)) + self.var_eps
+        qz = Normal(qm, qv.sqrt())
+        z = self._sample(qm, qv)
 
         return {
-            MODULE_KEYS.Z_KEY: z_g,
-            MODULE_KEYS.QZ_KEY: qzg,
-            MODULE_KEYS.QZM_KEY: mu_g,
-            MODULE_KEYS.QZV_KEY: var_g,
-            "zl": zl,
-            "qzl": qzl,
+            MODULE_KEYS.Z_KEY: z,
+            MODULE_KEYS.QZ_KEY: qz,
+            MODULE_KEYS.QZM_KEY: qm,
+            MODULE_KEYS.QZV_KEY: qv,
+            "zg": z_g,
+            "qzg": qz_g,
+            "zl": z_l,
+            "qzl": qz_l,
         }
 
 
@@ -1040,6 +1284,9 @@ class DecoderSCVI(nn.Module):
         if n_ctx_frac is not None:
             n_context_compression = int(n_input * n_ctx_frac)
         self.use_film = use_film
+        # Get cat input dim
+        self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in (n_cat_list or [])]
+        self.cat_dim = sum(self.n_cat_list)
 
         # Compress context embedding dimension to reduce its effect
         if self.n_dim_context_emb > 0 and n_context_compression is not None and n_context_compression > 0:
@@ -1075,7 +1322,6 @@ class DecoderSCVI(nn.Module):
         else:
             if use_funnel:
                 fc_layer_class = FunnelFCLayers
-                n_hidden = -1
             else:
                 fc_layer_class = FCLayers
             # Create main px decoder
@@ -1104,27 +1350,46 @@ class DecoderSCVI(nn.Module):
         else:
             raise ValueError(f"Unknown scale_activation: {scale_activation}")
 
+        # Add last distribution decoder layers
         self.px_scale_decoder = nn.Sequential(nn.Linear(funnel_out_dim, n_output), px_scale_activation)
         self.px_r_decoder = nn.Linear(funnel_out_dim, n_output)
         self.px_dropout_decoder = nn.Linear(funnel_out_dim, n_output)
-
-    def forward(self, dispersion: str, z: torch.Tensor, library: torch.Tensor, *cat_list: int, context_emb: torch.Tensor | None = None):
-        # Concatenate or modulate by context
-        if self.n_dim_context_emb > 0 and context_emb is not None:
-            # Use FiLM to combine the latent space with batch information
-            if self.use_film:
-                px = self.film(z, context_emb)
-            # Use simple concatenation
-            else:
-                if self.ctx_compression is not None:
-                    ctx_emb = self.ctx_compression(context_emb)
-                else:
-                    ctx_emb = context_emb
-                z = torch.cat([z, ctx_emb], dim=-1)
-            px = self.px_decoder(z, *cat_list)
+        
+        # FiLM layers: covariates -> scale/shift for decoder hidden dim
+        if self.cat_dim > 0:
+            self.film_scale = nn.Linear(self.cat_dim, funnel_out_dim)
+            self.film_shift = nn.Linear(self.cat_dim, funnel_out_dim)
+            # Init scale near zero so FiLM starts as identity
+            nn.init.zeros_(self.film_scale.weight)
+            nn.init.zeros_(self.film_scale.bias)
+            nn.init.zeros_(self.film_shift.weight)
+            nn.init.zeros_(self.film_shift.bias)
         else:
-            px = self.px_decoder(z, *cat_list)
+            self.film_scale = None
+            self.film_shift = None
+        
+    def _apply_film(self, px: torch.Tensor, *cat_list: int):
+        """Apply FiLM conditioning from categorical covariates."""
+        one_hot_cat_list = []
+        for n_cat, cat in zip(self.n_cat_list, cat_list, strict=False):
+            if n_cat > 1:
+                cat = cat.squeeze(-1) if cat.dim() == 2 and cat.size(-1) == 1 else cat
+                one_hot_cat_list.append(F.one_hot(cat, num_classes=n_cat).float())
+        
+        if one_hot_cat_list and self.film_scale is not None:
+            cat_input = torch.cat(one_hot_cat_list, dim=-1)
+            cat_input = cat_input.expand(px.shape[0], -1)
+            gamma = self.film_scale(cat_input)   # (B, funnel_out_dim)
+            beta = self.film_shift(cat_input)    # (B, funnel_out_dim)
+            px = px * (1 + gamma) + beta
+        
+        return px
 
+    def forward(self, dispersion: str, z: torch.Tensor, library: torch.Tensor, *cat_list: int, **kwargs):
+        # Decode z without covariates
+        px = self.px_decoder(z)
+        # FiLM modulation from covariates
+        px = self._apply_film(px, *cat_list)
         # Output heads
         px_scale = self.px_scale_decoder(px)
         px_dropout = self.px_dropout_decoder(px)
@@ -1602,7 +1867,9 @@ class ClassEmbedding(nn.Module):
         lora_rank: int = 8,
         lora_dropout: int = 0.1,
         ignore_texts: bool = False,
-        n_prototypes: int = 4,
+        n_prototypes: int = 1,
+        use_null_proxy: bool = False,
+        n_ctrl: int = 3,
     ):
         super().__init__()
 
@@ -1611,6 +1878,7 @@ class ClassEmbedding(nn.Module):
         self.max_length = max_length
         self.batch_size = batch_size
         self.freeze = freeze
+        self.use_null_proxy = use_null_proxy
 
         # -----------------------------
         # Case 1: Transformer text encoder
@@ -1702,14 +1970,26 @@ class ClassEmbedding(nn.Module):
             self.adapter = nn.Identity()
             self.use_adapter = False
 
+        C, D = self._num_classes, self._emb_dim
         # Use multi-prototypes (optional)
         if n_prototypes > 1:
-            C, D = self._num_classes, self._emb_dim
-            self.delta = nn.Parameter(torch.randn(C, n_prototypes, D) * 0.01)
+            self.delta = nn.Parameter(torch.randn(C, n_prototypes, D) / math.sqrt(D))
             self.use_prototypes = True
             self.n_prototypes = n_prototypes
         else:
             self.use_prototypes = False
+            
+        # Add non-responder null proxy (optional)
+        self.use_null_proxy = use_null_proxy
+        if use_null_proxy:
+            if self.use_prototypes:
+                self.null_delta = nn.Parameter(
+                    torch.randn(n_ctrl, self.n_prototypes, D) / math.sqrt(D)
+                )
+            else:
+                self.null_delta = nn.Parameter(
+                    torch.randn(n_ctrl, D) / math.sqrt(D)
+                )
             
         # Move module to device
         self.to(device)
@@ -1754,6 +2034,11 @@ class ClassEmbedding(nn.Module):
         loss = ((gram - eye) ** 2).mean()
 
         return loss
+    
+    def null_reg(self):
+        if not self.use_null_proxy:
+            return 0.0
+        return self.null_delta.pow(2).mean()
 
     # -------------------------------------------------------
     def forward(self, class_indices: torch.Tensor | list | None = None):
@@ -1779,6 +2064,12 @@ class ClassEmbedding(nn.Module):
             embeddings = self.adapter(embeddings)
             if self.use_prototypes:
                 embeddings = embeddings[:, None, :] + self.delta
+            # Append NULL proxy
+            if self.use_null_proxy:
+                null = self.null_delta
+                # expand dtype/device safety
+                null = null.to(embeddings.device)
+                embeddings = torch.cat([embeddings, null], dim=0)
             return embeddings
 
         # ---------------------------------------------------------
@@ -1824,7 +2115,12 @@ class ClassEmbedding(nn.Module):
         # Create multi-prototypes (optional)
         if self.use_prototypes:
             embeddings = embeddings[:, None, :] + self.delta
-            
+        # Append NULL proxy
+        if self.use_null_proxy:
+            null = self.null_delta
+            # expand dtype/device safety
+            null = null.to(embeddings.device)
+            embeddings = torch.cat([embeddings, null], dim=0)
         return embeddings
     
 
@@ -2008,8 +2304,8 @@ class EmbeddingAligner(nn.Module):
         temperature: float = 0.1,
         min_temperature: float = 0.07,
         use_learnable_temperature: bool = False,
-        use_controller: bool = True,
-        mode: Literal["latent_to_class", "class_to_latent", "shared"] = "latent_to_class",
+        use_controller: bool = False,
+        mode: Literal["latent_to_class", "class_to_latent", "shared"] = "shared",
         use_cross_attention: bool = False,
         linear_z_proj: bool = True,
         linear_c_proj: bool = True,
@@ -2100,9 +2396,9 @@ class EmbeddingAligner(nn.Module):
 
     @property
     def temperature(self) -> torch.Tensor:
-        # Use minimum temperature at inference
+        # Use static temperature at inference
         if not self.training:
-            return self._min_temperature
+            return self._temperature
         # Return training temperature
         if self.use_learnable_temperature:
             # Calculate logit scale
@@ -2125,7 +2421,7 @@ class EmbeddingAligner(nn.Module):
         """
         Parameters
         ----------
-        x : Tensor, shape (batch, latent_dim)
+        x : Tensor, shape (batch, input_dim)
         cls_emb : Optional[Tensor], shape (n_labels, embed_dim)
         labels : Optional[Tensor], shape (batch,)
         """
@@ -2138,20 +2434,19 @@ class EmbeddingAligner(nn.Module):
         # Apply projections
         z = self.latent_projection(x)               # (batch, d)
         c = self.class_projection(cls_emb)     # (n_labels, d)
-        # Add some noise to class embedding to avoid having a fixed point
-        if self.noise_sigma is not None and self.noise_sigma > 0:
-            c = c + self.noise_sigma * F.normalize((torch.rand_like(c) * 2 - 1), dim=-1)
+        # Add some dropout to z
         if self.dropout_rate > 0:
             z = self.dropout(z)
-        # Apply normalization to projections
-        z_norm = F.normalize(z, dim=-1)
-        c_norm = F.normalize(c, dim=-1)
         
         if not return_logits:
             return {
-                MODULE_KEYS.Z_SHARED_KEY: z_norm,
-                MODULE_KEYS.CLS_PROJ_KEY: c_norm
+                MODULE_KEYS.Z_SHARED_KEY: z,
+                MODULE_KEYS.CLS_PROJ_KEY: c
             }
+            
+        # Apply normalization to projections
+        z_norm = F.normalize(z, dim=-1)
+        c_norm = F.normalize(c, dim=-1)
         
         # Set temperature
         T = T if T is not None else self.temperature
@@ -2179,9 +2474,9 @@ class EmbeddingAligner(nn.Module):
             if c_norm.ndim == 3:
                 sim_aug = torch.einsum("bd,cmd->bcm", z_norm, c_norm)   # (B, C, M)
                 if self.training:
-                    logits = torch.logsumexp(sim_aug / T, dim=-1)  # (B, C)
+                    logits = torch.logsumexp(sim_aug, dim=-1) / T # (B, C)
                 else:
-                    logits = torch.max(sim_aug / T, dim=-1).values  # (B, C)
+                    logits = torch.max(sim_aug, dim=-1).values / T # (B, C)
             else:
                 logits = (z_norm @ c_norm.T) / T
             z_proj = z_norm
