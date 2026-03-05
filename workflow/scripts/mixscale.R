@@ -7,8 +7,8 @@ parser$add_argument("-i", "--input", type = "character", required = TRUE, help =
 parser$add_argument("-o", "--output", type = "character", required = TRUE, help = "Path to output h5ad file.")
 parser$add_argument("-d", "--min_deg", type = "integer", required = FALSE, default = 5,
           help = "Minimum number of differentially expressed genes vs. control per perturbation, default is 5 (int)")
-parser$add_argument("-t", "--threshold", type = "double", required = FALSE, default = 2,
-          help = "Number of standart deviations from control group to filter cells for, default is 2 (float)")
+parser$add_argument("-t", "--threshold", type = "double", required = FALSE, default = 0,
+          help = "Number of standart deviations from control group to filter cells for, default is 0 (float)")
 parser$add_argument("-p", "--pcol", type = "character", required = FALSE, default = "perturbation",
           help = "Column that labels the perturbation in meta data, default is 'perturbation' (string)")
 parser$add_argument("-c", "--ctrl", type = "character", required = FALSE, default = "control",
@@ -84,7 +84,7 @@ if (max(seurat_obj$mixscale_score)!=0) {
 # 4. Subset by mixscale score threshold and include control cells in filtering
 message("Filtering dataset based on absolute mixscore > ", ctrl_dev)
 # 4.1 Filter with combined mask
-mask = (abs(seurat_obj$mixscale_score) > ctrl_dev) | (seurat_obj[[perturbation_col]]==ctrl_key)
+mask = (abs(seurat_obj$mixscale_score) >= ctrl_dev) | (seurat_obj[[perturbation_col]]==ctrl_key)
 seurat_obj$mixscale_mask <- mask
 seurat_obj <- subset(seurat_obj, subset = mixscale_mask)
 

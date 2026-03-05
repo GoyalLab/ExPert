@@ -1,16 +1,13 @@
 from src.utils import setup_logger
 from src.preprocess import preprocess_dataset
-import logging
 import scanpy as sc
-from pathlib import Path
 
 
 def process_dataset(dataset_file, output_path, **kwargs):
-    # read dataset from downloaded file
-    ds = sc.read(dataset_file)
     # prepare dataset
-    ds = preprocess_dataset(ds, **kwargs)
-    ds.write_h5ad(output_path, compression='gzip')
+    ds = preprocess_dataset(dataset_file, **kwargs)
+    # write prepared dataset to output file
+    ds.write_h5ad(output_path)
 
 
 if __name__ == "__main__":
@@ -30,6 +27,7 @@ if __name__ == "__main__":
             norm=snakemake.params.norm,
             log=snakemake.params.log_norm,
             scale=snakemake.params.scale,
+            hvg=snakemake.params.hvg,
             n_hvg=snakemake.params.n_hvg,
             subset=snakemake.params.subset,
             n_ctrl=snakemake.params.n_ctrl,

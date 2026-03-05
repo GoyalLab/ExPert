@@ -33,6 +33,7 @@ class EmbeddingProcessor:
             additional_targets: np.ndarray | None = None,
             cls_label: str = 'cls_label',
             sim_cutoff: float = 0.8,
+            filter_adata: bool = True,
         ):
         # Init class settings
         self.emb_p = emb_p
@@ -55,8 +56,9 @@ class EmbeddingProcessor:
         self.neg_key = neg_key
         self.pos_type = pos_type
         self.is_directional = False
+        self.filter_adata = filter_adata
 
-    def _read_embedding(self) -> pd.DataFrame:
+    def _read_embedding(self, inplace: bool = False) -> pd.DataFrame:
         if self.emb_p.endswith('.pickle'):
             with open(self.emb_p, 'rb') as file:
                 emb = pd.DataFrame(pickle.load(file)).T
@@ -66,7 +68,11 @@ class EmbeddingProcessor:
             emb = pd.read_csv(self.emb_p, sep='\t', index_col=0)
         else:
             raise ValueError(f'Unsupported embedding file format provided.')
-        return emb
+        if inplace:
+            self.emb = emb
+            return
+        else:
+            return emb
 
     def _filter_emb(self, observed_genes: list[str], inplace: bool = True) -> None | pd.DataFrame:
         """Filter external embedding based on observed genes and additional targets."""
@@ -187,7 +193,7 @@ class EmbeddingProcessor:
         # Check number of unique perturbations to classify
         logging.info(f'Initializing dataset with {adata.obs[self.p_col].nunique()} classes.')
 
-    def _filter_classes_by_similarity(self, adata: ad.AnnData, sim_cutoff: float = 0.8, return_graph: bool = False):
+    def _filter_classes_by_similarity(self, adata: ad.AnnData, sim_cutoff: float = 0.8, return_graph: bool = False, subset: bool = True):
         """Filter classes by similarity cutoff.""" 
         # Check if embedding is not directional
         self.assert_not_directional()
@@ -219,8 +225,12 @@ class EmbeddingProcessor:
             rep = class_support.iloc[comp].idxmax()
             keep_idx.append(rep)
         # Subset adata
-        adata._inplace_subset_obs(adata.obs[self.p_col].isin(keep_idx))
-        logging.info(f'Adata has {adata.obs[self.p_col].nunique()} classes after similarity filtering.')
+        if subset:
+            adata._inplace_subset_obs(adata.obs[self.p_col].isin(keep_idx))
+            logging.info(f'Adata has {adata.obs[self.p_col].nunique()} classes after similarity filtering.')
+        else:
+            # Return perturbations
+            return keep_idx
         if return_graph:
             return G
         
@@ -271,8 +281,9 @@ class EmbeddingProcessor:
         self._add_direction_to_emb(adata)
         logging.info(f'Adding embedding to adata.')
         self._add_emb_to_uns(adata)
-        logging.info(f'Removing empty cells or genes from adata.')
         # Remove genes with no counts (zero-padded)
-        sc.pp.filter_genes(adata, min_counts=1)
-        sc.pp.filter_cells(adata, min_counts=1)
+        if self.filter_adata:
+            logging.info(f'Removing empty cells or genes from adata.')
+            sc.pp.filter_genes(adata, min_counts=1)
+            sc.pp.filter_cells(adata, min_counts=1)
         self.log_adata(adata)

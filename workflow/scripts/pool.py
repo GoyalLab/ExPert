@@ -10,7 +10,15 @@ def get_pool(files: Iterable[str], method: Literal['intersection', 'union'] = 'i
     # Read all .var annotations from datasets
     pool = [pd.read_csv(file, index_col=0) for file in files]
     # Determine union and intersection of indices (genes)
-    all_genes = [set(v.index) for v in pool]
+    all_genes = []
+    for v in pool:
+        if 'highly_variable' in v.columns:
+            logging.info(f'{v.shape[0]} genes, {v["highly_variable"].astype(bool).sum()} HVGs in {v.columns[0]}')
+            hvg_v = v[v['highly_variable'].astype(bool)]
+            all_genes.append(set(hvg_v.index))
+        else:
+            logging.info(f'{v.shape[0]} genes, no HVG annotation in {v.columns[0]}')
+            all_genes.append(set(v.index))
     union_genes = set.union(*all_genes)
     intersection_genes = set.intersection(*all_genes)
     logging.info(f'Union unique genes: {len(union_genes)}, intersection: {len(intersection_genes)}')

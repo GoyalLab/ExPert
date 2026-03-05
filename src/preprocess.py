@@ -307,7 +307,7 @@ def ens_to_symbol(adata: ad.AnnData) -> ad.AnnData:
         logging.info(f'Found duplicate indices for ensembl to symbol mapping, highest number of conflicts: {adata.var_names.value_counts().max()}')
         # Fix conflicts by choosing the gene with the higher harmonic mean of mean expression and normalized variance out of pool
         if len(set(['means', 'variances_norm']).intersection(adata.var.columns)) == 2:
-            adata.var['hm_var'] = (2 * adata.var.means * adata.var.variances_norm) / (adata.var.means + adata.var.variances_norm)
+            adata.var['hm_var'] = (2 * adata.var.means * adata.var.variances_norm) / (adata.var.means + adata.var.variances_norm + 1e-9)
         else:
             adata.var['hm_var'] = np.arange(adata.n_vars)
         idx = adata.var.reset_index().groupby(gsh, observed=True).hm_var.idxmax().values
@@ -416,9 +416,75 @@ def read_adata(
             adata._inplace_subset_obs(sp_mask)
     return adata
 
+def read_subset(
+    adata_p: str,
+    p_col: str = 'perturbation',
+    ctrl_key: str = 'control',
+    perturbation_pool_file: str | None = None,
+    use_perturbation_pool: bool = True,
+    n_ctrl: int = 10_000,
+    ensure_csr: bool = True,
+) -> ad.AnnData:
+    # Load adata in backed mode (meta-data only)
+    try:
+        adata = sc.read(adata_p, backed='r')
+        logging.info(f'Preprocessing dataset with shape: {adata.shape} (cells x genes)')
+        # Find correct perturbation key
+        p_idx = _find_match_idx(adata.obs.columns, P_COLS)
+        p_key = adata.obs.columns[p_idx]
+        # Subset adata to target perturbations
+        if use_perturbation_pool:
+            gene_targets = pd.read_csv(perturbation_pool_file, index_col=0)[OBS_KEYS.POOL_PERTURBATION_KEY]
+            gene_targets = gene_targets[~gene_targets.isin(CTRL_KEYS)]
+            mask = adata.obs[p_key].isin(gene_targets)
+        # Or keep all cells
+        else:
+            mask = np.ones(adata.n_obs).astype(bool)
+        # Randomly sample n control cells or use all available cells
+        sample_control = n_ctrl is not None and n_ctrl > 0
+        ctrl_mask = adata.obs[p_key].str.lower().isin(CTRL_KEYS)
+        if ctrl_mask.sum() == 0:
+            raise ValueError(f'No matching control key found in adata.obs["{p_key}"], looked for "{CTRL_KEYS}"')
+        if sample_control:
+            # Add all control cells if there are less than given
+            if n_ctrl > ctrl_mask.sum():
+                logging.info(f'Adding all {ctrl_mask.sum()} control cells')
+                mask |= ctrl_mask
+            # Sample N control cells
+            else:
+                logging.info(f'Sampling {n_ctrl} control cells from {ctrl_mask.sum()}')
+                ctrl_indices = np.where(ctrl_mask)[0]
+                sampled_ctrl = np.random.choice(ctrl_indices, size=n_ctrl, replace=False)
+                sampled_mask = np.zeros(adata.n_obs, dtype=bool)
+                sampled_mask[sampled_ctrl] = True
+                mask |= sampled_mask
+        # Subset adata view
+        subset = adata[mask]
+        # Load only subset into memory
+        logging.info(f'Loading {mask.sum()} selected cells')
+        subset = subset.to_memory()
+    except Exception as e:
+        raise e
+    finally:
+        adata.file.close()
+    # Rename perturbation column
+    subset.obs[p_col] = subset.obs[p_key].values
+    # Rename control column
+    if sample_control:
+        ctrl_mask = subset.obs[p_col].str.lower().isin(CTRL_KEYS)
+        if ctrl_mask.sum() > 0:
+            ps = np.array(subset.obs[p_col], dtype=str)
+            ps[ctrl_mask] = ctrl_key
+            subset.obs[p_col] = pd.Categorical(ps)
+    # Ensure subset.X is in csr format
+    if ensure_csr and not isinstance(subset.X, sp.csr_matrix):
+        logging.info('Converting adata.X to CSR matrix.')
+        subset.X = sp.csr_matrix(subset.X)
+    return subset
+
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/normalization.html
 def preprocess_dataset(
-        adata: ad.AnnData, 
+        dataset_file: str, 
         cancer: bool,
         perturbation_pool_file: str,
         feature_pool_file: str,
@@ -427,8 +493,8 @@ def preprocess_dataset(
         norm: bool = False, 
         log: bool = False, 
         scale: bool = False, 
-        hvg: bool = False,
-        n_hvg: int = 2000, 
+        hvg: bool = True,
+        n_hvg: int = 3000, 
         subset: bool = False, 
         n_ctrl: int | None = 10_000,
         single_perturbations_only: bool = True,
@@ -444,15 +510,15 @@ def preprocess_dataset(
         seed: int = 42,
         remove_invalid_labels: bool = True,
     ) -> ad.AnnData:
-    logging.info(f'Preprocessing dataset with shape: {adata.shape} (cells x genes)')
-    # Ensure adata.X is in csr format
-    if not isinstance(adata.X, sp.csr_matrix):
-        logging.info('Converting adata.X to CSR matrix.')
-        adata.X = sp.csr_matrix(adata.X)
-    # Check perturbation column
-    check_p_col(adata, p_col=p_col)
-    # Check control key
-    check_ctrl_col(adata, p_col=p_col, ctrl_key=ctrl_key)
+    logging.info(f'Reading: {dataset_file}')
+    adata = read_subset(
+        adata_p=dataset_file, 
+        p_col=p_col, 
+        ctrl_key=ctrl_key, 
+        perturbation_pool_file=perturbation_pool_file, 
+        use_perturbation_pool=use_perturbation_pool, 
+        n_ctrl=n_ctrl
+    )
     # Clean up perturbation label
     adata.obs[p_col] = clean_perturbation_labels(adata.obs[p_col], keep_versions=keep_versions)
     # Remove unknown or NaN labels
@@ -464,11 +530,6 @@ def preprocess_dataset(
         sp_mask = single_perturbation_mask(adata.obs, p_col=p_col)
         if sp_mask is not None:
             adata._inplace_subset_obs(sp_mask)
-    # Filter perturbations for perturbation pool if given
-    if use_perturbation_pool:
-        _filter_perturbation_pool(adata, perturbation_pool_file=perturbation_pool_file, p_col=p_col)
-    if n_ctrl is not None:
-        subset_ctrl_cells(adata, n_ctrl=n_ctrl, seed=seed, perturbation_col=p_col, ctrl_key=ctrl_key)
     # apply quality control measures
     if qc:
         logging.info(f'Quality control for dataset {name}')

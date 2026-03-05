@@ -23,7 +23,6 @@ config = load_configs(wf=workflow)
 
 ## PARAMETERS: I/O
 CACHE_DIR = str(config.get('cache_dir'))
-LOG = config.get('log_dir')
 # List of datasets to process
 DATASET_SHEET = read_data_sheet(config)
 DATASET_NAMES = DATASET_SHEET.index.tolist()
@@ -33,6 +32,7 @@ DATASET_NAMES = DATASET_SHEET.index.tolist()
 CONFIG_HASH = get_param_hash(config, DATASET_NAMES)
 OUTPUT_DIR = os.path.join(str(config['output_dir']), CONFIG_HASH)
 PLT_DIR = os.path.join(OUTPUT_DIR, config['plot_dir']) if config['plot_dir'] != '' else None
+LOG = os.path.join(OUTPUT_DIR, config['log_dir'])
 # save used params in output directory
 save_config(config, os.path.join(OUTPUT_DIR, 'config.yaml'))
 
@@ -85,6 +85,8 @@ rule download_dataset:
         url = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.URL],
         name = lambda wildcards: wildcards.dataset,
         cache = config['cache']
+    cluster:
+        output = os.path.join(LOG, 'downloads', "{dataset}.slurm.log")
     resources:
         **get_job_resources(config['resources'], job_name='download_dataset')
     script:
@@ -103,6 +105,8 @@ rule meta_info:
         min_cells_per_class = config['min_cells_per_class'],
         dataset_sheet = DATASET_SHEET,
         plt_dir = PLT_DIR
+    cluster:
+        output = os.path.join(LOG, 'meta_info.slurm.log')
     resources:
         **get_job_resources(config['resources'], job_name='meta_info')
     script:
@@ -125,6 +129,7 @@ rule process_dataset:
         norm = config['norm'],
         log_norm = config['log_norm'],
         scale = config['scale'],
+        hvg = config['hvg'],
         n_hvg = config['n_hvg'],
         subset = config['subset_hvg'],
         n_ctrl = config['n_ctrl'],
@@ -137,6 +142,8 @@ rule process_dataset:
         p_col = config['perturbation_col'],
         ctrl_key = config['ctrl_key'],
         seed = config['seed']
+    cluster:
+        output = os.path.join(LOG, 'processing', "{dataset}.slurm.log")
     resources:
         time = config['resources']['jobs']['process_dataset']['time'],
         mem = lambda wildcards: DATASET_SHEET.loc[wildcards.dataset, DATA_SHEET_KEYS.MEM],
@@ -169,22 +176,28 @@ if config['mixscale_filter']:
             filtered_file = os.path.join(FILTER_DIR, "{dataset}.h5ad")
         conda:
             "workflow/envs/mixscale.yaml"
+        log:
+            os.path.join(LOG, 'filter_cells_by_efficiency', "{dataset}.log")
         params:
             ctrl_dev = config['ctrl_dev'],
             perturbation_col = config['perturbation_col'],
             ctrl_key = config['ctrl_key'],
             min_deg = config['min_deg'],
+        cluster:
+            output = os.path.join(LOG, 'filter_cells_by_efficiency', "{dataset}.slurm.log")
         resources:
             time = config['resources']['jobs']['filter_cells_by_efficiency']['time'],
             mem = lambda wc: estimate_resources(
                 os.path.join(PROCESS_DIR, f"{wc.dataset}.h5ad"),
                 resource_config=config["resources"],
-                factor=6
+                factor=6,
+                job_name='filter_cells_by_efficiency'
             )['mem'],
             partition = lambda wc: estimate_resources(
                 os.path.join(PROCESS_DIR, f"{wc.dataset}.h5ad"),
                 resource_config=config["resources"],
-                factor=6
+                factor=6,
+                job_name='filter_cells_by_efficiency'
             )['partition'],
             cpus_per_task = int(config['resources']['jobs']['filter_cells_by_efficiency'].get('threads', 1)),
         shell:
@@ -207,10 +220,12 @@ else:
 rule determine_hvg:
     input:
         os.path.join(FILTER_DIR, "{dataset}.h5ad")
-    params:
-        hvg = config['hvg']
     output:
         os.path.join(HVG_DIR, "{dataset}_hvgs.csv")
+    log:
+        os.path.join(LOG, 'determine_hvg', "{dataset}.log")
+    cluster:
+        output = os.path.join(LOG, 'determine_hvg', "{dataset}.slurm.log")
     resources:
         **get_job_resources(config['resources'], job_name='determine_hvg')
     script:
@@ -227,6 +242,8 @@ rule build_gene_pool:
         os.path.join(LOG, 'pool.log')
     params:
         var_merge = config['var_merge']
+    cluster:
+        output = os.path.join(LOG, 'pool.slurm.log')
     resources:
         **get_job_resources(config['resources'], job_name='build_gene_pool')
     script:
@@ -246,17 +263,21 @@ rule prepare_dataset:
     params:
         zero_pad = config['zero_padding'],
         kwargs = config,
+    cluster:
+        output = os.path.join(LOG, 'prepare', "{dataset}.slurm.log")
     resources:
         time = config['resources']['jobs']['prepare_dataset']['time'],
         mem = lambda wc: estimate_resources(
             os.path.join(FILTER_DIR, f"{wc.dataset}.h5ad"),
             resource_config=config["resources"],
-            factor=2
+            factor=2,
+            job_name='prepare_dataset'
         )['mem'],
         partition = lambda wc: estimate_resources(
             os.path.join(FILTER_DIR, f"{wc.dataset}.h5ad"),
             resource_config=config["resources"],
-            factor=2
+            factor=2,
+            job_name='prepare_dataset'
         )['partition'],
     script:
         "workflow/scripts/prepare_dataset.py"
@@ -276,6 +297,8 @@ rule merge_datasets:
     params:
         meta_sheet = DATASET_SHEET,
         merge_method = config['merge_method']
+    cluster:
+        output = os.path.join(LOG, 'merge.slurm.log')
     resources:
         **get_job_resources(config['resources'], job_name='merge_datasets')
     script:
@@ -315,6 +338,8 @@ if OUTPUT_FILE_W_EMB is not None:
             gene_embedding_file = config['gene_embedding'],
             ctx_embedding_file = config['context_embedding'],
             add_emb_for_features = config['add_emb_for_features'],
+        cluster:
+            output = os.path.join(LOG, 'add_emb.slurm.log')
         resources:
             **get_job_resources(config['resources'], job_name='add_gene_embedding')
         script:
