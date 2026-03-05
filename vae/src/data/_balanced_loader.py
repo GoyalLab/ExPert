@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler, BatchSampler, Sampler
 from copy import deepcopy
@@ -11,6 +12,94 @@ from scvi import REGISTRY_KEYS, settings
 from scvi.data import AnnDataManager
 
 logger = logging.getLogger(__name__)
+
+
+class _MutableBatchSampler(Sampler):
+    """Wrapper that allows swapping the inner sampler after DataLoader init."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.batch_size = getattr(inner, 'batch_size', None)
+
+    def __iter__(self):
+        yield from self.inner
+
+    def __len__(self):
+        return len(self.inner)
+
+    def swap(self, new_inner):
+        self.inner = new_inner
+        self.batch_size = getattr(new_inner, 'batch_size', None)
+
+
+class BalancedEpochSampler(Sampler):
+    """Fast epoch-level balancing. Pre-computes group arrays, just shuffles and slices each epoch."""
+
+    def __init__(
+        self,
+        labels: np.ndarray,
+        dataset_ids: np.ndarray,
+        target_per_group: int | None = None,
+        max_ratio: float = 3.0,
+        min_samples: int = 4,
+        seed: int = 0,
+    ):
+        self.seed = seed
+        self.epoch = 0
+        self.min_samples = min_samples
+
+        # Pre-compute group arrays once
+        labels = np.asarray(labels)
+        dataset_ids = np.asarray(dataset_ids)
+        
+        self.group_keys = []
+        self.group_arrays = []
+        
+        # Build groups using pandas for speed
+        df = pd.DataFrame({'label': labels, 'dataset': dataset_ids, 'idx': np.arange(len(labels))})
+        for (label, ds), group in df.groupby(['label', 'dataset']):
+            arr = group['idx'].values
+            if len(arr) >= min_samples:
+                self.group_keys.append((label, ds))
+                self.group_arrays.append(arr)
+
+        # Compute target
+        group_sizes = np.array([len(a) for a in self.group_arrays])
+        if target_per_group is None:
+            self.target = int(np.median(group_sizes) * max_ratio)
+        else:
+            self.target = target_per_group
+
+        # Pre-compute length
+        self._len = sum(min(len(a), self.target) for a in self.group_arrays)
+
+    def _resample(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        
+        # Pre-allocate output
+        chunks = []
+        for arr in self.group_arrays:
+            n = len(arr)
+            if n >= self.target:
+                # Fast partial shuffle: pick target random indices
+                chosen = rng.choice(arr, size=self.target, replace=False)
+            else:
+                # Upsample with replacement
+                chosen = rng.choice(arr, size=self.target, replace=True)
+            chunks.append(chosen)
+        
+        indices = np.concatenate(chunks)
+        rng.shuffle(indices)
+        return indices
+
+    def __iter__(self):
+        return iter(self._resample().tolist())
+
+    def __len__(self):
+        return self._len
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
 
 class BalancedAnnDataLoader(DataLoader):
@@ -37,6 +126,12 @@ class BalancedAnnDataLoader(DataLoader):
         n_classes_per_batch: int | None = None,
         n_samples_per_class: int | None = None,
         min_contexts_per_class: int | None = None,
+        cap_per_group: int | None = None,
+        min_dataset_fraction: float = 0.5,
+        use_balanced_epochs: bool = False,
+        target_per_group: int | None = None,
+        max_ratio: float = 3.0,
+        min_group_samples: int = 4,
         **kwargs,
     ):
         # --- prepare indices
@@ -71,7 +166,6 @@ class BalancedAnnDataLoader(DataLoader):
         
         # set number of samples
         self.n_samples = n_samples * batch_size
-        
 
         if "num_workers" not in kwargs:
             kwargs["num_workers"] = settings.dl_num_workers
@@ -83,58 +177,153 @@ class BalancedAnnDataLoader(DataLoader):
         if sampler is not None and distributed_sampler:
             raise ValueError("Cannot specify both `sampler` and `distributed_sampler`.")
 
-        # --- create weighted sampler
+        # Store epoch balancing config — independent of contrastive
+        self.use_balanced_epochs = use_balanced_epochs
+        self.use_contrastive_loader = use_contrastive_loader
+        self._epoch_balancer = None
+
+        if self.use_balanced_epochs:
+            self._epoch_balancer = BalancedEpochSampler(
+                labels=labels,
+                dataset_ids=batches,
+                target_per_group=target_per_group,
+                max_ratio=max_ratio,
+                min_samples=min_group_samples,
+            )
+
+        # --- create sampler
         if sampler is None:
             if not distributed_sampler:
-                if use_contrastive_loader:
-                    batch_sampler = WeightedContrastiveBatchSampler(
-                        indices=indices,
-                        class_labels=labels,
-                        context_labels=batches,
-                        n_classes_per_batch=n_classes_per_batch,
-                        n_samples_per_class=n_samples_per_class,
-                        min_contexts_per_class=min_contexts_per_class,
-                        use_class_weights=self.use_balanced_weights,
+                if use_balanced_epochs:
+                    self._sampler = _MutableBatchSampler(
+                        BatchSampler(self._epoch_balancer, batch_size=batch_size, drop_last=drop_last)
                     )
-                    # Update batch size based on contrastive sampler
-                    batch_size = batch_sampler.batch_size
                 else:
                     # compute inverse-frequency weights per class
                     unique_labels, counts = np.unique(labels, return_counts=True)
                     class_weights = 1.0 / counts
-                    # Flip the frequencies to favour low-representation classes
                     if self.use_balanced_weights:
                         class_weights = compute_class_weight("balanced", classes=unique_labels, y=labels)
                     sample_weights = np.array([class_weights[np.where(unique_labels == l)[0][0]] for l in labels])
 
-                    # create weighted sampler
                     sampler = WeightedRandomSampler(
                         weights=torch.DoubleTensor(sample_weights),
                         num_samples=self.n_samples,
                         replacement=True,
                     )
+                    self._sampler = BatchSampler(sampler, batch_size=batch_size, drop_last=drop_last)
 
-                    # wrap into batch sampler
-                    batch_sampler = BatchSampler(sampler, batch_size=batch_size, drop_last=drop_last)
-
-                self.kwargs.update({"sampler": batch_sampler, "batch_size": None, "shuffle": False})
+                self.kwargs.update({"sampler": self._sampler, "batch_size": None, "shuffle": False})
             else:
                 raise NotImplementedError("Distributed sampler not implemented for weighted sampling.")
-            # do not touch batch size here, sampler gives batched indices
-            # This disables PyTorch automatic batching, which is necessary
-            # for fast access to sparse matrices
             self.kwargs.update({"batch_size": None, "shuffle": False})
         else:
             self.kwargs.update({"sampler": sampler})
 
+        # Store contrastive params for rebuilding each epoch
+        self._contrastive_params = dict(
+            n_classes_per_batch=n_classes_per_batch,
+            n_samples_per_class=n_samples_per_class,
+            min_contexts_per_class=min_contexts_per_class,
+            cap_per_group=cap_per_group,
+            min_dataset_fraction=min_dataset_fraction,
+            use_class_weights=self.use_balanced_weights,
+        )
+
         if iter_ndarray:
             self.kwargs.update({"collate_fn": lambda x: x})
+        # Save parameters
+        self._batch_size = batch_size
+        self._drop_last = drop_last
 
         super().__init__(self.dataset, **self.kwargs)
 
-        logger.info(f"Initialized BalancedAnnDataLoader with {len(self.dataset)} samples, "
-                    f"{len(np.unique(labels))} classes, batch size {batch_size}, "
-                    f"Contrastive: {use_contrastive_loader}.")
+        logger.info(
+            f"Initialized BalancedAnnDataLoader with {len(self.dataset)} samples, "
+            f"{len(np.unique(labels))} classes, batch size {batch_size}, "
+            f"Contrastive: {use_contrastive_loader}, "
+            f"Balanced epochs: {self.use_balanced_epochs}."
+        )
+
+    def _build_weighted_sampler(self, batch_size, drop_last):
+        """Build weighted random sampler, optionally from balanced subset."""
+        if self._epoch_balancer is not None:
+            balanced_idx = self._epoch_balancer._resample()
+            labels = self.labels[balanced_idx]
+            sample_indices = balanced_idx
+        else:
+            labels = self.labels
+            sample_indices = self.indices
+
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        if self.use_balanced_weights:
+            class_weights = compute_class_weight("balanced", classes=unique_labels, y=labels)
+        else:
+            class_weights = 1.0 / counts
+        
+        sample_weights = np.array([
+            class_weights[np.where(unique_labels == l)[0][0]] for l in labels
+        ])
+
+        sampler = WeightedRandomSampler(
+            weights=torch.DoubleTensor(sample_weights),
+            num_samples=len(sample_indices),
+            replacement=True,
+        )
+        batch_sampler = BatchSampler(sampler, batch_size=batch_size, drop_last=drop_last)
+
+        if self._epoch_balancer is not None:
+            return _RemappedBatchSampler(batch_sampler, sample_indices)
+        return batch_sampler
+
+    def _build_contrastive_sampler(self):
+        """Build contrastive batch sampler, optionally from balanced subset."""
+        if self._epoch_balancer is not None:
+            balanced_idx = self._epoch_balancer._resample()
+            sampler = WeightedContrastiveBatchSampler(
+                indices=balanced_idx,
+                class_labels=self.labels[balanced_idx],
+                context_labels=self.batches[balanced_idx],
+                **self._contrastive_params,
+            )
+            return _RemappedBatchSampler(sampler, balanced_idx)
+        else:
+            return WeightedContrastiveBatchSampler(
+                indices=self.indices,
+                class_labels=self.labels,
+                context_labels=self.batches,
+                **self._contrastive_params,
+            )
+
+    def set_epoch(self, epoch: int):
+        if self._epoch_balancer is not None:
+            self._epoch_balancer.set_epoch(epoch)
+
+        #if self.use_balanced_epochs:
+        #    if self.use_contrastive_loader:
+        #        new_sampler = self._build_contrastive_sampler()
+        #    else:
+        #        new_sampler = self._build_weighted_sampler(
+        #            self._batch_size, self._drop_last
+        #        )
+        #    self._mutable_sampler.swap(new_sampler)
+
+
+class _RemappedBatchSampler(Sampler):
+    """Wraps a batch sampler and remaps indices back to original dataset indices."""
+
+    def __init__(self, base_sampler, index_map: np.ndarray):
+        self.base_sampler = base_sampler
+        self.index_map = index_map
+        # Forward batch_size attribute
+        self.batch_size = getattr(base_sampler, 'batch_size', None)
+
+    def __iter__(self):
+        for batch in self.base_sampler:
+            yield [int(self.index_map[i]) for i in batch]
+
+    def __len__(self):
+        return len(self.base_sampler)
 
 class BatchSampler(Sampler[List[int]]):
     r"""Wraps another sampler to yield a mini-batch of indices.
@@ -211,7 +400,7 @@ class BatchSampler(Sampler[List[int]]):
             return (len(self.sampler) + self.batch_size - 1) // self.batch_size  # type: ignore[arg-type]
 
 
-class WeightedContrastiveBatchSampler(Sampler[List[int]]):
+class WeightedContrastiveBatchSamplerOld(Sampler[List[int]]):
     """
     Weighted contrastive sampler for multi-class datasets with optional context diversity.
 
@@ -266,7 +455,6 @@ class WeightedContrastiveBatchSampler(Sampler[List[int]]):
         )
         self.n_classes_per_batch = n_classes_per_batch
         self.n_samples_per_class = n_samples_per_class
-        self.min_contexts_per_class = min_contexts_per_class
         self.replacement = replacement
         self.shuffle = shuffle
         self.use_class_weights = use_class_weights
@@ -281,6 +469,8 @@ class WeightedContrastiveBatchSampler(Sampler[List[int]]):
         else:
             for i, cls in enumerate(self.class_labels):
                 self.class_pools[(cls, None)].append(i)
+        n_ctx = len(np.unique(self.context_labels))
+        self.min_contexts_per_class = min_contexts_per_class if min_contexts_per_class > 0 else n_ctx
 
         # --- compute class-level info
         self.unique_classes, counts = np.unique(self.class_labels, return_counts=True)
@@ -352,6 +542,236 @@ class WeightedContrastiveBatchSampler(Sampler[List[int]]):
             # Ensure batch size is valid
             if len(batch) == self.n_classes_per_batch * self.n_samples_per_class:
                 yield batch
+
+    def __len__(self) -> int:
+        return self.num_batches
+    
+
+class WeightedContrastiveBatchSampler(Sampler[List[int]]):
+
+    def __init__(
+        self,
+        indices: np.ndarray,
+        class_labels: np.ndarray,
+        context_labels: Optional[np.ndarray] = None,
+        n_classes_per_batch: int = 8,
+        n_samples_per_class: int = 4,
+        min_contexts_per_class: int = 1,
+        cap_per_group: int | None = None,
+        min_dataset_fraction: float = 0.5,
+        replacement: bool = True,
+        shuffle: bool = True,
+        use_class_weights: bool = True,
+        strict: bool = True,
+        seed: int | None = None,
+    ):
+        super().__init__(None)
+        self.indices = np.asarray(indices)
+        self.class_labels = np.asarray(class_labels)
+        self.context_labels = (
+            np.asarray(context_labels) if context_labels is not None else None
+        )
+        self.n_classes_per_batch = n_classes_per_batch
+        self.n_samples_per_class = n_samples_per_class
+        self.cap_per_group = cap_per_group
+        self.min_dataset_fraction = min_dataset_fraction
+        self.replacement = replacement
+        self.shuffle = shuffle
+        self.use_class_weights = use_class_weights
+        self.strict = strict
+        self.seed = seed
+        self.has_contexts = context_labels is not None
+
+        # --- build pools as contiguous arrays
+        pool_map = defaultdict(list)
+        if self.has_contexts:
+            for i, (cls, ctx) in enumerate(zip(self.class_labels, self.context_labels)):
+                pool_map[(cls, ctx)].append(i)
+        else:
+            for i, cls in enumerate(self.class_labels):
+                pool_map[(cls, None)].append(i)
+
+        self.class_pools = {k: np.array(v, dtype=np.int64) for k, v in pool_map.items()}
+
+        # --- precompute per-class structures as arrays for fast iteration
+        self.unique_classes, counts = np.unique(self.class_labels, return_counts=True)
+        self.n_unique_classes = len(self.unique_classes)
+        self.class_counts = dict(zip(self.unique_classes, counts))
+
+        # Per-class: ordered context arrays and their pools
+        # Avoids dict lookups in hot path
+        self._cls_contexts = {}    # cls -> np.array of contexts
+        self._cls_pools = {}       # cls -> list of np.array (aligned with _cls_contexts)
+        self._cls_pool_sizes = {}  # cls -> np.array of pool sizes
+        self._cls_weights = {}     # cls -> np.array of sampling weights per context
+
+        if self.has_contexts:
+            self.unique_contexts = np.unique(self.context_labels)
+            n_ctx = len(self.unique_contexts)
+            self.min_contexts_per_class = min(
+                min_contexts_per_class if min_contexts_per_class > 0 else n_ctx, n_ctx
+            )
+            self.min_n_datasets = max(2, int(n_ctx * min_dataset_fraction))
+
+            # Group sizes for weight computation
+            sizes = np.array([len(v) for v in self.class_pools.values()])
+            median_size = np.median(sizes) if len(sizes) > 0 else 1.0
+
+            for cls in self.unique_classes:
+                ctxs = []
+                pools = []
+                pool_sizes = []
+                weights = []
+                for (c, ctx), pool in self.class_pools.items():
+                    if c == cls and len(pool) > 0:
+                        ctxs.append(ctx)
+                        pools.append(pool)
+                        pool_sizes.append(len(pool))
+                        weights.append(median_size / max(len(pool), 1))
+
+                self._cls_contexts[cls] = np.array(ctxs)
+                self._cls_pools[cls] = pools
+                self._cls_pool_sizes[cls] = np.array(pool_sizes, dtype=np.int64)
+                w = np.array(weights, dtype=np.float64)
+                w /= w.sum() + 1e-12
+                self._cls_weights[cls] = w
+        else:
+            self.unique_contexts = None
+            self.min_contexts_per_class = 1
+            self.min_n_datasets = 0
+            # Flat pools per class
+            for cls in self.unique_classes:
+                pools = [v for (c, _), v in self.class_pools.items() if c == cls]
+                flat = np.concatenate(pools) if pools else np.array([], dtype=np.int64)
+                self._cls_pools[cls] = flat
+
+        # --- class sampling weights
+        if self.use_class_weights:
+            inv_freq = 1.0 / (counts + 1e-8)
+            self.class_weights = inv_freq / inv_freq.sum()
+        else:
+            self.class_weights = np.ones(len(counts), dtype=np.float64) / len(counts)
+
+        self.batch_size = n_classes_per_batch * n_samples_per_class
+        self.num_batches = len(self.indices) // self.batch_size
+
+    def _sample_class_indices(self, cls, rng, uncovered=None):
+        """Sample indices for one class with weighted context selection."""
+        if not self.has_contexts:
+            pool = self._cls_pools[cls]
+            if len(pool) == 0:
+                return None, None
+            return rng.choice(pool, self.n_samples_per_class, replace=self.replacement), None
+
+        contexts = self._cls_contexts[cls]
+        n_available = len(contexts)
+
+        if n_available < self.min_contexts_per_class:
+            return None, None
+
+        weights = self._cls_weights[cls]
+        n_ctx = max(self.min_contexts_per_class, min(n_available, self.n_samples_per_class))
+
+        # Boost weights for uncovered contexts
+        if uncovered and len(uncovered) > 0:
+            boosted = weights.copy()
+            for j in range(n_available):
+                if contexts[j] in uncovered:
+                    boosted[j] *= 10.0  # strong preference, not hard constraint
+            boosted /= boosted.sum()
+            pick_weights = boosted
+        else:
+            pick_weights = weights
+
+        # Choose contexts
+        pick_n = min(n_ctx, n_available)
+        ctx_idx = rng.choice(n_available, size=pick_n, replace=False, p=pick_weights)
+
+        # Compute draws per context (proportional to weight)
+        sel_weights = weights[ctx_idx]
+        sel_weights /= sel_weights.sum() + 1e-12
+        draws = np.maximum(np.floor(sel_weights * self.n_samples_per_class).astype(np.int64), 1)
+
+        if self.cap_per_group is not None:
+            np.minimum(draws, self.cap_per_group, out=draws)
+
+        # Distribute leftover
+        leftover = self.n_samples_per_class - draws.sum()
+        if leftover > 0:
+            order = np.argsort(-sel_weights)
+            for idx in order:
+                cap = (self.cap_per_group - draws[idx]) if self.cap_per_group else leftover
+                add = min(leftover, max(cap, 0))
+                draws[idx] += add
+                leftover -= add
+                if leftover <= 0:
+                    break
+
+        # Draw samples — single pre-allocated array
+        result = np.empty(self.n_samples_per_class, dtype=np.int64)
+        pos = 0
+        datasets_used_mask = 0  # bit cheaper than a set for small n
+
+        for j in range(pick_n):
+            ci = ctx_idx[j]
+            pool = self._cls_pools[cls][ci]
+            n = min(int(draws[j]), len(pool)) if not self.replacement else int(draws[j])
+            if n <= 0:
+                continue
+            drawn = rng.choice(pool, n, replace=self.replacement)
+            end = min(pos + len(drawn), self.n_samples_per_class)
+            result[pos:end] = drawn[:end - pos]
+            pos = end
+            if pos >= self.n_samples_per_class:
+                break
+
+        return result[:pos], set(contexts[ctx_idx])
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = np.random.default_rng(seed=self.seed)
+        batch_buf = np.empty(self.batch_size, dtype=np.int64)
+
+        for _ in range(self.num_batches):
+            # Dataset coverage tracking
+            if self.has_contexts:
+                uncovered = set(rng.choice(
+                    self.unique_contexts,
+                    size=min(self.min_n_datasets, len(self.unique_contexts)),
+                    replace=False,
+                ))
+            else:
+                uncovered = None
+
+            # Sample classes
+            class_idx = rng.choice(
+                self.n_unique_classes,
+                size=min(self.n_classes_per_batch, self.n_unique_classes),
+                replace=False,
+                p=self.class_weights,
+            )
+
+            pos = 0
+            for ci in class_idx:
+                cls = self.unique_classes[ci]
+                cls_indices, datasets_used = self._sample_class_indices(cls, rng, uncovered)
+
+                if cls_indices is None or (self.strict and len(cls_indices) < self.n_samples_per_class):
+                    continue
+
+                if uncovered and datasets_used:
+                    uncovered -= datasets_used
+
+                n = min(len(cls_indices), self.batch_size - pos)
+                batch_buf[pos:pos + n] = cls_indices[:n]
+                pos += n
+
+                if pos >= self.batch_size:
+                    break
+
+            if pos >= self.batch_size:
+                if self.shuffle:
+                    rng.shuffle(batch_buf)
+                yield batch_buf.tolist()
 
     def __len__(self) -> int:
         return self.num_batches

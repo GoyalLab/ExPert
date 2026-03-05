@@ -90,8 +90,8 @@ def _train(
         adata_p: str, 
         step_model_dir: str, 
         config: dict, 
-        cls_label: str = 'cls_label',
-        batch_key: str = 'context',
+        cls_label: str = 'perturbation',
+        batch_key: str = 'dataset',
         verbose: bool = True,
         context_filter: list[str] | None = None,
         cls_texts_p: str | None = None,
@@ -100,8 +100,6 @@ def _train(
     """Train wrapper for ExPert.train()"""
     log.info(f'Reading training data from: {adata_p}')
     model_set = sc.read(adata_p)
-    # Check if dataset is compatible
-    assert cls_label in model_set.obs.columns and batch_key in model_set.obs.columns
     
     # Subset model to only the include specified datasets
     if context_filter is not None:

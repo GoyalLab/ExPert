@@ -4,10 +4,11 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 import anndata as ad
+import itertools
 import scipy.sparse as sp
-from os import PathLike
 import random
 from copy import deepcopy
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,37 @@ log = logging.getLogger(__name__)
 mutually_excl_keys: dict[str, list[tuple[str]]] = {
     CONF_KEYS.MODEL: [('use_batch_norm', 'use_layer_norm')]
 }
+
+def sanitize_for_logging(obj, max_list_len=20):
+    """
+    Recursively sanitize hyperparams for logging.
+    Keeps only simple types.
+    """
+
+    # Allowed primitive types
+    if isinstance(obj, (int, float, str, bool, type(None))):
+        return obj
+
+    # Small lists/tuples
+    if isinstance(obj, (list, tuple)):
+        if len(obj) <= max_list_len:
+            return [sanitize_for_logging(x) for x in obj]
+        else:
+            return f"<list len={len(obj)}>"
+
+    # Dicts
+    if isinstance(obj, Mapping):
+        return {
+            str(k): sanitize_for_logging(v)
+            for k, v in obj.items()
+        }
+
+    # Torch tensors
+    if isinstance(obj, torch.Tensor):
+        return f"<Tensor shape={tuple(obj.shape)}>"
+
+    # Everything else
+    return str(obj)
 
 def load_json(p: str, mode: str = 'r', **kwargs):
     import json
@@ -67,6 +99,73 @@ def non_zero(x: torch.Tensor | float | int | None) -> bool:
     if x > 0:
         return True
     return False
+
+def generate_all_configs(
+    space: dict,
+    max_combinations: int = 100,
+):
+    """
+    Generate all possible combinations from a config space.
+    Only works if total combinations <= max_combinations.
+    """
+
+    def valid_config(config: dict):
+        # Same logic as in your random sampler
+        for sched_key, mu_kw_list in mutually_excl_keys.items():
+            sched: dict = config.get(sched_key)
+            if sched is None:
+                return True
+
+            for mu_tuple in mu_kw_list:
+                vs = set()
+                for kw in mu_tuple:
+                    vs.add(sched.get(kw))
+
+                if len(vs) == 1 and list(vs)[0] is None:
+                    return True
+
+                if len(vs) < len(mu_tuple):
+                    return False
+        return True
+
+    def expand_space(subspace):
+        """
+        Convert space into a list of all possible configs
+        """
+        if isinstance(subspace, dict):
+            keys = list(subspace.keys())
+            values = [expand_space(subspace[k]) for k in keys]
+
+            combos = []
+            for product in itertools.product(*values):
+                combos.append(dict(zip(keys, product)))
+            return combos
+
+        elif isinstance(subspace, list):
+            return subspace
+
+        else:
+            return [subspace]
+
+    # Expand top-level
+    keys = list(space.keys())
+    values = [expand_space(space[k]) for k in keys]
+
+    total_combinations = 1
+    for v in values:
+        total_combinations *= len(v)
+
+    if total_combinations > max_combinations:
+        raise ValueError(
+            f"Too many combinations ({total_combinations}). "
+            f"Limit is {max_combinations}."
+        )
+    logging.info(f'Created {total_combinations} configs.')
+
+    for product in itertools.product(*values):
+        config = dict(zip(keys, product))
+        if valid_config(config):
+            yield config
     
 def generate_random_configs(space: dict, n_samples: int | None = None, seed: int | None = None):
     if seed is not None:
@@ -124,10 +223,25 @@ def recursive_update(d: dict, u: dict) -> dict:
             d[k] = v
     return d
 
-def sample_configs(space: dict, src_config: dict, N: int = 10, base_dir: str | None = None, verbose: bool = False, **kwargs):
+def sample_configs(
+        space: dict, 
+        src_config: dict, 
+        N: int = 10, 
+        base_dir: str | None = None, 
+        random_samples: bool = True,
+        verbose: bool = False, 
+        **kwargs
+    ):
     # Sample configs
+    if random_samples:
+        # Randomly sample N configs from all combinations
+        configs = generate_random_configs(space, n_samples=N, seed=42, **kwargs)
+    else:
+        # Sample all possible combinations
+        configs = generate_all_configs(space, max_combinations=N)
+    # Create run dir for each config
     space_configs, config_paths = [], []
-    for i, sample in enumerate(generate_random_configs(space, n_samples=N, seed=42, **kwargs)):
+    for i, sample in enumerate(configs):
         # Merge sample into a deep copy of src_config
         merged_config = recursive_update(deepcopy(src_config), sample)
         space_configs.append(merged_config)

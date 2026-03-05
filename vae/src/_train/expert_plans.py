@@ -90,13 +90,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         ] = "elbo_validation",
         compile: bool = False,
         compile_kwargs: dict | None = None,
+        optimizer_cls: torch.optim.Optimizer = torch.optim.Adam,
         average: str = "macro",
         top_k: int = 1,
         auto_temperature_args: dict | None = None,
         use_posterior_mean: Literal["train", "val", "both"] | None = "val",
-        log_class_distribution: bool = False,
+        log_class_distribution: bool = True,
         freeze_modules: dict[str, float] | None = None,
         freeze_encoder_epoch: int | None = None,
+        freeze_global_encoder_epoch: int | None = None,
         freeze_decoder_epoch: int | None = None,
         soft_freeze_lr: float | None = None,
         gene_emb: torch.Tensor | None = None,
@@ -115,11 +117,13 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         plot_umap_key: str | list[str] = 'z_shared',
         plot_f1_dist: bool = True,
         plot_cm: bool = True,
+        plot_clip_geom: bool = True,
         plot_every_n_epochs: int = 10,
         # Caching options
         cache_n_epochs: int | None = 1,
-        n_train_step_cache: int = 64,
+        n_train_cache: int = 10_000,
         save_cache: bool = False,
+        use_cosine_restart: bool = False,
         **loss_kwargs,
     ):
         # Set custom learning rates for zlocal encoder if auto temperature is enabled
@@ -132,6 +136,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 freeze_modules = auto_conf
             else:
                 freeze_modules.update(auto_conf)
+        self.optimizer_cls = optimizer_cls
+        self.use_cosine_restart = use_cosine_restart
         # Get custom optimizer for soft freezing if argument is provided
         optimizer, optimizer_fn = self._optimizer_creator_fn_custom(module_lrs=freeze_modules)
         if optimizer == 'Custom':
@@ -175,6 +181,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Contrastive params
         self.log_class_distribution = log_class_distribution
         self.freeze_encoder_epoch = freeze_encoder_epoch
+        self.freeze_global_encoder_epoch = freeze_global_encoder_epoch
         self.freeze_decoder_epoch = freeze_decoder_epoch
         self.soft_freeze_lr = soft_freeze_lr
         if auto_temperature_args is not None:
@@ -192,6 +199,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.plot_umap_key = plot_umap_key if isinstance(plot_umap_key, list) else [plot_umap_key]
         self.plot_f1_dist = plot_f1_dist
         self.plot_cm = plot_cm
+        self.plot_clip_geom = plot_clip_geom
         self.plot_kl_distribution = plot_kl_distribution
         self.log_full = log_full
         self.full_log_every_n_epoch = full_log_every_n_epoch
@@ -204,7 +212,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.observed_classes = set()
         # ----- Cache -----
         self.cache = {}
-        self.n_train_step_cache = n_train_step_cache
+        self.n_train_cache = n_train_cache
         self.save_cache = save_cache
         # Cache for embeddings and metadata within epoch
         self.epoch_cache = {
@@ -224,80 +232,111 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Setup test metrics
         self._n_obs_test = None
         self.initialize_test_metrics()
-
+        
+    def _cos_lr_scheduler(self, opt: torch.optim.Optimizer):
+        return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            opt,
+            T_0=getattr(self, "cosine_T0", 15),
+            T_mult=getattr(self, "cosine_Tmult", 2),
+            eta_min=getattr(self, "cosine_eta_min", 5e-6),
+        )
 
     def _optimizer_creator_fn_custom(
         self,
-        optimizer_cls: torch.optim.Adam | torch.optim.AdamW = torch.optim.Adam,
         module_lrs: dict[str, float] | None = None,
     ):
-        """
-        Create an optimizer for the model with custom learning rates per module.
 
-        Parameters
-        ----------
-        optimizer_cls : torch.optim.Optimizer class
-            e.g., torch.optim.Adam or torch.optim.AdamW
-        module_lrs : dict[str, float], optional
-            Dict mapping module name substrings to learning rates
-            e.g., {"encoder": 1e-5, "lora_": 5e-6, "decoder": 1e-4}
-            Parameters matching multiple keys use the first match.
-            Parameters not matching any key use self.lr (default)
-        """
-        # Create default optimizer if no custom LRs specified
-        if module_lrs is None or not module_lrs:
-            return "Adam", None
-        
         logging.info(f'Creating custom optimizer with module LRs: {module_lrs}')
 
         def _creator(params):
-            # collect all parameters (params is usually a generator)
-            params_list = list(params)
-            if not hasattr(self, "module"):
-                # fallback: no module context, behave normally
-                return optimizer_cls(params_list, lr=self.lr, eps=self.eps, weight_decay=self.weight_decay)
 
-            # map parameter -> module name for filtering
+            params_list = list(params)
+
+            if not hasattr(self, "module"):
+                return self.optimizer_cls(
+                    params_list,
+                    lr=self.lr,
+                    eps=self.eps,
+                    weight_decay=self.weight_decay,
+                )
+
             param_to_name = {}
             for module_name, module in self.module.named_modules():
                 for p in module.parameters(recurse=False):
                     param_to_name[p] = module_name
 
-            # group parameters by learning rate
-            lr_to_params = {}  # {lr: [params]}
-            
+            lr_to_params = {}
+
             for p in params_list:
+
                 name = param_to_name.get(p, "")
-                
-                # Find matching module LR (first match wins)
+
                 matched_lr = None
-                for module_key, lr in module_lrs.items():
-                    if module_key in name:
-                        matched_lr = float(lr)
-                        break
-                
-                # Use default LR if no match
+                if module_lrs:
+                    for module_key, lr in module_lrs.items():
+                        if module_key in name:
+                            matched_lr = float(lr)
+                            break
+
                 if matched_lr is None:
                     matched_lr = self.lr
-                
-                # Add to corresponding group
-                if matched_lr not in lr_to_params:
-                    lr_to_params[matched_lr] = []
-                lr_to_params[matched_lr].append(p)
-            
-            # Build param groups
+
+                lr_to_params.setdefault(matched_lr, []).append(p)
+
             param_groups = []
             for lr, params_group in lr_to_params.items():
                 param_groups.append({"params": params_group, "lr": lr})
                 logging.info(f"  LR {lr}: {len(params_group)} parameters")
 
-            return optimizer_cls(
+            return self.optimizer_cls(
                 param_groups,
                 eps=self.eps,
                 weight_decay=self.weight_decay,
             )
 
         return "Custom", _creator
+    
+    def configure_optimizers(self):
+        params = filter(lambda p: p.requires_grad, self.module.parameters())
+
+        optimizer = self.get_optimizer_creator()(params)
+
+        config = {"optimizer": optimizer}
+
+        # --------------------------------
+        # ReduceLROnPlateau
+        # --------------------------------
+        if self.reduce_lr_on_plateau:
+
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                patience=self.lr_patience,
+                factor=self.lr_factor,
+                threshold=self.lr_threshold,
+                min_lr=self.lr_min,
+                threshold_mode="abs",
+                verbose=True,
+            )
+
+            config["lr_scheduler"] = {
+                "scheduler": scheduler,
+                "monitor": self.lr_scheduler_metric,
+                "interval": "epoch",
+            }
+
+        # --------------------------------
+        # Cosine Restart Scheduler
+        # --------------------------------
+        elif self.use_cosine_restart:
+
+            scheduler = self._cos_lr_scheduler(optimizer)
+
+            config["lr_scheduler"] = {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            }
+
+        return config
     
     def _scale_lr(self, group_name: str, factor: float, error: bool = True):
         optimizer = self.optimizers()
@@ -350,69 +389,78 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
     def _cache_step_data(self, mode: str, batch: dict, inference_outputs: dict, loss_output: LossOutput):
         """Cache data from a single step."""
         # Only cache every n epoch
-        if self.full_log_every_n_epoch > 0 and self.current_epoch % self.full_log_every_n_epoch == 0:
-            # Stop caching training steps after limit is reached
-            if mode == 'train' and len(self.epoch_cache[mode][MODULE_KEYS.Z_KEY]) > self.n_train_step_cache:
-                return
-            self.epoch_cache[mode][MODULE_KEYS.Z_KEY].append(inference_outputs[MODULE_KEYS.Z_KEY].cpu())
-            self.epoch_cache[mode][REGISTRY_KEYS.LABELS_KEY].append(inference_outputs[MODULE_KEYS.LABEL_KEY].cpu())
-            self.epoch_cache[mode][REGISTRY_KEYS.BATCH_KEY].append(inference_outputs[MODULE_KEYS.BATCH_INDEX_KEY].cpu())
-            if loss_output.logits is not None:
-                self.epoch_cache[mode][PREDICTION_KEYS.PREDICTION_KEY].append(torch.argmax(loss_output.logits, dim=-1).cpu())
-                self.epoch_cache[mode][MODULE_KEYS.CLS_LOGITS_KEY].append(loss_output.logits.cpu())
-            if PREDICTION_KEYS.PREDICTION_KEY in loss_output.extra_metrics['extra_outputs']:
-                self.epoch_cache[mode][PREDICTION_KEYS.PREDICTION_KEY].append(loss_output.extra_metrics['extra_outputs'][PREDICTION_KEYS.PREDICTION_KEY].cpu())
-            # Add shared latent space to cache
-            if MODULE_KEYS.Z_SHARED_KEY in loss_output.extra_metrics['extra_outputs']:
-                self.epoch_cache[mode][MODULE_KEYS.Z_SHARED_KEY].append(loss_output.extra_metrics['extra_outputs'][MODULE_KEYS.Z_SHARED_KEY].cpu())
-            # Add class projection to cache
-            if MODULE_KEYS.CLS_PROJ_KEY in loss_output.extra_metrics['extra_outputs']:
-                self.epoch_cache[mode][MODULE_KEYS.CLS_PROJ_KEY].append(loss_output.extra_metrics['extra_outputs'][MODULE_KEYS.CLS_PROJ_KEY].cpu())
-            # Add pathway latent to cache
-            if 'z_s' in loss_output.extra_metrics['extra_outputs']:
-                self.epoch_cache[mode]['z_s'].append(loss_output.extra_metrics['extra_outputs']['z_s'].cpu())
-            # Add pathway projection to cache
-            if 't_s' in loss_output.extra_metrics['extra_outputs']:
-                self.epoch_cache[mode]['t_s'].append(loss_output.extra_metrics['extra_outputs']['t_s'].cpu())
+        if self.full_log_every_n_epoch <= 0 or self.current_epoch % self.full_log_every_n_epoch != 0:
+            return
+        # Stop caching training steps after limit is reached
+        if mode == "train" and len(self.epoch_cache[mode][MODULE_KEYS.Z_KEY]) > self.n_train_cache:
+            return
+        # Create cache
+        cache = self.epoch_cache[mode]
+        # Core fields
+        cache[MODULE_KEYS.Z_KEY].append(inference_outputs[MODULE_KEYS.Z_KEY].detach().cpu())
+        cache[REGISTRY_KEYS.LABELS_KEY].append(inference_outputs[MODULE_KEYS.LABEL_KEY].detach().cpu())
+        cache[REGISTRY_KEYS.BATCH_KEY].append(inference_outputs[MODULE_KEYS.BATCH_INDEX_KEY].detach().cpu())
+        # Logits
+        if loss_output.logits is not None:
+            cache[PREDICTION_KEYS.PREDICTION_KEY].append(
+                torch.argmax(loss_output.logits, dim=-1).detach().cpu()
+            )
+        # Handle extra outputs
+        extra_outputs = loss_output.extra_metrics.get("extra_outputs", {})
+
+        # Automatically cache everything tensor-like
+        for k, v in extra_outputs.items():
+            if v is None:
+                continue
+            if isinstance(v, torch.Tensor):
+                cache[k].append(v.detach().cpu())
                 
     def _process_epoch_cache(self, mode: str) -> dict[str, np.ndarray]:
-        """Process and clear the epoch cache, returning concatenated arrays."""
+        """Process and clear the epoch cache."""
+        import numpy as np
+        import torch
+        # Get mode cache from training plan
         cache = self.epoch_cache.get(mode, None)
         if not cache:
             return {}
-        # Concatenate all cached tensors
-        processed = {
-            MODULE_KEYS.Z_KEY: torch.cat(cache[MODULE_KEYS.Z_KEY], dim=0).numpy(),
-            REGISTRY_KEYS.LABELS_KEY: torch.cat(cache[REGISTRY_KEYS.LABELS_KEY], dim=0).numpy().squeeze(),
-            REGISTRY_KEYS.BATCH_KEY: torch.cat(cache[REGISTRY_KEYS.BATCH_KEY], dim=0).numpy().squeeze(),
+        # Collect processed data
+        processed = {}
+
+        # keys that should be averaged instead of concatenated
+        mean_keys = {
+            MODULE_KEYS.CLS_PROJ_KEY,
+            "t_s",
         }
-        # Add cached shared latent space to output
-        if MODULE_KEYS.Z_SHARED_KEY in cache:
-            processed[MODULE_KEYS.Z_SHARED_KEY] = torch.cat(cache.get(MODULE_KEYS.Z_SHARED_KEY), dim=0).numpy()
-        # Add mean cached class projections to outuput
-        if MODULE_KEYS.CLS_PROJ_KEY in cache:
-            processed[MODULE_KEYS.CLS_PROJ_KEY] = torch.stack(cache.get(MODULE_KEYS.CLS_PROJ_KEY), dim=0).mean(dim=0).numpy()
-        if cache.get(PREDICTION_KEYS.PREDICTION_KEY, []):
-            processed[PREDICTION_KEYS.PREDICTION_KEY] = torch.cat(cache[PREDICTION_KEYS.PREDICTION_KEY], dim=0).numpy().squeeze()
-        if MODULE_KEYS.CLS_LOGITS_KEY in cache:
-            processed[MODULE_KEYS.CLS_LOGITS_KEY] = torch.cat(cache[MODULE_KEYS.CLS_LOGITS_KEY], dim=0).numpy().squeeze()
-        # Add cached pathway-level latent space to output
-        if 'z_s' in cache:
-            processed['z_s'] = torch.cat(cache.get('z_s'), dim=0).numpy()
-        # Add cached pathway-level projections to output
-        if 't_s' in cache:
-            processed['t_s'] = torch.stack(cache.get('t_s'), dim=0).mean(dim=0).numpy()
+        # Collect each cache item
+        for k, tensors in cache.items():
+            if len(tensors) == 0:
+                continue
+            # Mean aggregation
+            if k in mean_keys:
+                processed[k] = torch.stack(tensors, dim=0).mean(dim=0).numpy()
+            # Concatenation
+            else:
+                processed[k] = torch.cat(tensors, dim=0).numpy()
+
+            # squeeze labels/batch/preds
+            if k in {
+                REGISTRY_KEYS.LABELS_KEY,
+                REGISTRY_KEYS.BATCH_KEY,
+                PREDICTION_KEYS.PREDICTION_KEY,
+            }:
+                processed[k] = processed[k].squeeze()
+
         # Add to historical cache
         for k, v in processed.items():
             self.history_cache[mode][k].append(v)
-            # Keep only last N epochs
             if len(self.history_cache[mode][k]) > self.cache_n_epochs:
                 self.history_cache[mode][k].pop(0)
-        # Add mode to output data
-        processed[REGISTRY_KEYS.SPLIT_KEY] = np.repeat(mode, processed[REGISTRY_KEYS.LABELS_KEY].shape[0])
-        # Clear epoch cache
+        # Add split info
+        processed[REGISTRY_KEYS.SPLIT_KEY] = np.repeat(
+            mode, processed[REGISTRY_KEYS.LABELS_KEY].shape[0]
+        )
+        # Clear cache
         self.epoch_cache[mode].clear()
-        
         return processed
 
     def _get_stall_epochs(self) -> dict[str, int]:
@@ -640,6 +688,46 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Log to tensorboard
         self.logger.experiment.add_figure(f"{metric}_distribution", fig, self.current_epoch)
         plt.close(fig)
+        
+    def _log_extra_output_histograms(self, mode: str, extra_outputs: dict):
+        """
+        Log TensorBoard histograms for all non-scalar values in extra_outputs.
+
+        Values are removed from the dictionary using pop() to avoid downstream issues.
+        """
+        import numpy as np
+        import torch
+        # Skip if no exra outputs are given
+        if extra_outputs is None:
+            return
+        # Get all extra keys
+        keys = list(extra_outputs.keys())  # avoid dict size change during iteration
+        # Log each key
+        for k in keys:
+            v = extra_outputs.pop(k, None)
+            if v is None:
+                continue
+            # Convert tensors to numpy
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            # Convert lists to numpy
+            if isinstance(v, list):
+                v = np.asarray(v)
+            # Skip scalars
+            if np.isscalar(v):
+                continue
+            # Skip empty
+            if hasattr(v, "__len__") and len(v) == 0:
+                continue
+            try:
+                self.logger.experiment.add_histogram(
+                    f"{k}_hist_{mode}",
+                    v,
+                    global_step=self.current_epoch,
+                )
+            except Exception:
+                # Avoid crashing training if tensorboard rejects shape
+                continue
 
     def compute_and_log_metrics(
         self, loss_output: LossOutput, metrics: dict[str, ElboMetric], mode: str
@@ -676,6 +764,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             and self.current_epoch % self.full_log_every_n_epoch == 0
         ):
             self._plot_kl_distribution_over_latents(kl_tensor=kl_per_latent, metric=MODULE_KEYS.KL_Z_PER_LATENT_KEY)
+        
+        # Get clip weights if they exist
+        responder_prob = loss_output.extra_metrics['extra_outputs'].get('responder_prob', None)
+        
         # Initialize default classification metrics
         metrics_dict = {
             METRIC_KEYS.CLASSIFICATION_LOSS_KEY: np.inf,
@@ -685,9 +777,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             f'clip_{METRIC_KEYS.F1_SCORE_KEY}': 0.0,
         }
         # Log context prediction if available
-        ctx_pred = loss_output.extra_metrics['extra_outputs'].pop('ctx_pred', None)
+        ctx_pred = loss_output.extra_metrics['extra_outputs'].get('ctx_pred', None)
+        ctx_labels = loss_output.extra_metrics['extra_outputs'].get('ctx_labels', None)
         if ctx_pred is not None:
-            ctx_labels = loss_output.extra_metrics['extra_outputs'].pop('ctx_labels')
             # Calculate F1 score over predicted and true labels
             ctx_f1 = tmf.classification.multiclass_f1_score(
                 ctx_pred,
@@ -697,9 +789,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             )
             metrics_dict[f'ctx_{METRIC_KEYS.F1_SCORE_KEY}'] = ctx_f1
         # Log adversial context prediction if available
-        adv_ctx_pred = loss_output.extra_metrics['extra_outputs'].pop('adv_ctx_pred', None)
+        adv_ctx_pred = loss_output.extra_metrics['extra_outputs'].get('adv_ctx_pred', None)
         if adv_ctx_pred is not None:
-            adv_ctx_labels = loss_output.extra_metrics['extra_outputs'].pop('adv_ctx_labels')
+            adv_ctx_labels = loss_output.extra_metrics['extra_outputs'].get('adv_ctx_labels')
             # Calculate F1 score over predicted and true labels
             adv_ctx_f1 = tmf.classification.multiclass_f1_score(
                 adv_ctx_pred,
@@ -708,136 +800,103 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 average=self.average,
             )
             metrics_dict[f'adv_ctx_{METRIC_KEYS.F1_SCORE_KEY}'] = adv_ctx_f1
-        # Get number of classes
-        n_classes = self.n_classes
+
         # Get true class labels
         true_labels = loss_output.true_labels.squeeze(-1)
-        # Add classification-based metrics if they exist
-        if loss_output.classification_loss is not None:
-            classification_loss = loss_output.classification_loss
-            logits = loss_output.logits
-            # Take argmax of logits to get highest predicted label
-            predicted_labels = torch.argmax(logits, dim=-1).squeeze(-1)
-
-            # Check if any classes are outside of training classes, i.e
-            unknown_mask = (predicted_labels >= n_classes)
-            if unknown_mask.any():
-                # Assign unknown to classes that are outside of the training classes
-                predicted_labels = predicted_labels.masked_fill(unknown_mask, n_classes)
-                n_classes += 1
-            # Assign unknown to classes that are outside of the training classes
-            predicted_labels = predicted_labels.masked_fill((predicted_labels >= n_classes), n_classes)
-            # Calculate accuracy over predicted and true labels
-            accuracy = tmf.classification.multiclass_accuracy(
-                predicted_labels,
-                true_labels,
-                n_classes,
-                average=self.average
-            )
-            # Calculate F1 score over predicted and true labels
-            f1 = tmf.classification.multiclass_f1_score(
-                predicted_labels,
-                true_labels,
-                n_classes,
-                average=self.average,
-            )
-            # Update metrics
-            metrics_dict[METRIC_KEYS.CLASSIFICATION_LOSS_KEY] = classification_loss
-            metrics_dict[METRIC_KEYS.ACCURACY_KEY] = accuracy
-            metrics_dict[METRIC_KEYS.F1_SCORE_KEY] = f1
-            # Include top k predictions as well
-            if self.top_k > 1:
-                top_k_acc_key = f'{METRIC_KEYS.ACCURACY_KEY}_top_{self.top_k}'
-                top_k_f1_key = f'{METRIC_KEYS.F1_SCORE_KEY}_top_{self.top_k}'
-                top_k_accuracy = tmf.classification.multiclass_accuracy(
-                    logits,
-                    true_labels,
-                    n_classes,
-                    average=self.average,
-                    top_k=self.top_k,
-                )
-                top_k_f1 = tmf.classification.multiclass_f1_score(
-                    logits,
-                    true_labels,
-                    n_classes,
-                    average=self.average,
-                    top_k=self.top_k,
-                )
-                metrics_dict[top_k_acc_key] = top_k_accuracy
-                metrics_dict[top_k_f1_key] = top_k_f1
         # Add clip classification metrics
-        clip_cls_pred = loss_output.extra_metrics['extra_outputs'].pop(PREDICTION_KEYS.PREDICTION_KEY, None)
+        clip_cls_pred = loss_output.extra_metrics['extra_outputs'].get(PREDICTION_KEYS.PREDICTION_KEY, None)
         if clip_cls_pred is not None:
-            # Check if any classes are outside of training classes, i.e
-            unknown_mask = (clip_cls_pred >= n_classes)
+            # Get in-batch labels
+            unique = list(torch.unique(true_labels))
+            n_cls = len(unique)
+            n_total_cls = self.n_classes
+            base_clip_cls_pred = clip_cls_pred
+            # Check if any classes are outside of training classes, i.e null classes or zero-shot candidates
+            unknown_mask = (1-(clip_cls_pred == torch.unique(true_labels).reshape(-1, 1)).sum(0)).bool()
+            # Check null predictions
+            null_mask = (clip_cls_pred >= self.n_classes)
             if unknown_mask.any():
-                # Assign unknown to classes that are outside of the training classes
-                clip_cls_pred = clip_cls_pred.masked_fill(unknown_mask, n_classes)
-                n_classes += 1
+                # Assign anything outside of training to placeholder and add to list of predictions
+                clip_cls_pred = clip_cls_pred.masked_fill(unknown_mask, n_cls)
+                unique.append(n_cls)
+                n_cls += 1
+                n_total_cls += 1
+            # Get local index mapping
+            mapping = {int(u): i for i, u in enumerate(unique)}
+            # Y in-batch labels
+            true_local = torch.tensor(
+                [mapping[int(v)] for v in true_labels],
+                device=true_labels.device
+            )
+            # Local yhat
+            pred_local = torch.tensor(
+                [mapping[int(v)] for v in clip_cls_pred],
+                device=clip_cls_pred.device
+            )
 
-            # Assign unknown to classes that are outside of the training classes
-            clip_cls_pred = clip_cls_pred.masked_fill((clip_cls_pred >= n_classes), n_classes)
             # Calculate accuracy over predicted and true labels
-            accuracy = tmf.classification.multiclass_accuracy(
-                clip_cls_pred,
-                true_labels,
-                n_classes,
-                average=self.average
+            accuracy_local = tmf.classification.multiclass_accuracy(
+                pred_local,
+                true_local,
+                num_classes=n_cls,
+                ignore_index=n_cls,
+                average=self.average,
             )
             # Calculate F1 score over predicted and true labels
+            f1_local = tmf.classification.multiclass_f1_score(
+                pred_local,
+                true_local,
+                num_classes=n_cls,
+                ignore_index=n_cls,
+                average=self.average,
+            )
+            # Calculate total F1 score over all classes
             f1 = tmf.classification.multiclass_f1_score(
-                clip_cls_pred,
+                base_clip_cls_pred,
                 true_labels,
-                n_classes,
+                num_classes=n_total_cls,
                 average=self.average,
             )
+
+            # Log fraction of predicted responders
+            null_frac = responder_prob.mean() if responder_prob is not None else 0.0
+            metrics_dict[f'responder_fraction'] = null_frac
+            # Log clip f1 within not-null predicted cells (if there are enough responders in batch)
+            if null_frac > 0 and null_frac < 0.9:
+                null_mask = responder_prob < 0.5
+                if (~null_mask).sum() > 0:
+                    f1_responder = tmf.classification.multiclass_f1_score(
+                        pred_local[~null_mask],
+                        true_local[~null_mask],
+                        num_classes=n_cls,
+                        ignore_index=n_cls,
+                        average=self.average,
+                    )
+                else:
+                    f1_responder = 0.0
+                metrics_dict[f'clip_{METRIC_KEYS.F1_SCORE_KEY}_responder'] = f1_responder
+                # Do the same for non-responder fraction
+                if null_mask.sum() > 0:
+                    f1_non_responder = tmf.classification.multiclass_f1_score(
+                        pred_local[null_mask],
+                        true_local[null_mask],
+                        num_classes=n_cls,
+                        ignore_index=n_cls,
+                        average=self.average,
+                    )
+                else:
+                    f1_non_responder = 0.0
+                metrics_dict[f'clip_{METRIC_KEYS.F1_SCORE_KEY}_non_responder'] = f1_non_responder
+                
             # Update metrics
-            metrics_dict[f'clip_{METRIC_KEYS.ACCURACY_KEY}'] = accuracy
+            metrics_dict[f'clip_{METRIC_KEYS.ACCURACY_KEY}_local'] = accuracy_local
+            metrics_dict[f'clip_{METRIC_KEYS.F1_SCORE_KEY}_local'] = f1_local
             metrics_dict[f'clip_{METRIC_KEYS.F1_SCORE_KEY}'] = f1
-            # Include top k predictions as well
-            clip_logits = loss_output.extra_metrics['extra_outputs'].pop(PREDICTION_KEYS.SOFT_PREDICTION_KEY, None)
-            if self.top_k > 1 and clip_logits is not None and self.full_log_every_n_epoch > 0 and self.current_epoch % self.full_log_every_n_epoch == 0:
-                top_k_acc_key = f'clip_{METRIC_KEYS.ACCURACY_KEY}_top_{self.top_k}'
-                top_k_f1_key = f'clip_{METRIC_KEYS.F1_SCORE_KEY}_top_{self.top_k}'
-                top_k_accuracy = tmf.classification.multiclass_accuracy(
-                    clip_logits,
-                    true_labels,
-                    n_classes,
-                    average=self.average,
-                    top_k=self.top_k,
-                )
-                top_k_f1 = tmf.classification.multiclass_f1_score(
-                    clip_logits,
-                    true_labels,
-                    n_classes,
-                    average=self.average,
-                    top_k=self.top_k,
-                )
-                metrics_dict[top_k_acc_key] = top_k_accuracy
-                metrics_dict[top_k_f1_key] = top_k_f1
-        # Add hierarchical predictions
-        pw_pred = loss_output.extra_metrics['extra_outputs'].pop('pw_pred', None)
-        pw_y = loss_output.extra_metrics['extra_outputs'].pop('pw_y', None)
-        n_pw = getattr(self.module, 'n_pw', None)
-        if pw_pred is not None and pw_y is not None and n_pw is not None:
-            # Pathway f1 including misc categories
-            pw_f1 = tmf.classification.multiclass_f1_score(
-                pw_pred,
-                pw_y,
-                n_pw,
-                average=self.average,
-            )
-            metrics_dict[f'pw_all_{METRIC_KEYS.F1_SCORE_KEY}'] = pw_f1
-            # Remove misc pathways from stats
-            if self.module.misc_pw_idx > -1:
-                pw_f1_no_misc = tmf.classification.multiclass_f1_score(
-                    pw_pred,
-                    pw_y,
-                    n_pw,
-                    average=self.average,
-                    ignore_index=self.module.misc_pw_idx
-                )
-                metrics_dict[f'pw_{METRIC_KEYS.F1_SCORE_KEY}'] = pw_f1_no_misc
+        
+        # Plot extra histograms
+        self._log_extra_output_histograms(mode, loss_output.extra_metrics['extra_outputs'])
+        # Log batch composition histograms
+        self._log_extra_output_histograms(mode, {MODULE_KEYS.BATCH_INDEX_KEY: ctx_labels, MODULE_KEYS.LABEL_KEY: true_labels})
         # Add metrics to extra metrics for internal logging
         loss_output.extra_metrics.update(metrics_dict)
         # Remove all extra outputs from metrics for super logging
@@ -909,16 +968,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         
         # Add split-specific kwargs
         input_kwargs['use_posterior_mean'] = self.use_posterior_mean in [split, 'both']
-        
-        # TODO: move to model, Add external gene embedding to batch
-        if self.gene_emb is not None:
-            # Add gene embedding matrix to batch
-            batch[REGISTRY_KEYS.GENE_EMB_KEY] = self.gene_emb
+
         # Perform full forward pass of model
         return self.forward(batch, loss_kwargs=input_kwargs)
         
     def training_step(self, batch, batch_idx):
         """Training step for supervised training."""
+        # Log batch composition
+        self._epoch_labels.extend(batch[REGISTRY_KEYS.LABELS_KEY].flatten().cpu().numpy())
+        self._epoch_datasets.extend(batch[REGISTRY_KEYS.BATCH_KEY].flatten().cpu().numpy())
         # Perform full forward pass of model
         inference_outputs, _, loss_output = self.step(split='train', batch=batch, batch_idx=batch_idx)
         loss = loss_output.loss
@@ -985,10 +1043,18 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Log metrics
         self.compute_and_log_metrics(loss_output, self.test_metrics, "test")
 
-    def on_train_epoch_start(self):        
+    def on_train_epoch_start(self):   
+        # Monitor batch composition
+        self._epoch_labels = []
+        self._epoch_datasets = []     
+        # Re-sample epoch dataset if toggled
+        if hasattr(self.trainer.train_dataloader, 'set_epoch'):
+            self.trainer.train_dataloader.set_epoch(self.current_epoch)
         # Freeze module encoder at a certain epoch if option is enabled
         if self.freeze_encoder_epoch is not None and self.current_epoch >= self.freeze_encoder_epoch and not getattr(self.module.z_encoder, 'frozen', False):
             self.module.freeze_module('z_encoder', soft_lr=self.soft_freeze_lr, optim=self.optimizers())
+        if self.freeze_global_encoder_epoch is not None and self.current_epoch >= self.freeze_global_encoder_epoch and not getattr(self.module.z_encoder, 'frozen', False):
+            self.module.freeze_module('z_encoder.global_encoder', soft_lr=self.soft_freeze_lr, optim=self.optimizers())
         if self.freeze_decoder_epoch is not None and self.current_epoch >= self.freeze_decoder_epoch and not getattr(self.module.decoder, 'frozen', False):
             self.module.freeze_module('decoder', soft_lr=self.soft_freeze_lr, optim=self.optimizers())
         # Compute class embeddings once per epoch
@@ -1043,47 +1109,17 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         plt.close(fig)
 
     def on_train_epoch_end(self):
-        # Get random prediction buffer from module and reset buffer
-        random_ctx_predictions = self.module.get_ctx_buffer(reset=True)
-        random_cls_predictions = self.module.get_cls_buffer(reset=True)
-        # Plot random prediction distributions
-        if self.log_random_predictions:
-            # Plot the distributions
-            self._plt_random_ctx_predictions(random_ctx_predictions)
-            self._plt_random_cls_predictions(random_cls_predictions)
         # Plot class distribution in batches
         if self.log_class_distribution:
-            import matplotlib.pyplot as plt
-            # Convert counter to dataframe and pad missing values with nan
-            max_len = max(len(v) for v in self.class_batch_counts.values())
-            df = pd.DataFrame({
-                k: v + [np.nan] * (max_len - len(v))
-                for k, v in self.class_batch_counts.items()
-            })
-            # Sort by class key to make comparable
-            df = df[sorted(df.columns)]
-            fig, ax = plt.subplots(figsize=(10, 5))
-            df.boxplot(ax=ax)
-            ax.set_xlabel("Class")
-            ax.set_ylabel("Samples per Batch")
-            ax.set_title("Per-Class Distribution of Samples per Batch")
-            self.logger.experiment.add_figure("train_class_batch_distribution", fig, self.current_epoch)
-            plt.close(fig)
-
-            # Reset for next epoch
-            self.class_batch_counts = defaultdict(list)
-
-            # Plot distribution of number of classes / batch
-            df = pd.DataFrame({'n_classes': self.train_class_counts})
-            fig, ax = plt.subplots(figsize=(5, 10))
-            df.boxplot(ax=ax)
-            ax.set_xlabel("")
-            ax.set_ylabel("Number of classes in Batch")
-            ax.set_title("Distribution of Number of Classes per Batch")
-            self.logger.experiment.add_figure("train_class_distribution", fig, self.current_epoch)
-            plt.close(fig)
-            # Reset for next epoch
-            self.train_class_counts = []
+            # Now log once with full epoch data
+            _, label_counts = np.unique(self._epoch_labels, return_counts=True)
+            self.logger.experiment.add_histogram(
+                "epoch/samples_per_label", label_counts, self.current_epoch
+            )
+            _, ds_counts = np.unique(self._epoch_datasets, return_counts=True)
+            self.logger.experiment.add_histogram(
+                "epoch/samples_per_dataset", ds_counts, self.current_epoch
+            )
 
     def _full_log_on_epoch_end(self):
         """Plot umap of mode on epoch end"""
@@ -1111,6 +1147,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 # Plot confusion matrices
                 if self.plot_cm:
                     self._plt_confusion(mode, mode_data)
+                if self.plot_clip_geom:
+                    self._plt_clip_geometry(mode, mode_data)
+                    self._plt_eff_weight_corr(mode, mode_data)
             # Save used mode
             _modes.extend([mode])
             # Combine modes only if we plot
@@ -1224,11 +1263,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         - Per context: cm/{mode}/{ctx}
         - Combined: cm/{mode}/all
         """
-        import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
         import seaborn as sns
-        import torch
         from sklearn.metrics import confusion_matrix
 
         preds = mode_data.get(PREDICTION_KEYS.PREDICTION_KEY)
@@ -1319,8 +1356,204 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 title=f"{mode} | Confusion Matrix ({ctx})",
                 tag=f"cm/{mode}/{ctx}",
             )
+            
+    def _plt_eff_weight_corr(self, mode: str, mode_data: dict[str, np.ndarray]):
+        """
+        Plot correlation between class effects and CLIP weights.
 
-    
+        x = class effects
+        y = weights
+
+        One subplot per context.
+        Logged to TensorBoard: clip/eff_weight_corr_{mode}
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import math
+
+        # Get efficiency and predicted weights
+        eff = mode_data.get(REGISTRY_KEYS.CLS_EFF_KEY, None)
+        weights = mode_data.get("clip/weights", None)
+        # Exit if data is not available
+        if eff is None or weights is None:
+            return
+        # Get data contexts
+        contexts = mode_data.get(REGISTRY_KEYS.BATCH_KEY, None)
+        # Transform to arrays if need
+        eff = np.asarray(eff)
+        weights = np.asarray(weights)
+
+        # flatten if needed
+        eff = eff.reshape(-1)
+        weights = weights.reshape(-1)
+
+        if contexts is None:
+            contexts = np.zeros_like(eff)
+
+        # Get unique contexts to color for
+        contexts = np.asarray(contexts).reshape(-1)
+        # Optional mapping
+        if self.batch_labels is not None:
+            contexts = self.batch_labels[contexts]
+        unique_ctx = np.unique(contexts)
+
+        n_ctx = len(unique_ctx)
+        n_cols = min(3, n_ctx)
+        n_rows = math.ceil(n_ctx / n_cols)
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+        axes = np.array(axes).reshape(-1)
+        # Scatter for each dataset
+        for ax, ctx in zip(axes, unique_ctx):
+            mask = contexts == ctx
+
+            x = eff[mask]
+            y = weights[mask]
+
+            if len(x) == 0:
+                ax.axis("off")
+                continue
+
+            r = np.corrcoef(x, y)[0, 1]
+
+            ax.scatter(x, y, s=6, alpha=0.5)
+            ax.set_title(f"{ctx} \nR={r:.2f}")
+            ax.set_xlabel("real")
+            ax.set_ylabel("predicted")
+
+        for ax in axes[len(unique_ctx):]:
+            ax.axis("off")
+
+        fig.tight_layout()
+
+        if hasattr(self, "logger") and hasattr(self.logger, "experiment"):
+            self.logger.experiment.add_figure(
+                f"clip/eff_weight_corr_{mode}",
+                fig,
+                global_step=self.current_epoch
+            )
+
+        plt.close(fig)
+            
+    def _plt_clip_geometry(self, mode: str, mode_data: dict[str, np.ndarray]):
+        """
+        Plot CLIP geometry sanity scatter:
+        x = hardest negative similarity
+        y = positive similarity
+
+        One subplot per condition.
+        Logged to TensorBoard: clip/geom_{mode}
+        """
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import math
+
+        logits = mode_data.get(MODULE_KEYS.CLS_LOGITS_KEY)
+        if logits is None:
+            return
+
+        labels = mode_data[REGISTRY_KEYS.LABELS_KEY]
+        contexts = mode_data[REGISTRY_KEYS.BATCH_KEY]
+        weights = mode_data.get("clip/weights", None)
+        distances = mode_data.get("clip/dists", None)
+
+        logits = np.asarray(logits)
+        labels = np.asarray(labels).astype(int).flatten()
+        contexts = np.asarray(contexts)
+
+        # ----- positive similarities -----
+        pos = logits[np.arange(len(labels)), labels]
+
+        # ----- hardest negative -----
+        neg_logits = logits.copy()
+        neg_logits[np.arange(len(labels)), labels] = -np.inf
+        hardest_neg = neg_logits.max(axis=1)
+
+        df = pd.DataFrame({
+            "pos": pos,
+            "neg": hardest_neg,
+            "context": contexts,
+            "label": labels,
+        })
+
+        if weights is not None:
+            df["weight"] = np.asarray(weights)
+        if distances is not None:
+            df["distance"] = np.asarray(distances)
+
+        # Optional mapping
+        if self.batch_labels is not None:
+            df["context"] = self.batch_labels[df["context"]]
+
+        # ----- define conditions to plot -----
+        conditions = [c for c in ["context", "label", "weight", "distance"] if c in df.columns]
+
+        n_cond = len(conditions)
+        if n_cond == 0:
+            return
+
+        n_cols = min(3, n_cond)
+        n_rows = math.ceil(n_cond / n_cols)
+
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(5 * n_cols, 5 * n_rows),
+            squeeze=False
+        )
+
+        axes = axes.flatten()
+
+        vmin = min(df["neg"].min(), df["pos"].min())
+        vmax = max(df["neg"].max(), df["pos"].max())
+
+        for i, cond in enumerate(conditions):
+            ax = axes[i]
+
+            if pd.api.types.is_numeric_dtype(df[cond]):
+                # continuous coloring
+                sc = ax.scatter(
+                    df["neg"],
+                    df["pos"],
+                    c=df[cond],
+                    s=6,
+                    alpha=0.4,
+                )
+                fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            else:
+                # categorical coloring
+                for val, sdf in df.groupby(cond):
+                    ax.scatter(
+                        sdf["neg"],
+                        sdf["pos"],
+                        s=6,
+                        alpha=0.4,
+                        label=str(val),
+                    )
+                if df[cond].nunique() <= 10:
+                    ax.legend(markerscale=2, fontsize=8)
+
+            ax.plot([vmin, vmax], [vmin, vmax], linestyle="--")
+            ax.set_xlabel("Hardest negative similarity")
+            ax.set_ylabel("Positive similarity")
+            ax.set_title(f"{cond}")
+
+        # Hide unused axes
+        for j in range(i + 1, len(axes)):
+            axes[j].axis("off")
+
+        fig.suptitle(f"{mode} | CLIP geometry sanity", fontsize=14)
+        plt.tight_layout()
+
+        self.logger.experiment.add_figure(
+            tag=f"clip/geom_{mode}",
+            figure=fig,
+            global_step=self.current_epoch,
+        )
+
+        plt.close(fig)
+
     def _plt_f1_per_ctx_boxplots(self, mode_data: dict[str, np.ndarray]):
         import pandas as pd
         import seaborn as sns
@@ -1359,11 +1592,18 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
 
             labels_t = torch.tensor(g["label"].values)
             preds_t = torch.tensor(g["pred"].values)
+            clip_n_cls = self.n_classes
+            unknown_mask = (preds_t >= self.n_classes)
+            if unknown_mask.any():
+                # Assign unknown to classes that are outside of the training classes
+                preds_t = preds_t.masked_fill(unknown_mask, self.n_classes)
+                clip_n_cls += 1
 
             f1_per_class = multiclass_f1_score(
                 preds_t,
                 labels_t,
-                num_classes=self.n_classes,
+                num_classes=clip_n_cls,
+                ignore_index=self.n_classes,
                 average="none",
             ).cpu().numpy()
 
@@ -1487,9 +1727,12 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # --- Add class proxies if they exist
         if MODULE_KEYS.CLS_PROJ_KEY in mode_data and z_key != MODULE_KEYS.Z_KEY:
             cls_proxies = mode_data[MODULE_KEYS.CLS_PROJ_KEY]
+            # Get proxies (excluding null)
+            cls_proxies = cls_proxies[:self.module.n_cls]
             # Aggregate into smaller shapes if needed
             if cls_proxies.ndim == 3:
                 cls_proxies = cls_proxies.mean(1)
+            # Get current number of available proxies for plotting
             n_proxies = cls_proxies.shape[0]
 
             # proxy label ids
@@ -1605,7 +1848,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             sns.scatterplot(
                 data=data_sorted[~data_sorted.is_proxy],
                 x=u1, y=u2, hue=hue,
-                s=6, alpha=0.6, ax=ax, legend=legend
+                s=6, alpha=0.5, ax=ax, legend=legend
             )
             # overlay proxies as crosses (always plot observed on top of unobserved)
             if plot_proxy:
@@ -1640,7 +1883,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         fig, axes = plt.subplots(N, 2, figsize=(12, D), dpi=150)
 
         # 1. by modes (splits)
-        _scatter_base(axes[0, 0], df, "mode", f"Splits @ Epoch {self.current_epoch}")
+        _scatter_base(axes[0, 0], df, "mode", f"Splits @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False)
 
         # 2. by class (overlay proxies)
         _scatter_base(axes[0, 1], df, "label", f"Classes @ Epoch {self.current_epoch}", legend=False, plot_proxy=False, proxy_legend=False)

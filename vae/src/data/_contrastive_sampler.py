@@ -24,6 +24,8 @@ class RandomContrastiveBatchSampler(Sampler):
         batch_size: int = 512,
         max_cells_per_batch: int = 32,
         max_classes_per_batch: int = 16,
+        cap_per_group: int | None = None,
+        min_dataset_fraction: float = 0.5,
         seed: int = 0,
         shuffle: bool = True,
         drop_last: bool = False,
@@ -43,6 +45,8 @@ class RandomContrastiveBatchSampler(Sampler):
         self.max_cells_per_batch = max_cells_per_batch
         self.max_classes_per_batch = max_classes_per_batch
         self.min_contexts_per_class = min_contexts_per_class
+        self.cap_per_group = cap_per_group
+        self.min_dataset_fraction = min_dataset_fraction
         self.ctrl_class = ctrl_class
         self.ctrl_frac = ctrl_frac
         self.batch_sampler_cls = ContrastiveBatchSampler
@@ -71,6 +75,7 @@ class RandomContrastiveBatchSampler(Sampler):
             indices = torch.randperm(len(self.dataset), generator=g).tolist()
         else:
             indices = list(range(len(self.dataset)))
+        # Shuffle indices for batch
         labels = self.cls_labels[indices]
         batches = self.batches[indices]
 
@@ -82,13 +87,16 @@ class RandomContrastiveBatchSampler(Sampler):
             batch_size=self.batch_size,
             max_cells_per_batch=self.max_cells_per_batch,
             max_classes_per_batch=self.max_classes_per_batch,
+            cap_per_group=self.cap_per_group,
+            min_dataset_fraction=self.min_dataset_fraction,
             last_first=True,
             shuffle_classes=self.shuffle,
             min_contexts_per_class=self.min_contexts_per_class,
             ctrl_class=self.ctrl_class,
             ctrl_frac=self.ctrl_frac,
+            use_copy=self.use_copy,
         )
-        batch_dict = self.sampler.sample(copy=self.use_copy, return_details=False)
+        batch_dict = self.sampler.sample(return_details=False)
         # Return sampled class indices if no control cells are given
         return np.array(batch_dict[self.sampler.IDX_KEY])
 
@@ -100,6 +108,325 @@ class RandomContrastiveBatchSampler(Sampler):
 
     def set_epoch(self, epoch):
         self.epoch = epoch
+
+
+class ContrastiveBatchSampler:
+    """
+    Builds balanced batches for contrastive training. Supports context-aware sampling.
+    Ensures that each class has samples drawn from multiple contexts if possible.
+    """
+    IDX_KEY = "indices"
+    CLS_PER_BATCH_KEY = "classes_per_batch"
+    IDC_PER_BATCH_KEY = "idc_per_batch"
+    CTRL_IDX_KEY = "ctrl_indices"
+
+    def _check_setup(self):
+        if self.max_classes_per_batch is None and self.max_cells_per_batch is None:
+            logging.warning("No constraints set; defaulting max_classes_per_batch=8.")
+            self.max_classes_per_batch = 8
+            self.max_cells_per_batch = self.batch_size // self.max_classes_per_batch
+        elif self.max_cells_per_batch is not None and self.max_classes_per_batch is None:
+            self.max_classes_per_batch = self.batch_size // self.max_cells_per_batch
+        elif self.max_classes_per_batch is not None and self.max_cells_per_batch is None:
+            self.max_cells_per_batch = self.batch_size // self.max_classes_per_batch
+        if self.batch_size % self.max_classes_per_batch != 0:
+            logging.warning(f"Batch size not divisible by {self.max_classes_per_batch}.")
+
+    def __init__(
+        self,
+        indices: np.ndarray,
+        batch_labels: np.ndarray,
+        cls_labels: np.ndarray,
+        batch_size: int = 512,
+        max_cells_per_batch: Optional[int] = 32,
+        max_classes_per_batch: Optional[int] = 16,
+        shuffle_classes: bool = True,
+        strict: bool = True,
+        sample_mode: Literal["random", "split", "counter"] = "random",
+        split_batches: bool = False,
+        min_contexts_per_class: int = 2,
+        ctrl_class: str | None = None,
+        ctrl_frac: float = 1.0,
+        cap_per_group: int | None = None,
+        min_dataset_fraction: float = 0.5,
+        use_copy: bool = True,
+        **kwargs
+    ):
+        self.batch_size = batch_size
+        self.max_cells_per_batch = max_cells_per_batch
+        self.max_classes_per_batch = max_classes_per_batch
+        self._check_setup()
+        self.shuffle_classes = shuffle_classes
+        self.strict = strict
+        self.sample_mode = sample_mode
+        self.split_batches = split_batches
+        self.min_contexts_per_class = min_contexts_per_class
+        self.ctrl_class = ctrl_class
+        self.ctrl_frac = ctrl_frac
+        self.ctrl_pools = {}
+        self.use_copy = use_copy
+        self.kwargs = kwargs
+
+        # Index and label setup
+        self.indices = np.array(indices)
+        self.cls_labels = pd.Series(cls_labels, name="cls_label")
+        self.batch_labels = pd.Series(batch_labels, name="batch")
+        self.n_indices = len(indices)
+        self.unique_batches = np.unique(self.batch_labels)
+        # Split control vs non-control indices
+        if self.ctrl_class is not None:
+            ctrl_mask = self.cls_labels == self.ctrl_class
+            self.ctrl_indices = self.indices[ctrl_mask]
+            self.ctrl_pools = {
+                b: set(self.ctrl_indices[self.batch_labels[self.cls_labels == self.ctrl_class] == b])
+                for b in self.unique_batches
+            }
+            # remove empty control contexts
+            self.ctrl_pools = {b: pool for b, pool in self.ctrl_pools.items() if len(pool) > 0}
+            # Set some control specific parameters
+            n_ctrl_contexts = len(self.ctrl_pools)
+            # Save specifics about control batching if we have have control cells available
+            if n_ctrl_contexts > 0:
+                n_ctrl = self.batch_size * self.ctrl_frac
+                self.n_ctrl_per_ctx = int(np.ceil(n_ctrl / n_ctrl_contexts))
+                self.n_ctrl = int(self.n_ctrl_per_ctx * n_ctrl_contexts)
+            # Disable control cell batching if none are found
+            else:
+                self.n_ctrl_per_ctx = 0
+                self.n_ctrl = 0
+
+            # remove control indices from normal sampling
+            self.indices = self.indices[~ctrl_mask]
+            self.cls_labels = self.cls_labels[~ctrl_mask]
+            self.batch_labels = self.batch_labels[~ctrl_mask]
+
+        # --- build pools for non-control classes
+        self.cells_per_class = self.cls_labels.value_counts()
+        self.n_classes = self.cells_per_class.shape[0]
+        self.n_batches = int(np.floor(self.n_indices / self.batch_size))
+        # Merge cell meta information
+        index_meta = pd.concat((self.cls_labels.astype("category"), self.batch_labels.astype("category")), axis=1)
+        # Set self.indices as meta indices
+        index_meta.set_index(self.indices, inplace=True)
+        # Create index pools for each class and context
+        self.idx_pools = (
+            index_meta.groupby(index_meta.columns.tolist(), observed=True)
+            .apply(lambda x: set(x.index))
+            .unstack(0)
+            .to_dict()
+        )
+        # Track metrics per group
+        self.cap_per_group = cap_per_group
+        self.min_dataset_fraction = min_dataset_fraction
+        self.min_n_datasets = max(2, int(len(self.unique_batches) * min_dataset_fraction))
+        
+        # Track per-group sizes for reweighting
+        self._compute_group_weights()
+        # Pre-convert pools to arrays for fast sampling
+        self._precompute_arrays()
+        
+    def _precompute_arrays(self):
+        """Convert set pools to arrays with pointer-based sampling."""
+        self.array_pools = {}
+        self.pool_cursors = {}
+        
+        for cls, context_dict in self.idx_pools.items():
+            self.array_pools[cls] = {}
+            self.pool_cursors[cls] = {}
+            for ctx, pool in context_dict.items():
+                if isinstance(pool, set) and len(pool) > 0:
+                    arr = np.array(list(pool))
+                    np.random.shuffle(arr)
+                    self.array_pools[cls][ctx] = arr
+                    self.pool_cursors[cls][ctx] = 0
+                    
+    def _draw_from_pool_with_replacement(self, cls, ctx, n):
+        """Draw n samples randomly from full pool (no cursor)."""
+        arr = self.array_pools[cls][ctx]
+        if n >= len(arr):
+            return arr.copy()
+        idx = np.random.randint(0, len(arr), size=n)
+        return arr[idx]
+
+    def _draw_from_pool_no_replacement(self, cls, ctx, n):
+        """Draw n samples using cursor, exhausting pool."""
+        arr = self.array_pools[cls][ctx]
+        cursor = self.pool_cursors[cls][ctx]
+        remaining = len(arr) - cursor
+        if remaining >= n:
+            drawn = arr[cursor:cursor + n]
+            self.pool_cursors[cls][ctx] = cursor + n
+            return drawn
+        np.random.shuffle(arr)
+        self.pool_cursors[cls][ctx] = n
+        return arr[:n]
+
+    def _draw(self, cls, ctx, n):
+        if self.use_copy:
+            return self._draw_from_pool_with_replacement(cls, ctx, n)
+        return self._draw_from_pool_no_replacement(cls, ctx, n)
+        
+    def _compute_group_weights(self):
+        # TODO: use this
+        """Compute inverse-frequency weights per (class, context) group."""
+        self.group_sizes = {}
+        for cls, context_dict in self.idx_pools.items():
+            for ctx, pool in context_dict.items():
+                if isinstance(pool, set) and len(pool) > 0:
+                    self.group_sizes[(cls, ctx)] = len(pool)
+        
+        if not self.group_sizes:
+            self.group_weights = {}
+            return
+            
+        median_size = np.median(list(self.group_sizes.values()))
+        self.group_weights = {
+            k: median_size / max(v, 1) 
+            for k, v in self.group_sizes.items()
+        }
+
+    def _eligible_classes(self):
+        """Check eligibility from array pools and cursors only."""
+        eligible = []
+        for cls, ctx_dict in self.array_pools.items():
+            n_active = sum(
+                1 for ctx in ctx_dict
+                if len(ctx_dict[ctx]) - self.pool_cursors[cls][ctx] > 0
+            )
+            if n_active >= self.min_contexts_per_class:
+                eligible.append(cls)
+        return eligible
+
+    def _fill_batch_split(self):  # idx_pools kept for compat but unused
+        batch_idc = np.empty(self.batch_size, dtype=np.int64)
+        write_pos = 0
+        classes_in_batch = []
+        cells_per_class = []
+
+        required_datasets = set(np.random.choice(
+            self.unique_batches,
+            size=min(self.min_n_datasets, len(self.unique_batches)),
+            replace=False,
+        ))
+        uncovered = set(required_datasets)
+
+        # Recompute eligibility every batch
+        _class_pool = self._eligible_classes()
+        if self.shuffle_classes:
+            np.random.shuffle(_class_pool)
+
+        i = 0
+        n_pool = len(_class_pool)
+        batch_space = self.batch_size
+
+        while batch_space > 0 and n_pool > 0:
+            target_class = _class_pool[i % n_pool]
+
+            available_contexts = [
+                ctx for ctx in self.array_pools.get(target_class, {})
+                if len(self.array_pools[target_class][ctx]) - self.pool_cursors[target_class][ctx] > 0
+            ]
+
+            if len(available_contexts) < self.min_contexts_per_class:
+                _class_pool.pop(i % n_pool)
+                n_pool -= 1
+                if n_pool == 0:
+                    break
+                continue
+
+            # Prioritize uncovered datasets
+            uncovered_ctx = [b for b in available_contexts if b in uncovered]
+            other_ctx = [b for b in available_contexts if b not in uncovered]
+            n_ctx = max(len(available_contexts), self.min_contexts_per_class)
+            chosen_contexts = (uncovered_ctx + other_ctx)[:n_ctx]
+
+            draw_n_per_ctx = max(1, self.max_cells_per_batch // len(chosen_contexts))
+            if self.cap_per_group is not None:
+                draw_n_per_ctx = min(draw_n_per_ctx, self.cap_per_group)
+
+            drawn_total = 0
+            for ctx in chosen_contexts:
+                draw_n = min(draw_n_per_ctx, batch_space - drawn_total)
+                if draw_n <= 0:
+                    break
+                chosen = self._draw(target_class, ctx, draw_n)
+                n_drawn = len(chosen)
+                batch_idc[write_pos:write_pos + n_drawn] = chosen
+                write_pos += n_drawn
+                drawn_total += n_drawn
+                uncovered.discard(ctx)
+
+            if drawn_total > 0:
+                classes_in_batch.append(target_class)
+                cells_per_class.append(drawn_total)
+
+            batch_space = self.batch_size - write_pos
+            i += 1
+
+        return batch_idc[:write_pos].tolist(), classes_in_batch, cells_per_class
+    
+    def _fill_control_batch(self, ctrl_pools: dict, keep: bool = True) -> np.ndarray:
+        # Create batch list
+        ctrl_batch = []
+        for b, pool in ctrl_pools.items():
+            # Determine how many cells to draw
+            n_draw = min(self.n_ctrl_per_ctx, len(pool))
+            # Choose cells from available pool
+            chosen = np.random.choice(list(pool), n_draw, replace=False)
+            ctrl_batch.extend(chosen)
+            # Remove chosen cells from pool of available control cells
+            if not keep:
+                ctrl_pools[b] -= set(chosen)
+        # Draw with replacement if needed
+        if len(ctrl_batch) < self.n_ctrl:
+            # Draw extra random cells if there are not enough control cells for each context
+            extra = np.random.choice(self.ctrl_indices, self.n_ctrl - len(ctrl_batch), replace=True)
+            ctrl_batch.extend(extra)
+        # Shuffle the batch once more
+        return np.array(ctrl_batch[: self.n_ctrl])
+    
+    def sample(self, return_details: bool = False) -> dict:
+        # Reset cursors for fresh epoch
+        self._precompute_arrays()
+        # Collect batches
+        batches = []
+        n_classes_per_batch = []
+        n_idc_per_batch = []
+
+        # Sample batches
+        for _ in np.arange(self.n_batches):
+            batch_idc, classes_in_batch, cells_per_class = self._fill_batch_split()
+
+            if len(batch_idc) != self.batch_size:
+                continue
+
+            if self.strict and (
+                len(np.unique(classes_in_batch)) < 1
+                or np.any(np.array(cells_per_class) == 0)
+            ):
+                continue
+            # Randomly shuffle the indices
+            if self.shuffle_classes:
+                batch_idc = np.random.permutation(batch_idc)
+
+            batches.extend(batch_idc)
+            n_cls = len(classes_in_batch)
+            n_batch = len(batch_idc)
+            
+            # Add stats
+            n_classes_per_batch.append(n_cls)
+            n_idc_per_batch.append(n_batch)
+
+        # Create batch output dict
+        batch = {self.IDX_KEY: np.array(batches)}
+        # Add batch details
+        if return_details:
+            batch.update({
+                self.CLS_PER_BATCH_KEY: n_classes_per_batch,
+                self.IDC_PER_BATCH_KEY: np.array(n_idc_per_batch),
+            })
+        # Return batch
+        return batch
 
 
 class DistributedContrastiveBatchSampler(Sampler):
@@ -207,247 +534,3 @@ class DistributedContrastiveBatchSampler(Sampler):
 
     def set_epoch(self, epoch):
         self.epoch = epoch
-
-
-class ContrastiveBatchSampler:
-    """
-    Builds balanced batches for contrastive training. Supports context-aware sampling.
-    Ensures that each class has samples drawn from multiple contexts if possible.
-    """
-    IDX_KEY = "indices"
-    CLS_PER_BATCH_KEY = "classes_per_batch"
-    IDC_PER_BATCH_KEY = "idc_per_batch"
-    CTRL_IDX_KEY = "ctrl_indices"
-
-    def _check_setup(self):
-        if self.max_classes_per_batch is None and self.max_cells_per_batch is None:
-            logging.warning("No constraints set; defaulting max_classes_per_batch=8.")
-            self.max_classes_per_batch = 8
-            self.max_cells_per_batch = self.batch_size // self.max_classes_per_batch
-        elif self.max_cells_per_batch is not None and self.max_classes_per_batch is None:
-            self.max_classes_per_batch = self.batch_size // self.max_cells_per_batch
-        elif self.max_classes_per_batch is not None and self.max_cells_per_batch is None:
-            self.max_cells_per_batch = self.batch_size // self.max_classes_per_batch
-        if self.batch_size % self.max_classes_per_batch != 0:
-            logging.warning(f"Batch size not divisible by {self.max_classes_per_batch}.")
-
-    def __init__(
-        self,
-        indices: np.ndarray,
-        batch_labels: np.ndarray,
-        cls_labels: np.ndarray,
-        batch_size: int = 512,
-        max_cells_per_batch: Optional[int] = 32,
-        max_classes_per_batch: Optional[int] = 16,
-        shuffle_classes: bool = True,
-        strict: bool = True,
-        sample_mode: Literal["random", "split", "counter"] = "random",
-        split_batches: bool = False,
-        min_contexts_per_class: int = 2,
-        ctrl_class: str | None = None,
-        ctrl_frac: float = 1.0,
-        **kwargs
-    ):
-        self.batch_size = batch_size
-        self.max_cells_per_batch = max_cells_per_batch
-        self.max_classes_per_batch = max_classes_per_batch
-        self._check_setup()
-        self.shuffle_classes = shuffle_classes
-        self.strict = strict
-        self.sample_mode = sample_mode
-        self.split_batches = split_batches
-        self.min_contexts_per_class = min_contexts_per_class
-        self.ctrl_class = ctrl_class
-        self.ctrl_frac = ctrl_frac
-        self.ctrl_pools = {}
-        self.kwargs = kwargs
-
-        # Index and label setup
-        self.indices = np.array(indices)
-        self.cls_labels = pd.Series(cls_labels, name="cls_label")
-        self.batch_labels = pd.Series(batch_labels, name="batch")
-        self.n_indices = len(indices)
-        self.unique_batches = np.unique(self.batch_labels)
-        # Split control vs non-control indices
-        if self.ctrl_class is not None:
-            ctrl_mask = self.cls_labels == self.ctrl_class
-            self.ctrl_indices = self.indices[ctrl_mask]
-            self.ctrl_pools = {
-                b: set(self.ctrl_indices[self.batch_labels[self.cls_labels == self.ctrl_class] == b])
-                for b in self.unique_batches
-            }
-            # remove empty control contexts
-            self.ctrl_pools = {b: pool for b, pool in self.ctrl_pools.items() if len(pool) > 0}
-            # Set some control specific parameters
-            n_ctrl_contexts = len(self.ctrl_pools)
-            # Save specifics about control batching if we have have control cells available
-            if n_ctrl_contexts > 0:
-                n_ctrl = self.batch_size * self.ctrl_frac
-                self.n_ctrl_per_ctx = int(np.ceil(n_ctrl / n_ctrl_contexts))
-                self.n_ctrl = int(self.n_ctrl_per_ctx * n_ctrl_contexts)
-            # Disable control cell batching if none are found
-            else:
-                self.n_ctrl_per_ctx = 0
-                self.n_ctrl = 0
-
-            # remove control indices from normal sampling
-            self.indices = self.indices[~ctrl_mask]
-            self.cls_labels = self.cls_labels[~ctrl_mask]
-            self.batch_labels = self.batch_labels[~ctrl_mask]
-
-        # --- build pools for non-control classes
-        self.cells_per_class = self.cls_labels.value_counts()
-        self.n_classes = self.cells_per_class.shape[0]
-        self.n_batches = int(np.floor(self.n_indices / self.batch_size))
-        # Merge cell meta information
-        index_meta = pd.concat((self.cls_labels.astype("category"), self.batch_labels.astype("category")), axis=1)
-        # Set self.indices as meta indices
-        index_meta.set_index(self.indices, inplace=True)
-        # Create index pools for each class and context
-        self.idx_pools = (
-            index_meta.groupby(index_meta.columns.tolist(), observed=True)
-            .apply(lambda x: set(x.index))
-            .unstack(0)
-            .to_dict()
-        )
-
-    def _eligible_classes(self, idx_pools: dict[int, dict[int, set[int]]]) -> list[int]:
-        eligible = []
-        for cls, context_dict in idx_pools.items():
-            # Check number of contexts per class that still have cells
-            n_contexts = sum(len(v) > 0 for v in context_dict.values() if isinstance(v, set))
-            if n_contexts >= self.min_contexts_per_class:
-                eligible.append(cls)
-        return eligible
-
-    def _fill_batch_split(self, idx_pools):
-        batch_space = self.batch_size
-        batch_idc = []
-        classes_in_batch = []
-        cells_per_class = []
-        # Get classes that still have available indices
-        eligible_classes = self._eligible_classes(idx_pools)
-        # Randomly shuffle class pool
-        if self.shuffle_classes:
-            _class_pool = list(np.random.permutation(eligible_classes))
-        else:
-            _class_pool = eligible_classes
-        # Keep drawing from class pools as long as the batch is not full
-        i = 0
-        while batch_space > 0 and len(_class_pool) > 0:
-            target_class = _class_pool[i]
-            current_class_pool = idx_pools[target_class]
-
-            # Get number of cells per context
-            available_contexts = [b for b, pool in current_class_pool.items() if isinstance(pool, set) and len(pool) > 0]
-            # Remove class from pool if it has less than requires contexts
-            if len(available_contexts) < self.min_contexts_per_class:
-                _class_pool.remove(target_class)
-                if i >= len(_class_pool):
-                    break
-                continue
-            # Randomly choose cells from all possible contexts
-            chosen_contexts = np.random.choice(
-                available_contexts,
-                size=max(len(available_contexts), self.min_contexts_per_class),
-                replace=False,
-            )
-
-            draw_n_per_ctx = max(1, self.max_cells_per_batch // len(chosen_contexts))
-            drawn_total = 0
-            for ctx in chosen_contexts:
-                pool = current_class_pool[ctx]
-                draw_n = min(draw_n_per_ctx, len(pool), batch_space - drawn_total)
-                if draw_n <= 0:
-                    continue
-                chosen = np.random.choice(list(pool), draw_n, replace=False)
-                batch_idc.extend(chosen)
-                pool -= set(chosen)
-                drawn_total += draw_n
-
-            if drawn_total > 0:
-                classes_in_batch.append(target_class)
-                cells_per_class.append(drawn_total)
-
-            batch_space = self.batch_size - len(batch_idc)
-            i = (i + 1) % len(_class_pool)
-
-        return batch_idc, classes_in_batch, cells_per_class
-    
-    def _fill_control_batch(self, ctrl_pools: dict, keep: bool = True) -> np.ndarray:
-        # Create batch list
-        ctrl_batch = []
-        for b, pool in ctrl_pools.items():
-            # Determine how many cells to draw
-            n_draw = min(self.n_ctrl_per_ctx, len(pool))
-            # Choose cells from available pool
-            chosen = np.random.choice(list(pool), n_draw, replace=False)
-            ctrl_batch.extend(chosen)
-            # Remove chosen cells from pool of available control cells
-            if not keep:
-                ctrl_pools[b] -= set(chosen)
-        # Draw with replacement if needed
-        if len(ctrl_batch) < self.n_ctrl:
-            # Draw extra random cells if there are not enough control cells for each context
-            extra = np.random.choice(self.ctrl_indices, self.n_ctrl - len(ctrl_batch), replace=True)
-            ctrl_batch.extend(extra)
-        # Shuffle the batch once more
-        return np.array(ctrl_batch[: self.n_ctrl])
-    
-    def sample(self, copy: bool = False, return_details: bool = False) -> dict:
-        batches = []
-        n_classes_per_batch = []
-        n_idc_per_batch = []
-
-        # Create a deepcopy of available pools every sample
-        if copy:
-            idx_pools = deepcopy(self.idx_pools)
-            ctrl_pools = deepcopy(self.ctrl_pools)
-        # Use class pool and remove cells that have been drawn
-        else:
-            idx_pools = self.idx_pools
-            ctrl_pools = self.ctrl_pools
-
-        for _ in np.arange(self.n_batches):
-            batch_idc, classes_in_batch, cells_per_class = self._fill_batch_split(idx_pools=idx_pools)
-
-            if len(batch_idc) != self.batch_size:
-                continue
-
-            if self.strict and (
-                len(np.unique(classes_in_batch)) < 1
-                or np.any(np.array(cells_per_class) == 0)
-            ):
-                continue
-            # Randomly shuffle the indices
-            if self.shuffle_classes:
-                batch_idc = np.random.permutation(batch_idc)
-
-            batches.extend(batch_idc)
-            n_cls = len(classes_in_batch)
-            n_batch = len(batch_idc)
-            # Randomly sample control indices for each batch
-            if self.ctrl_class is not None and len(ctrl_pools) > 0:
-                ctrl_batch = self._fill_control_batch(ctrl_pools=ctrl_pools)
-                # Shuffle control indices
-                if self.shuffle_classes:
-                    ctrl_batch = np.random.permutation(ctrl_batch)
-                # Add control batch to class batch and update stats
-                batches.extend(ctrl_batch)
-                n_cls += 1
-                n_batch += 1
-            # Add stats
-            n_classes_per_batch.append(n_cls)
-            n_idc_per_batch.append(n_batch)
-
-        # Create batch output dict
-        batch = {self.IDX_KEY: np.array(batches)}
-        # Add batch details
-        if return_details:
-            batch.update({
-                self.CLS_PER_BATCH_KEY: n_classes_per_batch,
-                self.IDC_PER_BATCH_KEY: np.array(n_idc_per_batch),
-            })
-        # Return batch
-        return batch
-
