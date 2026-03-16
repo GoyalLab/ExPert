@@ -1,3 +1,4 @@
+import os
 from scipy.stats import median_abs_deviation
 import scanpy as sc
 import numpy as np
@@ -5,11 +6,11 @@ import pandas as pd
 import logging
 import anndata as ad
 import scipy.sparse as sp
-from typing import Iterable
+from typing import Iterable, Optional, List, Literal
 from sklearn.covariance import EmpiricalCovariance
 
 from src.statics import P_COLS, CTRL_KEYS, GENE_SYMBOL_KEYS, SETTINGS, OBS_KEYS, MISC_LABELS_KEYS
-
+import src.prepare as prep
 
 # credit to https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
 def is_outlier(
@@ -586,3 +587,588 @@ def preprocess_dataset(
         filter_min_number_of_cells_per_class(adata, condition_col=p_col, min_cells=min_cells_per_perturbation)
     logging.info(f'Pre-processed adata shape: {adata.shape}')
     return adata
+
+# Per-dataset adaptive threshold
+def compute_responder_threshold(scores, dataset_ids, min_threshold=1.5, quantile=0.5):
+    """Threshold as median of non-zero scores per dataset."""
+    thresholds = {}
+    for ds in np.unique(dataset_ids):
+        ds_scores = np.abs(scores[dataset_ids == ds])
+        nonzero = ds_scores[ds_scores > 0.5]  # ignore near-zero
+        if len(nonzero) > 0:
+            thresholds[ds] = max(np.quantile(nonzero, quantile), min_threshold)
+        else:
+            thresholds[ds] = min_threshold
+    return thresholds
+
+def scale_scores(
+        adata: ad.AnnData, 
+        score_col: str = 'mixscale_score', 
+        dataset_col: str = 'dataset', 
+        q: float = 0.99,
+        max_scaling: bool = False,
+    ):
+    # Get max values for each cell
+    df = adata.obs.copy()
+    df['score'] = adata.obs[score_col].abs()
+    max_per_ds = df.groupby(dataset_col).score.quantile(q)[adata.obs[dataset_col]].values
+    score = df.score
+    score = max_per_ds * np.tanh(score / max_per_ds)
+    if max_scaling:
+        return score / max_per_ds * max_per_ds.min()
+    else:
+        return score
+
+def select_perturbations(
+    adata,
+    n: int,
+    perturbation_col: str = "perturbation",
+    context_col: str = "context",
+    efficiency_col: Optional[str] = None,
+    min_contexts: int = 4,
+    min_cells: int = 100,
+    min_abs_eff: float = 0.0,
+    min_eff_variance: Optional[float] = None,
+    random_state: Optional[int] = None,
+    return_stats: bool = False,
+) -> List[str]:
+    """
+    Select N perturbations based on cross-context support and signal richness.
+
+    Parameters
+    ----------
+    adata : AnnData
+    n : int
+        Number of perturbations to select
+    perturbation_col : str
+    context_col : str
+    efficiency_col : Optional[str]
+        Column with cell-level efficiency scores
+    min_contexts : int
+        Minimum number of distinct contexts per perturbation
+    min_cells : int
+        Minimum total number of cells per perturbation
+    min_eff_variance : Optional[float]
+        Minimum variance in efficiency score (if provided)
+    random_state : Optional[int]
+
+    Returns
+    -------
+    List[str]
+        Selected perturbation names
+    """
+
+    df = adata.obs[[perturbation_col, context_col]].copy()
+    # Add efficiency column and filter
+    if efficiency_col is not None:
+        df["efficiency"] = np.log1p(adata.obs[efficiency_col].abs())
+        # Filter for min efficiency
+        df = df[df.efficiency > min_abs_eff].copy()
+
+    # ---- Aggregate stats per perturbation ----
+    stats = df.groupby(perturbation_col).agg(
+        n_cells=(perturbation_col, "count"),
+        n_contexts=(context_col, "nunique"),
+    )
+
+    # Add efficiency stats if provided
+    if efficiency_col is not None:
+        eff_stats = df.groupby(perturbation_col)["efficiency"].agg(
+            eff_mean="mean",
+            eff_var="var",
+        )
+        stats = stats.join(eff_stats)
+
+    # ---- Filtering ----
+    stats = stats[stats["n_contexts"] >= min_contexts]
+    stats = stats[stats["n_cells"] >= min_cells]
+
+    if efficiency_col is not None and min_eff_variance is not None:
+        stats = stats[stats["eff_var"] >= min_eff_variance]
+
+    if len(stats) == 0:
+        raise ValueError("No perturbations satisfy the selection criteria.")
+
+    # ---- Ranking ----
+    # Primary: number of contexts
+    # Secondary: number of cells
+    sort_cols = ["n_contexts", "n_cells"]
+
+    if efficiency_col is not None:
+        sort_cols.append("eff_var")
+
+    stats = stats.sort_values(sort_cols, ascending=False)
+
+    # ---- Select top N ----
+    selected = stats.index.tolist()
+
+    if len(selected) < n:
+        print(f"Warning: only {len(selected)} perturbations available after filtering.")
+        return selected
+
+    # Optional random sampling within top 2N for diversity
+    if random_state is not None:
+        rng = np.random.default_rng(random_state)
+        top_pool = selected[: min(len(selected), 2 * n)]
+        selected = rng.choice(top_pool, size=n, replace=False).tolist()
+    else:
+        selected = selected[:n]
+    if return_stats:
+        return selected, stats
+    else:
+        return selected
+    
+def build_perturbation_groups(class_embeddings, class_names, threshold=0.8, method='embedding'):
+    """Group perturbations by similarity."""
+    from sklearn.metrics.pairwise import cosine_similarity
+    if method == 'embedding':
+        emb = class_embeddings
+        emb_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+        sim = emb_norm @ emb_norm.T
+    elif method == 'expression':
+        # Average expression profile per perturbation
+        sim = cosine_similarity(class_embeddings)
+    
+    # Cluster similar perturbations via connected components
+    from scipy.sparse.csgraph import connected_components
+    adjacency = (sim > threshold).astype(int)
+    np.fill_diagonal(adjacency, 0)
+    _, component_labels = connected_components(adjacency, directed=False)
+    
+    groups = {}
+    for name, group_id in zip(class_names, component_labels):
+        groups[name] = f'group_{group_id}'
+    
+    return groups
+
+def sample_merged_dataset(
+    obs: pd.DataFrame,
+    perturbation_col: str = "perturbation",
+    context_col: str = "dataset",
+    sampling_method: Literal['subsample', 'maxsample'] = 'maxsample',
+    cells_per_perturbation: int = 100,
+    min_contexts: int = 3,
+    efficiency_col: str | None = None,
+    **kwargs
+):
+    if sampling_method == 'subsample':
+        return sample_dataset_idx(
+            obs,
+            perturbation_col=perturbation_col,
+            context_col=context_col,
+            cells_per_perturbation=cells_per_perturbation,
+            min_contexts=min_contexts,
+            efficiency_col=efficiency_col,
+            **kwargs
+        )
+    elif sampling_method == 'maxsample':
+        return sample_max_dataset_idx(
+            obs,
+            perturbation_col=perturbation_col,
+            context_col=context_col,
+            cells_per_perturbation=cells_per_perturbation,
+            min_contexts=min_contexts,
+            **kwargs
+        )
+    else:
+        raise ValueError(f'Unrecognized sampling_method: {sampling_method}')
+
+def sample_dataset_idx(
+    obs: pd.DataFrame,
+    perturbation_col: str = "perturbation",
+    context_col: str = "dataset",
+    cells_per_perturbation: int = 100,
+    min_contexts: int = 3,
+    seed: int = 42,
+    ignore_key: str = "control",
+    efficiency_col: str | None = None,
+    min_eff: float = 0.0,
+    strict: bool = True,
+):
+    # Init random generator
+    rng = np.random.default_rng(seed)
+
+    # ----------------------------
+    # Filtering
+    # ----------------------------
+    mask = np.ones(len(obs), dtype=bool)
+    # Remove control cells
+    if ignore_key is not None:
+        mask &= obs[perturbation_col] != ignore_key
+    # Check if efficiency col is present and can be used
+    use_eff = efficiency_col is not None and efficiency_col in obs
+    if use_eff:
+        # Use absolute values
+        obs[efficiency_col] = obs[efficiency_col].abs()
+        # Remove cells below efficiency cutoff
+        mask &= obs[efficiency_col] > min_eff
+
+    # Subset to overall available cells
+    obs = obs[mask]
+
+    # ----------------------------
+    # Stats
+    # ----------------------------
+    stats = obs.groupby(perturbation_col).agg(
+        n_cells=(perturbation_col, "count"),
+        n_contexts=(context_col, "nunique"),
+    )
+    # Filter for min contexts per perturbation
+    if min_contexts < 0:
+        min_contexts = obs[context_col].nunique()
+    # Draw n * min contexts cells per perturbation
+    min_cells_total = min_contexts * cells_per_perturbation
+    # Collect stats per group
+    stats = stats[
+        (stats.n_cells >= min_cells_total) &
+        (stats.n_contexts >= min_contexts)
+    ]
+    # Subset to perturbation that pass the filtering
+    valid_perts = stats.index
+    obs = obs[obs[perturbation_col].isin(valid_perts)]
+    # Collect adata indices for subsetting
+    sampled_indices = []
+
+    # ----------------------------
+    # Sample cells per perturbation x dataset group
+    # ----------------------------
+    for _, dfp in obs.groupby(perturbation_col):
+        # Collect perturbation indices
+        pert_indices = []
+        # Gather all contexts per perturbation
+        contexts = dfp[context_col].unique()
+        k = len(contexts)
+        # Skip perturbation if not enough contexts are present
+        if k < min_contexts:
+            continue
+        # Determine how many cells to sample per group
+        base = min_cells_total // k
+        remainder = min_cells_total % k
+        # Loop over each available context and draw equal cells
+        for ctx in contexts:
+            # Subset to context perturbation
+            d: pd.DataFrame = dfp[dfp[context_col] == ctx]
+            # Update remainder counts
+            n = base
+            if remainder > 0:
+                n += 1
+                remainder -= 1
+            # Determine number of available cells
+            n = min(len(d), n)
+            # Randomly draw cells
+            if not use_eff:
+                sampled_idx = rng.choice(d.index, size=n, replace=False)
+            # Draw cells with highest efficiency
+            else:
+                sampled_idx = d.sort_values(efficiency_col, ascending=False).index[:n]
+            # Add indices per perturbation
+            pert_indices.extend(
+                sampled_idx
+            )
+
+        # Fill remainder if needed and not strict batching
+        if not strict and len(pert_indices) < min_cells_total:
+            # Check how many cells are missing
+            remaining = dfp.index.difference(pert_indices)
+            # Draw extra cells
+            extra = rng.choice(
+                remaining,
+                size=min_cells_total - len(pert_indices),
+                replace=False
+            )
+            # Add to drawn indices
+            pert_indices.extend(extra)
+
+        sampled_indices.extend(pert_indices)
+    # Sort sampled indices to speed up backed up selection
+    sampled_indices = np.sort(np.array(sampled_indices))
+
+    return sampled_indices
+
+def sample_max_dataset_idx(
+    obs: pd.DataFrame,
+    perturbation_col: str = "perturbation",
+    context_col: str = "dataset",
+    cells_per_perturbation: int = 10,
+    min_contexts: int = 2,
+    cap_quantile: float = 0.95,
+    cap_max: int | None = None,
+    seed: int = 42,
+    ignore_key: str = "control",
+    efficiency_col: str | None = None,
+    min_eff: float = 0.0,
+):
+    """
+    Light subsampling: keep all data except extreme outlier groups.
+    Only caps dataset x perturbation groups above the cap_quantile threshold.
+    """
+    rng = np.random.default_rng(seed)
+
+    # ----------------------------
+    # Filtering
+    # ----------------------------
+    mask = np.ones(len(obs), dtype=bool)
+    if ignore_key is not None:
+        mask &= obs[perturbation_col] != ignore_key
+    
+    use_eff = efficiency_col is not None and efficiency_col in obs.columns
+    if use_eff:
+        obs = obs.copy()
+        obs[efficiency_col] = obs[efficiency_col].abs()
+        mask &= obs[efficiency_col] > min_eff
+
+    obs = obs[mask]
+
+    # ----------------------------
+    # Group stats
+    # ----------------------------
+    group_sizes = obs.groupby([perturbation_col, context_col]).size()
+    # Filter: each group must have minimum cells
+    valid_groups = group_sizes[group_sizes >= cells_per_perturbation]
+    # Filter valid groups for minimum amount of contexts per perturbation
+    ctxpp = valid_groups.reset_index().groupby(perturbation_col)[context_col].nunique()
+    valid_perturbations = ctxpp[ctxpp >= min_contexts].index
+    valid_group_idx = valid_groups[valid_perturbations].index
+    valid_group_idx = pd.Series(valid_group_idx.values).str.join('_').values
+
+    # Compute cap from quantile of valid group sizes
+    cap = int(valid_groups.quantile(cap_quantile))
+    if cap_max is not None:
+        cap = min(cap, cap_max)
+
+    # ----------------------------
+    # Sample from all groups
+    # ----------------------------
+    sampled_indices = []
+
+    for (pert, ctx), group_df in obs.groupby([perturbation_col, context_col]):
+        # Skip if perturbation doesn't meet filters
+        idx_key = str(pert) + '_' + str(ctx)
+        if idx_key not in valid_group_idx:
+            continue
+        
+        idx = group_df.index.tolist()
+        
+        # Only subsample if above cap
+        if len(idx) > cap:
+            if use_eff:
+                idx = group_df.nlargest(cap, efficiency_col).index.tolist()
+            else:
+                idx = rng.choice(idx, size=cap, replace=False).tolist()
+        
+        sampled_indices.extend(idx)
+
+    sampled_indices = np.sort(np.array(sampled_indices))
+    
+    # Log stats
+    n_total = len(obs)
+    n_sampled = len(sampled_indices)
+    n_capped = (group_sizes > cap).sum()
+    logging.info(f"Subsampling: {n_sampled}/{n_total} cells kept "
+          f"({n_sampled/n_total:.1%}), {n_capped} groups capped at {cap}")
+
+    return sampled_indices
+    
+def process(
+    adata_p: str, 
+    gene_targets: list[str], 
+    n_hvg: int = 3000,
+    p_col: str = 'perturbation', 
+    n_ctrl: int = 10_000, 
+    ctrl_key: str = 'control',
+    cpm: bool = False,
+    log1p: bool = False,
+    scale: bool = False,
+):
+    if not os.path.exists(adata_p):
+        logging.info(f'File not found: {adata_p}')
+        return None
+    logging.info(f'Reading: {adata_p}')
+    # Read adata in backed mode
+    adata = sc.read(adata_p, backed='r')
+    logging.info(f'Shape: {adata.shape}')
+    # Check adata type
+    logging.info(f'X: {type(adata.X)}')
+    
+    # Find correct key
+    p_idx = _find_match_idx(adata.obs.columns, P_COLS)
+    p_key = adata.obs.columns[p_idx]
+    # Subset adata to target perturbations
+    mask = adata.obs[p_key].isin(gene_targets)
+    # Randomly sample n control cells if given
+    if n_ctrl > 0:
+        ctrl_mask = adata.obs[p_key].str.lower().isin(CTRL_KEYS)
+        # Add all control cells if there are less than given
+        if n_ctrl > ctrl_mask.sum():
+            logging.info(f'Adding all {ctrl_mask.sum()} control cells')
+            mask |= ctrl_mask
+        # Sample N control cells
+        else:
+            logging.info(f'Sampling {n_ctrl} control cells from {ctrl_mask.sum()}')
+            ctrl_indices = np.where(ctrl_mask)[0]
+            sampled_ctrl = np.random.choice(ctrl_indices, size=n_ctrl, replace=False)
+            sampled_mask = np.zeros(adata.n_obs, dtype=bool)
+            sampled_mask[sampled_ctrl] = True
+            mask |= sampled_mask
+
+    # Stop if no cells have been selected
+    logging.info(f'Found {mask.sum()} cells matching the target genes.')
+    if mask.sum() == 0:
+        return None
+    # Subset adata view
+    subset = adata[mask]
+    # Load only subset into memory
+    subset = subset.to_memory()
+    # Rename perturbation column
+    subset.obs[p_col] = subset.obs[p_key].values
+    # Rename control column
+    if n_ctrl > 0:
+        ctrl_mask = subset.obs[p_col].str.lower().isin(CTRL_KEYS)
+        if ctrl_mask.sum() > 0:
+            ps = np.array(subset.obs[p_col], dtype=str)
+            ps[ctrl_mask] = ctrl_key
+            subset.obs[p_col] = pd.Categorical(ps)
+    # Close adata file connection TODO: wrap in try
+    adata.file.close()
+    # Convert to csr if neccessary
+    if not sp.issparse(subset.X):
+        logging.info('Converting .X to csr.')
+        subset.X = sp.csr_matrix(subset.X)
+    # Subset adata for highly variable genes, use v3 for raw data
+    sc.pp.highly_variable_genes(subset, n_top_genes=n_hvg, subset=False, flavor='seurat_v3', check_values=True)
+    # Ensure var names are symbols
+    if subset.var_names.str.lower().str.startswith('ens').sum() / subset.n_vars > 0.9:
+        logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
+        subset = ens_to_symbol(subset).copy()
+    # Apply pre-processing to adata
+    norms = []
+    if cpm:
+        norms.append('cpm')
+        sc.pp.normalize_total(subset, target_sum=1e6)
+    if log1p:
+        norms.append('log1p')
+        sc.pp.log1p(subset)
+    if scale:
+        norms.append('scale')
+        sc.pp.scale(subset)
+    if len(norms) > 0:
+        logging.info(f'Applied normalizations: {norms}')
+    return subset
+
+def prepare(adata, ds: str, pool_genes: list[str]):
+    # Make cell names unique per dataset
+    adata.obs_names = adata.obs_names + ';' + ds
+    # Add dataset marker to adata
+    adata.obs['dataset'] = ds
+    # Zero-pad missing genes from adata
+    adata = prep._filter(adata, ds, pool_genes)
+    # Convert adata.X to csr
+    if not isinstance(adata.X, sp.csr_matrix):
+        logging.info('Converting to CSR matrix.')
+        adata.X = sp.csr_matrix(adata.X.compute())
+    return adata
+
+
+def subset_adata(adata, labels_key='perturbation', dataset_key='dataset', max_per_group=500):
+    """Only downsample large groups, never upsample."""
+    idx = []
+    for _, group_df in adata.obs.groupby([labels_key, dataset_key]):
+        group_idx = group_df.index.tolist()
+        if len(group_idx) > max_per_group:
+            idx.extend(np.random.choice(group_idx, max_per_group, replace=False))
+        else:
+            idx.extend(group_idx)
+    return adata[idx].copy()
+
+def compute_dataset_similarity_matrix(adata, dataset_key, labels_key, n_pcs=50):
+    import scanpy as sc
+    """Pairwise dataset similarity per label, averaged."""
+    if 'X_pca' not in adata.obsm:
+        logging.info(f'Calculating PCA with {n_pcs} components.')
+        sc.pp.pca(adata, n_comps=n_pcs)
+
+    # Collect dataset information
+    datasets = list(adata.obs[dataset_key].unique())
+    ds_to_idx = {ds: i for i, ds in enumerate(datasets)}
+    n_ds = len(datasets)
+    
+    # Accumulate per-label similarities
+    sim_sum = np.zeros((n_ds, n_ds))
+    sim_count = np.zeros((n_ds, n_ds))
+    
+    for label, group in adata.obs.groupby(labels_key):
+        centroids = {}
+        for ds in group[dataset_key].unique():
+            mask = group[dataset_key] == ds
+            if mask.sum() >= 5:
+                centroids[ds] = adata[group[mask].index].obsm['X_pca'].mean(axis=0)
+        
+        ds_list = list(centroids.keys())
+        if len(ds_list) < 2:
+            continue
+        
+        for a in ds_list:
+            for b in ds_list:
+                if a == b:
+                    continue
+                c1, c2 = centroids[a], centroids[b]
+                sim = np.dot(c1, c2) / (np.linalg.norm(c1) * np.linalg.norm(c2) + 1e-8)
+                i, j = ds_to_idx[a], ds_to_idx[b]
+                sim_sum[i, j] += sim
+                sim_count[i, j] += 1
+    
+    # Average similarity
+    sim_matrix = np.divide(sim_sum, sim_count, where=sim_count > 0, out=np.zeros_like(sim_sum))
+    
+    # Convert to contrastive weight: dissimilar pairs get higher weight
+    # They provide more learning signal
+    weight_matrix = 1.0 - sim_matrix
+    np.fill_diagonal(weight_matrix, 0)
+    # Normalize so mean weight = 1
+    mask = weight_matrix > 0
+    weight_matrix[mask] /= weight_matrix[mask].mean()
+    
+    return weight_matrix, datasets
+
+def dataset_anchors(
+    adata, 
+    batch_col: str = 'dataset', 
+    dataset_to_idx_key: str = 'dataset_to_mask_idx',
+):
+    if batch_col not in adata.obs:
+        raise ValueError(f'Missing category: {batch_col}')
+    X = adata.X
+
+    batch_labels = adata.obs[batch_col].values
+    n_genes = X.shape[1]
+    # Get datasets from unique values
+    if dataset_to_idx_key not in adata.uns:
+        datasets = adata.obs[batch_col].unique()
+    # Get precalculated dataset from index mapping
+    else:
+        datasets = adata.uns[dataset_to_idx_key].keys()
+    n_datasets = len(datasets)
+
+    mean_matrix = np.zeros((n_datasets, n_genes), dtype=np.float32)
+    std_matrix = np.zeros((n_datasets, n_genes), dtype=np.float32)
+
+    for i, ds in enumerate(datasets):
+        mask = batch_labels == ds
+        ds_data = X[mask]
+
+        if sp.issparse(ds_data):
+            # Sparse mean is fast
+            m = np.asarray(ds_data.mean(axis=0)).flatten()
+            # Var = E[x^2] - E[x]^2, all sparse-friendly
+            sq = ds_data.copy()
+            sq.data **= 2
+            mean_sq = np.asarray(sq.mean(axis=0)).flatten()
+            var = mean_sq - m ** 2
+            var = np.maximum(var, 0)  # numerical safety
+            std_matrix[i] = np.sqrt(var)
+        else:
+            m = ds_data.mean(axis=0)
+            std_matrix[i] = ds_data.std(axis=0)
+
+        mean_matrix[i] = m
+    return mean_matrix, std_matrix
