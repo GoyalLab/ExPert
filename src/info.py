@@ -6,8 +6,9 @@ import scanpy as sc
 from typing import Iterable, Any
 import matplotlib.pyplot as plt
 import seaborn as sns
+from collections import defaultdict
 
-from src.statics import OBS_KEYS
+from src.statics import OBS_KEYS, DATA_SHEET_KEYS
 from src.preprocess import get_adata_meta
 
 
@@ -62,6 +63,64 @@ def collect_meta_from_files(input_files: list[str]) -> tuple[pd.DataFrame, dict[
             adata.file.close()
     meta = pd.concat(meta, axis=0)
     return meta, vars
+
+def build_perturbation_pool(
+    obs: pd.DataFrame,
+    min_datasets: int = None,
+    min_dataset_frac: float = 0.4,
+    min_cells_per_group: int = 30,
+    adata=None,
+    dataset_col: str = 'dataset',
+    perturbation_col: str = 'perturbation',
+):
+    """
+    Build perturbation pool based on how many datasets each perturbation
+    appears in, with optional cell count filtering.
+    """
+    # Calculate perturbation sets per dataset
+    cppd = obs.groupby(dataset_col)[perturbation_col].unique()
+    sets = {i: set(ps) for i, ps in cppd.items()}
+    all_datasets = list(sets.keys())
+    if min_datasets is None:
+        min_datasets = max(3, int(len(all_datasets) * min_dataset_frac))
+    
+    # Count datasets per perturbation
+    pert_counts = defaultdict(set)
+    for ds_name, ds_perts in sets.items():
+        for p in ds_perts:
+            pert_counts[p].add(ds_name)
+    
+    # Filter by minimum dataset presence
+    pool = {p for p, ds_set in pert_counts.items() if len(ds_set) >= min_datasets}
+    
+    # Optional: filter by minimum cells per group
+    if adata is not None:
+        pool_filtered = set()
+        for p in pool:
+            mask = adata.obs[perturbation_col] == p
+            ds_counts = adata[mask].obs[dataset_col].value_counts()
+            # Keep if enough cells in enough datasets
+            n_valid_ds = (ds_counts >= min_cells_per_group).sum()
+            if n_valid_ds >= min_datasets:
+                pool_filtered.add(p)
+        pool = pool_filtered
+    
+    # Report per-dataset coverage
+    logging.info(f"\nPool: {len(pool)} perturbations (min {min_datasets} datasets)")
+    logging.info("-" * 60)
+    for ds_name in sorted(sets.keys()):
+        overlap = sets[ds_name] & pool
+        logging.info(f"{ds_name:<40} {len(overlap):>4}/{len(pool)} "
+              f"({len(overlap)/len(pool)*100:>5.1f}%)")
+    
+    # Flag datasets with low coverage
+    low_coverage = [ds for ds in sets if len(sets[ds] & pool) / len(pool) < 0.1]
+    if low_coverage:
+        logging.info(f"\nWarning: these datasets cover <10% of pool:")
+        for ds in low_coverage:
+            logging.info(f"  {ds}: consider excluding from contrastive losses")
+    
+    return pool
 
 def _plot_cpp(meta: pd.DataFrame, plt_dir: str | None = None, by: str = 'dataset', remove_ctrl: bool = True):
     # check number of cells/perturbation
@@ -308,12 +367,14 @@ def create_meta_summary(
         feature_pool_file: str,
         dataset_sheet: pd.DataFrame,
         min_cells_per_class: int = 50,
+        min_dataset_frac: float = 0.4,
         plt_dir: str | None = None,
         plot: bool = True,
     ):
     # Collect meta data for all available datasets
     obs, vars_dict = collect_meta_from_files(input_files)
-    
+    # Group dataset conditions
+    dataset_sheet[OBS_KEYS.BROAD_DATASET_KEY] = dataset_sheet[DATA_SHEET_KEYS.P_INDEX] + '_' + dataset_sheet[DATA_SHEET_KEYS.D_INDEX].str.split('_').str[-1]
     # Add dataset meta information to observations
     obs = obs.merge(dataset_sheet, left_on=OBS_KEYS.DATASET_KEY, right_index=True, how='left')
     # Filter obs by minimum number of cells per perturbation within a context
@@ -333,7 +394,7 @@ def create_meta_summary(
     perturbation_union.to_csv(union_file)
 
     # Calculate optimal perturbation pool
-    perturbation_pool = _calc_pool_datasets(obs)
+    perturbation_pool = build_perturbation_pool(obs, dataset_col=OBS_KEYS.BROAD_DATASET_KEY, min_dataset_frac=min_dataset_frac)
     # Save pool to output file
     pp = pd.DataFrame(perturbation_pool, columns=[OBS_KEYS.POOL_PERTURBATION_KEY])
     pp.to_csv(perturbation_pool_file)

@@ -14,6 +14,7 @@ if __name__ == "__main__":
             dataset_sheet=snakemake.params.dataset_sheet,
             feature_pool_file=snakemake.output.feature_pool_file,
             min_cells_per_class=snakemake.params.min_cells_per_class,
+            min_dataset_frac=snakemake.params.min_dataset_frac,
             plt_dir=snakemake.params.plt_dir,
         )
     except NameError:

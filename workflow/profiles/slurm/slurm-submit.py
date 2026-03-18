@@ -44,7 +44,9 @@ RESOURCE_MAPPING = {
     "nodes": ("nodes", "nnodes"),
     "partition": ("partition", "queue"),
     "cpus-per-task": ("threads", "cpus-per-task", "cpus_per_task"),
-    "gres": ("gres", "gpu")
+    "gres": ("gres", "gpu"),
+    "output": ("output", "out", "log", "error"),
+    "error": ("output", "out", "log", "error")
 }
 
 # parse job

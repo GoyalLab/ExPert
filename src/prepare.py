@@ -11,48 +11,31 @@ from typing import Iterable
 
 
 def _filter(d: ad.AnnData, dataset_name: str, hvg_pool: Iterable[str], zero_pad: bool = True):
-    # extract .X, obs and var from dataset and delete input
-    X, obs, var = d.X, d.obs, d.var
-    # ensure .X is in csc format
-    if isinstance(X, sp.csr_matrix):
-        logging.debug('Changing matrix format to CSC')
-        X = X.tocsc()
-    # Filter for pool of genes in dataset
-    hvg_pool_set = set(hvg_pool)
-    matching_hvgs = var.index.intersection(hvg_pool_set)
-    logging.info(f'Found {len(matching_hvgs)} pool genes in {dataset_name}')
+    hvg_pool = list(hvg_pool)
+    matching = d.var.index.intersection(hvg_pool)
+    logging.info(f'Found {len(matching)} pool genes in {dataset_name}')
     
-    # Subset dataset for matching genes and convert to dask array
-    X = da.from_array(X[:, var.index.isin(matching_hvgs)])
-    
-    # Determine pool genes that are missing from this dataset
-    missing_hvgs = hvg_pool_set - set(matching_hvgs)
-    # Add missing genes to dataset
-    if zero_pad and missing_hvgs:
-        logging.info(f'{len(missing_hvgs)} hvgs missing from pool; padding with zero values')
-        # Construct 0-pad
-        zero_matrix = da.from_array(sp.csc_matrix((obs.shape[0], len(missing_hvgs)), dtype=np.float32))
-
-        logging.debug(f'Adding 0-pad ({obs.shape[0]}, {len(missing_hvgs)})')
-        # Combine existing data with zero matrix
-        X = da.hstack([X, zero_matrix])
+    if zero_pad:
+        missing = set(hvg_pool) - set(matching)
+        if missing:
+            logging.info(f'{len(missing)} hvgs missing; padding with zeros')
         
-        # Update d.var with padded genes
-        var = pd.DataFrame(index=pd.Index(list(matching_hvgs) + list(missing_hvgs)))
+        # Subset to matching, then add empty columns and reorder
+        d_sub = d[:, matching].copy()
+        
+        # Add zero columns for missing genes
+        if missing:
+            zero_block = sp.csr_matrix((d.shape[0], len(missing)), dtype=np.float32)
+            missing_var = pd.DataFrame(index=pd.Index(list(missing)))
+            d_zero = ad.AnnData(X=zero_block, obs=d_sub.obs, var=missing_var)
+            d_sub = ad.concat([d_sub, d_zero], axis=1, merge='first')
+        
+        # Reorder to pool order
+        d_sub = d_sub[:, hvg_pool]
+        return d_sub
     else:
-        logging.info(f'{len(missing_hvgs)} hvgs lost from pool')
-        var = pd.DataFrame(index=list(matching_hvgs))
-    
-    # order the AnnData.X based on the pool index
-    logging.debug('Ordering AnnData based on pool order')
-    sorted_by_pool_idx = var.index.get_indexer(hvg_pool)
-    # reorder based on chunks
-    dask_order = da.from_array(sorted_by_pool_idx, chunks=X.chunks[1])
-    X = X[:, dask_order]
-    var = var.iloc[sorted_by_pool_idx]
-    # Create updated AnnData
-    return ad.AnnData(X=X, obs=obs, var=var)
-
+        pool_in_data = [g for g in hvg_pool if g in set(d.var.index)]
+        return d[:, pool_in_data].copy()
 
 def prepare_merge(input_pth: str, pool_genes: Iterable[str], out: str, zero_pad: bool = True, **kwargs):
     if input_pth.endswith('.h5ad'):
@@ -67,7 +50,7 @@ def prepare_merge(input_pth: str, pool_genes: Iterable[str], out: str, zero_pad:
         # Convert adata.X to csr
         if not isinstance(adata.X, sp.csr_matrix):
             logging.info('Converting to CSR matrix.')
-            adata.X = sp.csr_matrix(adata.X.compute())
+            adata.X = sp.csr_matrix(adata.X)
         # Filter for a minimum number of cells per perturbation
         mcpp = kwargs.get('min_cells_per_perturbation', 0)
         if mcpp > 0:

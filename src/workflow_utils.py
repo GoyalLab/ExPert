@@ -92,7 +92,7 @@ def estimate_resources(file_p: str, resource_config: dict, factor: int = 2, job_
         'partition': partition
     }
 
-def get_job_resources(resource_config: dict, job_name: str, partition_prio: str | None = None) -> dict[str, str]:
+def get_job_resources(resource_config: dict, job_name: str, partition_prio: str | None = None, **kwargs) -> dict[str, str]:
     # Check if there are resource specification for that job name
     if job_name not in resource_config['jobs']:
         logging.warning(f'Could not find resource config for job {job_name}, falling back to defaults.')
@@ -123,6 +123,8 @@ def get_job_resources(resource_config: dict, job_name: str, partition_prio: str 
     # Add any extra options to resources
     ext_kwargs = {k: v for k, v in resource_config['jobs'][job_name].items() if k not in o.keys()}
     o.update(ext_kwargs)
+    # Add manual extra options to resources
+    o.update(kwargs)
     return o
 
 

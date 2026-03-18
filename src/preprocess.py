@@ -1,3 +1,4 @@
+import gc
 import os
 from scipy.stats import median_abs_deviation
 import scanpy as sc
@@ -210,41 +211,59 @@ def filter_min_number_of_cells_per_class(
     adata._inplace_subset_obs(mask)
 
 # inspired by https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html
-def quality_control_filter(
-        adata: ad.AnnData,                  # input anndata object
-        percent_threshold: int = 50,        # top x percent of counts to base calculations an
-        nmads: int = 5,                     # Number of median absolute deviations
-        mt_nmads: int = 3,                  # Number of median absolute deviations for mitochondrial counts
-        mt_per: int = 20                    # Maximum percent of mitochondrial counts in cell (is higher for cancer cells)
-    ) -> None:
-    # ensure unique variable names
-    adata.var_names_make_unique()
-    # mitochondrial genes
-    adata.var['mt'] = adata.var_names.str.startswith('MT-')
-    # ribosomal genes
-    adata.var['ribo'] = adata.var_names.str.startswith(('RPS', 'RPL'))
-    # hemoglobin genes
-    adata.var['hb'] = adata.var_names.str.contains('^HB[^(P)]')
-    # calculate qc metrics
+def _compute_qc_mask(
+        adata: ad.AnnData,
+        percent_threshold: int = 50,
+        nmads: int = 5,
+        mt_nmads: int = 3,
+        mt_per: int = 20,
+    ) -> np.ndarray:
+    """
+    Compute QC keep-mask without modifying adata.  Works on backed *or*
+    in-memory AnnData — scanpy's calculate_qc_metrics reads backed h5ad
+    files via HDF5 without loading the full matrix into RAM.
+
+    When var_names look like Ensembl IDs, MT/ribo/hb genes are detected
+    through the gene-symbol column in adata.var instead.
+    """
+    # Prefer gene symbols over Ensembl IDs for MT/ribo/hb detection
+    vn = adata.var_names.to_series()
+    if vn.str.lower().str.startswith('ens').mean() > 0.9:
+        gscl = adata.var.columns.intersection(set(GENE_SYMBOL_KEYS)).values
+        if len(gscl) > 0:
+            vn = adata.var[gscl[0]].astype(str)
+    adata.var['mt']   = vn.str.startswith('MT-').values
+    adata.var['ribo'] = vn.str.startswith(('RPS', 'RPL')).values
+    adata.var['hb']   = vn.str.contains('^HB[^(P)]').values
     sc.pp.calculate_qc_metrics(
         adata, qc_vars=['mt', 'ribo', 'hb'],
-        inplace=True, percent_top=[percent_threshold],
-        log1p=True
+        inplace=True, percent_top=[percent_threshold], log1p=True,
     )
-    # determine outliers
-    adata.obs['outlier'] = (
-            is_outlier(adata, 'log1p_total_counts', nmads)
-            | is_outlier(adata, 'log1p_n_genes_by_counts', nmads)
-            | is_outlier(adata, f'pct_counts_in_top_{percent_threshold}_genes', nmads)
+    outlier = (
+        is_outlier(adata, 'log1p_total_counts', nmads)
+        | is_outlier(adata, 'log1p_n_genes_by_counts', nmads)
+        | is_outlier(adata, f'pct_counts_in_top_{percent_threshold}_genes', nmads)
     )
-    # determine mitochondrial outliers
-    # calculate 
-    adata.obs['mt_outlier'] = is_outlier(adata, 'pct_counts_mt', mt_nmads) | (
-            adata.obs['pct_counts_mt'] > mt_per
+    mt_outlier = (
+        is_outlier(adata, 'pct_counts_mt', mt_nmads)
+        | (adata.obs['pct_counts_mt'] > mt_per)
     )
-    # remove outliers
+    keep = (~outlier) & (~mt_outlier)
+    logging.info(f'QC: keeping {keep.sum()}/{len(keep)} cells')
+    return keep.values
+
+
+def quality_control_filter(
+        adata: ad.AnnData,
+        percent_threshold: int = 50,
+        nmads: int = 5,
+        mt_nmads: int = 3,
+        mt_per: int = 20,
+    ) -> None:
+    keep = _compute_qc_mask(adata, percent_threshold=percent_threshold,
+                             nmads=nmads, mt_nmads=mt_nmads, mt_per=mt_per)
     logging.info(f'Total number of cells: {adata.n_obs}')
-    adata._inplace_subset_obs((~adata.obs.outlier) & (~adata.obs.mt_outlier))
+    adata._inplace_subset_obs(keep)
     logging.info(f'Number of cells after filtering for low quality cells: {adata.n_obs}')
 
 def subset_ctrl_cells(
@@ -285,13 +304,13 @@ def single_perturbation_mask(meta: pd.DataFrame, p_col: str = 'perturbation'):
     )
     return mask
 
-def clean_perturbation_labels(p: pd.Series, keep_versions: bool = False) -> pd.Categorical:
+def clean_perturbation_labels(p: pd.Series, keep_versions: bool = False) -> pd.Series:
     # Remove guide prefixes
     clean_p = p.str.replace(r'^ES.sg\d*.', '', regex=True)
     # Remove versions
     if not keep_versions:
         clean_p = clean_p.str.split('_').str[0]
-    return pd.Categorical(clean_p.values)
+    return pd.Series(clean_p.values)
 
 def ens_to_symbol(adata: ad.AnnData) -> ad.AnnData:
     # Look for possible gene symbol columns
@@ -303,8 +322,8 @@ def ens_to_symbol(adata: ad.AnnData) -> ad.AnnData:
     # Convert index
     adata.var.reset_index(names='ensembl_id', inplace=True)
     adata.var.set_index(gsh, inplace=True)
-    # Check for duplicate index conflicts
-    if adata.var_names.nunique() != adata.shape[0]:
+    # Check for duplicate gene symbols after conversion
+    if adata.var_names.nunique() != adata.n_vars:
         logging.info(f'Found duplicate indices for ensembl to symbol mapping, highest number of conflicts: {adata.var_names.value_counts().max()}')
         # Fix conflicts by choosing the gene with the higher harmonic mean of mean expression and normalized variance out of pool
         if len(set(['means', 'variances_norm']).intersection(adata.var.columns)) == 2:
@@ -312,6 +331,7 @@ def ens_to_symbol(adata: ad.AnnData) -> ad.AnnData:
         else:
             adata.var['hm_var'] = np.arange(adata.n_vars)
         idx = adata.var.reset_index().groupby(gsh, observed=True).hm_var.idxmax().values
+        # Subset adata
         adata = adata[:,idx]
     return adata
 
@@ -424,60 +444,168 @@ def read_subset(
     perturbation_pool_file: str | None = None,
     use_perturbation_pool: bool = True,
     n_ctrl: int = 10_000,
+    min_cells_per_perturbation: int = 50,
     ensure_csr: bool = True,
+    feature_pool_file: str | None = None,
+    use_feature_pool: bool = False,
+    remove_invalid_labels: bool = False,
+    single_perturbations_only: bool = False,
+    keep_versions: bool = False,
+    qc: bool = False,
+    cancer: bool = False,
+    seed: int = 42,
 ) -> ad.AnnData:
-    # Load adata in backed mode (meta-data only)
+    """
+    Load a minimal subset of an h5ad into memory using a single backed read.
+
+    All cell-level filters (perturbation pool, control sampling, label
+    cleaning, QC) are evaluated while the file is still backed so that
+    ``to_memory()`` loads only the final set of cells × genes.  This avoids
+    the repeated in-memory copies that ``_inplace_subset_obs`` causes on
+    large datasets.
+    """
+    
     try:
         adata = sc.read(adata_p, backed='r')
-        logging.info(f'Preprocessing dataset with shape: {adata.shape} (cells x genes)')
-        # Find correct perturbation key
+        logging.info(f'Dataset shape: {adata.shape} (cells x genes)')
+
+        # --- Identify perturbation column ---
         p_idx = _find_match_idx(adata.obs.columns, P_COLS)
         p_key = adata.obs.columns[p_idx]
-        # Subset adata to target perturbations
-        if use_perturbation_pool:
+
+        # --- Clean labels once (obs only, no X) ---
+        labels = clean_perturbation_labels(adata.obs[p_key], keep_versions=keep_versions)
+
+        # --- Perturbation pool filter (obs only) ---
+        if use_perturbation_pool and perturbation_pool_file is not None:
             gene_targets = pd.read_csv(perturbation_pool_file, index_col=0)[OBS_KEYS.POOL_PERTURBATION_KEY]
             gene_targets = gene_targets[~gene_targets.isin(CTRL_KEYS)]
-            mask = adata.obs[p_key].isin(gene_targets)
-        # Or keep all cells
+            mask = labels.isin(gene_targets)
+            logging.info(f'Subsetting to perturbation pool, found {len(labels[mask].unique())}/{len(labels.unique())} of total perturbations in dataset.')
         else:
-            mask = np.ones(adata.n_obs).astype(bool)
-        # Randomly sample n control cells or use all available cells
+            mask = np.ones(adata.n_obs, dtype=bool)
+
+        # --- Control sampling (obs only) ---
         sample_control = n_ctrl is not None and n_ctrl > 0
-        ctrl_mask = adata.obs[p_key].str.lower().isin(CTRL_KEYS)
+        ctrl_mask = labels.str.lower().isin(CTRL_KEYS)
         if ctrl_mask.sum() == 0:
             raise ValueError(f'No matching control key found in adata.obs["{p_key}"], looked for "{CTRL_KEYS}"')
         if sample_control:
-            # Add all control cells if there are less than given
             if n_ctrl > ctrl_mask.sum():
                 logging.info(f'Adding all {ctrl_mask.sum()} control cells')
                 mask |= ctrl_mask
-            # Sample N control cells
             else:
                 logging.info(f'Sampling {n_ctrl} control cells from {ctrl_mask.sum()}')
                 ctrl_indices = np.where(ctrl_mask)[0]
-                sampled_ctrl = np.random.choice(ctrl_indices, size=n_ctrl, replace=False)
+                sampled = np.random.choice(ctrl_indices, size=n_ctrl, replace=False)
                 sampled_mask = np.zeros(adata.n_obs, dtype=bool)
-                sampled_mask[sampled_ctrl] = True
+                sampled_mask[sampled] = True
                 mask |= sampled_mask
-        # Subset adata view
-        subset = adata[mask]
-        # Load only subset into memory
-        logging.info(f'Loading {mask.sum()} selected cells')
-        subset = subset.to_memory()
+
+        # --- Optional obs-only filters (no X access) ---
+        if remove_invalid_labels:
+            logging.info(f'Removing invalid labels.')
+            invalid = labels.isna() | labels.isin(MISC_LABELS_KEYS)
+            mask &= ~invalid.values
+
+        if single_perturbations_only:
+            logging.info(f'Filtering for single perturbations.')
+            sp_mask = single_perturbation_mask(labels.rename(p_key).to_frame(), p_col=p_key)
+            if sp_mask is not None:
+                mask &= np.asarray(sp_mask)
+
+        # --- QC filter ---
+        # calculate_qc_metrics doesn't support backed HDF5 Dataset objects,
+        # so load the candidate cells temporarily, compute the mask, then free.
+        # The two loads are sequential so peak RAM is always 1x, never 2x.
+        if qc:
+            logging.info(f'Applying QC on {mask.sum()} candidate cells.')
+            mt_per = SETTINGS.MT_PERCENT_CANCER if cancer else SETTINGS.MT_PERCENT_NORMAL
+            # Load masked adata 
+            candidate_positions = np.sort(np.where(mask)[0])
+            qc_adata = adata[candidate_positions].to_memory()
+            qc_keep = _compute_qc_mask(qc_adata, mt_per=mt_per)
+            # Delete loaded adata out of memory
+            del qc_adata
+            gc.collect()
+            # Map back to full indices
+            full_qc_mask = np.zeros(adata.n_obs, dtype=bool)
+            full_qc_mask[candidate_positions[qc_keep]] = True
+            mask = full_qc_mask
+        # Filter perturbations for minimum amount of cells (after qc).
+        # Use `labels` (already cleaned) and boolean indexing — p_col doesn't
+        # exist on the backed adata yet, it's only added post-load.
+        if min_cells_per_perturbation is not None:
+            logging.info(f'Filtering perturbations for a minimum of {min_cells_per_perturbation} cells.')
+            cpp = labels[mask].value_counts()
+            valid_perturbations = cpp[cpp >= min_cells_per_perturbation].index
+            mask &= labels.isin(valid_perturbations).values
+
+        logging.info(f'Backed filters: {mask.sum()} / {adata.n_obs} cells retained')
+
+        # --- Var (gene) filter (obs metadata only) ---
+        # Also detect ensembl IDs here so we can reuse gsh post-load for a
+        # zero-copy index rename instead of calling ens_to_symbol on loaded data.
+        var_mask = None
+        gsh = None  # gene-symbol column name; set when var_names are ensembl IDs
+        if adata.var_names.str.lower().str.startswith('ens').mean() > 0.9:
+            gscl = adata.var.columns.intersection(set(GENE_SYMBOL_KEYS)).values
+            if len(gscl) > 0:
+                gsh = gscl[0]
+                symbols = adata.var[gsh].astype(str)
+                if {'means', 'variances_norm'}.issubset(adata.var.columns):
+                    hm = (2 * adata.var['means'] * adata.var['variances_norm']) / (
+                        adata.var['means'] + adata.var['variances_norm'] + 1e-9)
+                else:
+                    hm = pd.Series(np.arange(adata.n_vars), index=adata.var.index)
+                keep_pos = (symbols.to_frame()
+                            .assign(_hm=hm.values)
+                            .reset_index()
+                            .groupby(gsh, observed=True)['_hm']
+                            .idxmax().values)
+                var_mask = np.zeros(adata.n_vars, dtype=bool)
+                var_mask[keep_pos] = True
+                logging.info(f'Ensembl dedup: {var_mask.sum()} / {adata.n_vars} genes retained')
+        # Optional futher filtering using pre-calculated feature pools
+        if use_feature_pool and feature_pool_file is not None:
+            feature_pool = pd.read_csv(feature_pool_file, index_col=0)[OBS_KEYS.POOL_FEATURE_KEY]
+            if gsh is not None:
+                fp_mask = adata.var[gsh].isin(feature_pool)
+            else:
+                fp_mask = adata.var_names.isin(feature_pool)
+            var_mask = fp_mask if var_mask is None else (var_mask & fp_mask)
+            logging.info(f'Feature pool filter: {var_mask.sum()} / {adata.n_vars} genes retained')
+        
+        # --- Single to_memory() with the fully-combined mask ---
+        # Sort mask indices for faster slicing
+        mask = np.sort(np.where(mask)[0])
+        # Slice view
+        view = adata[mask, var_mask] if (var_mask is not None and var_mask.sum() > 0) else adata[mask]
+        logging.info(f'Loading {view.shape[0]} cells x {view.shape[1]} genes into memory')
+        subset = view.to_memory()
+
     except Exception as e:
         raise e
     finally:
+        # Close file connection
+        logging.info(f'Closing file connection.')
         adata.file.close()
-    # Rename perturbation column
-    subset.obs[p_col] = subset.obs[p_key].values
-    # Rename control column
+
+    # Post-load fixups
+    subset.obs[p_col] = labels[mask].values
     if sample_control:
-        ctrl_mask = subset.obs[p_col].str.lower().isin(CTRL_KEYS)
-        if ctrl_mask.sum() > 0:
+        ctrl_mask_post = subset.obs[p_col].str.lower().isin(CTRL_KEYS)
+        if ctrl_mask_post.sum() > 0:
             ps = np.array(subset.obs[p_col], dtype=str)
-            ps[ctrl_mask] = ctrl_key
+            ps[ctrl_mask_post] = ctrl_key
             subset.obs[p_col] = pd.Categorical(ps)
-    # Ensure subset.X is in csr format
+
+    # Rename ensembl IDs --> gene symbols using the column we already found
+    if gsh is not None:
+        logging.info(f'Renaming var index from ensembl IDs to gene symbols via "{gsh}"')
+        subset.var.reset_index(names='ensembl_id', inplace=True)
+        subset.var.set_index(gsh, inplace=True)
+
     if ensure_csr and not isinstance(subset.X, sp.csr_matrix):
         logging.info('Converting adata.X to CSR matrix.')
         subset.X = sp.csr_matrix(subset.X)
@@ -498,58 +626,56 @@ def preprocess_dataset(
         n_hvg: int = 3000, 
         subset: bool = False, 
         n_ctrl: int | None = 10_000,
-        single_perturbations_only: bool = True,
-        use_perturbation_pool: bool = False,
-        use_feature_pool: bool = True,
-        z_score_filter: bool = False,
-        control_neighbor_threshold: float = 0.1,
         min_cells_per_perturbation: int | None = 50,
+        single_perturbations_only: bool = True,
+        use_perturbation_pool: bool = True,
+        use_feature_pool: bool = False,
+        z_score_filter: bool = False,
+        control_neighbor_threshold: float = 0.0,
         p_col: str = OBS_KEYS.PERTURBATION_KEY,
         ctrl_key: str = OBS_KEYS.CTRL_KEY,
         min_genes: int = 5_000,
         keep_versions: bool = False,
-        seed: int = 42,
         remove_invalid_labels: bool = True,
+        **kwargs
     ) -> ad.AnnData:
+    # All cell-level filters (labels, single-pert, QC) and the gene filter are
+    # pushed into read_subset so they run in backed mode.  to_memory() is called
+    # exactly once on the minimal (cells × genes) slice — no in-memory copies.
     logging.info(f'Reading: {dataset_file}')
     adata = read_subset(
-        adata_p=dataset_file, 
-        p_col=p_col, 
-        ctrl_key=ctrl_key, 
-        perturbation_pool_file=perturbation_pool_file, 
-        use_perturbation_pool=use_perturbation_pool, 
-        n_ctrl=n_ctrl
+        adata_p=dataset_file,
+        p_col=p_col,
+        ctrl_key=ctrl_key,
+        perturbation_pool_file=perturbation_pool_file,
+        use_perturbation_pool=use_perturbation_pool,
+        n_ctrl=n_ctrl,
+        min_cells_per_perturbation=min_cells_per_perturbation,
+        feature_pool_file=feature_pool_file if use_feature_pool else None,
+        use_feature_pool=use_feature_pool,
+        remove_invalid_labels=remove_invalid_labels,
+        single_perturbations_only=single_perturbations_only,
+        keep_versions=keep_versions,
+        qc=qc,
+        cancer=cancer,
     )
-    # Clean up perturbation label
-    adata.obs[p_col] = clean_perturbation_labels(adata.obs[p_col], keep_versions=keep_versions)
-    # Remove unknown or NaN labels
-    if remove_invalid_labels:
-        _remove_invalid_labels(adata, p_col=p_col)
-    # Filter for single perturbations only
-    if single_perturbations_only:
-        logging.info(f'Filtering column "{p_col}" for single perturbations only')
-        sp_mask = single_perturbation_mask(adata.obs, p_col=p_col)
-        if sp_mask is not None:
-            adata._inplace_subset_obs(sp_mask)
-    # apply quality control measures
-    if qc:
-        logging.info(f'Quality control for dataset {name}')
-        mt_percent = SETTINGS.MT_PERCENT_CANCER if cancer else SETTINGS.MT_PERCENT_NORMAL           # set threshold higher for cancer
-        logging.info(f'Cancer: {cancer}, mt_per: {mt_percent}')
-        quality_control_filter(adata, mt_per=mt_percent)
     if hvg:
-        # Calculate highly variable genes
+        # Calculate highly variable genes on raw counts (seurat_v3 requires this).
         if adata.n_vars <= min_genes:
             logging.info(f'Selecting all genes for dataset "{name}", because of low gene number: {adata.n_vars}')
             adata.var['highly_variable'] = True
         else:
             logging.info(f'Determining highly variable genes for dataset "{name}"')
-            # Use seurat_v3 for raw counts
             logging.info(f'Using flavor "seurat_v3" when determining hvgs for raw counts')
             sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=subset, flavor='seurat_v3')
     else:
-        # set all genes to highly variable for downstream selection
         adata.var['highly_variable'] = True
+
+    logging.info(f'Found {np.sum(adata.var.highly_variable)} highly variable genes out of {adata.n_vars} total genes')
+
+    # Release memory from filtered-out genes before the expensive dense ops below
+    gc.collect()
+
     # normalize data
     if norm:
         logging.info(f'Normalizing dataset "{name}"')
@@ -562,15 +688,6 @@ def preprocess_dataset(
     if scale:
         logging.info(f'Scaling and centering "{name}"')
         sc.pp.scale(adata)
-    logging.info(f'Found {np.sum(adata.var.highly_variable)} highly variable genes out of {adata.n_vars} total genes')
-    # check if .var indices are gene symbols or ensembl ids
-    if adata.var_names.str.lower().str.startswith('ens').sum() / adata.n_vars > 0.9:
-        logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
-        adata = ens_to_symbol(adata).copy()
-    # Filter for feature pool if option is given
-    if use_feature_pool:
-        logging.info(f'Using feature pool to filtering for shared features.')
-        _filter_feature_pool(adata, feature_pool_file=feature_pool_file)
     # Remove outliers of perturbation classes that are too close to control cells
     if control_neighbor_threshold > 0:
         logging.info(f'Filtering cells based on minimum amount of class neighbors.')
@@ -581,11 +698,9 @@ def preprocess_dataset(
     if z_score_filter:
         logging.info(f'Filtering cells based on control z-score.')
         filter_by_distance_to_control(adata, condition_col=p_col, ctrl_key=ctrl_key, normalize=not norm)
-    # Filter perturbations based on minimum number of support
-    if min_cells_per_perturbation is not None and min_cells_per_perturbation > 0:
-        logging.info(f'Filtering for at least {min_cells_per_perturbation} cells per perturbation.')
-        filter_min_number_of_cells_per_class(adata, condition_col=p_col, min_cells=min_cells_per_perturbation)
     logging.info(f'Pre-processed adata shape: {adata.shape}')
+    logging.info(f'\t -> # perturbations: {adata.obs[p_col].nunique()}')
+    logging.info(f'\t -> # cpp (median): {adata.obs[p_col].value_counts().median()}')
     return adata
 
 # Per-dataset adaptive threshold
@@ -768,6 +883,7 @@ def sample_merged_dataset(
             context_col=context_col,
             cells_per_perturbation=cells_per_perturbation,
             min_contexts=min_contexts,
+            efficiency_col=efficiency_col,
             **kwargs
         )
     else:
@@ -886,7 +1002,7 @@ def sample_dataset_idx(
     return sampled_indices
 
 def sample_max_dataset_idx(
-    obs: pd.DataFrame,
+    src_obs: pd.DataFrame,
     perturbation_col: str = "perturbation",
     context_col: str = "dataset",
     cells_per_perturbation: int = 10,
@@ -897,6 +1013,8 @@ def sample_max_dataset_idx(
     ignore_key: str = "control",
     efficiency_col: str | None = None,
     min_eff: float = 0.0,
+    norm_by_context_support: bool = True,
+    sample_by_eff: bool = False,
 ):
     """
     Light subsampling: keep all data except extreme outlier groups.
@@ -907,29 +1025,36 @@ def sample_max_dataset_idx(
     # ----------------------------
     # Filtering
     # ----------------------------
-    mask = np.ones(len(obs), dtype=bool)
+    mask = np.ones(len(src_obs), dtype=bool)
     if ignore_key is not None:
-        mask &= obs[perturbation_col] != ignore_key
+        mask &= src_obs[perturbation_col] != ignore_key
+    # Filter for minimum efficiency cells
+    use_eff = efficiency_col is not None and efficiency_col in src_obs.columns
+    # Subset to valid cells
+    obs = src_obs[mask].copy()
     
-    use_eff = efficiency_col is not None and efficiency_col in obs.columns
-    if use_eff:
-        obs = obs.copy()
-        obs[efficiency_col] = obs[efficiency_col].abs()
-        mask &= obs[efficiency_col] > min_eff
-
-    obs = obs[mask]
+    # Calculate overall context support
+    if norm_by_context_support:
+        cpds = obs[context_col].value_counts()
+        ctx_weights = cpds.mean() / cpds
 
     # ----------------------------
     # Group stats
     # ----------------------------
+    # Determine group sizes
     group_sizes = obs.groupby([perturbation_col, context_col]).size()
+    # Filter each group by mean efficiency over 0
+    if use_eff:
+        obs[efficiency_col] = obs[efficiency_col].abs()
+        mean_eff_per_group = obs.groupby([perturbation_col, context_col])[efficiency_col].mean()
+        valid_mean_eff_groups = mean_eff_per_group[mean_eff_per_group > min_eff].index
+        group_sizes = group_sizes[valid_mean_eff_groups]
     # Filter: each group must have minimum cells
     valid_groups = group_sizes[group_sizes >= cells_per_perturbation]
     # Filter valid groups for minimum amount of contexts per perturbation
     ctxpp = valid_groups.reset_index().groupby(perturbation_col)[context_col].nunique()
-    valid_perturbations = ctxpp[ctxpp >= min_contexts].index
+    valid_perturbations = ctxpp[ctxpp >= min_contexts].index.values
     valid_group_idx = valid_groups[valid_perturbations].index
-    valid_group_idx = pd.Series(valid_group_idx.values).str.join('_').values
 
     # Compute cap from quantile of valid group sizes
     cap = int(valid_groups.quantile(cap_quantile))
@@ -943,22 +1068,29 @@ def sample_max_dataset_idx(
 
     for (pert, ctx), group_df in obs.groupby([perturbation_col, context_col]):
         # Skip if perturbation doesn't meet filters
-        idx_key = str(pert) + '_' + str(ctx)
-        if idx_key not in valid_group_idx:
+        if (pert, ctx) not in valid_group_idx:
             continue
-        
+        # Get index pool for group
         idx = group_df.index.tolist()
+        # Get context specific cap
+        if norm_by_context_support:
+            ctx_cap = int(cap * ctx_weights[ctx])
+        # Use overall cap
+        else:
+            ctx_cap = cap
         
         # Only subsample if above cap
-        if len(idx) > cap:
-            if use_eff:
-                idx = group_df.nlargest(cap, efficiency_col).index.tolist()
+        if len(idx) > ctx_cap:
+            if use_eff and sample_by_eff:
+                idx = group_df.nlargest(ctx_cap, efficiency_col).index.tolist()
             else:
-                idx = rng.choice(idx, size=cap, replace=False).tolist()
+                idx = rng.choice(idx, size=ctx_cap, replace=False).tolist()
         
         sampled_indices.extend(idx)
-
-    sampled_indices = np.sort(np.array(sampled_indices))
+    # Collect all sampled indices
+    sampled_indices = np.array(sampled_indices)
+    # Sort indices for faster indexing of backed adata objects
+    sampled_indices = np.sort(sampled_indices)
     
     # Log stats
     n_total = len(obs)

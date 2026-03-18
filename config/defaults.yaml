@@ -21,11 +21,13 @@ n_ctrl: 10000                               # Maximum number of control cells, r
 single_perturbations_only: true             # Exclude multiple perturbations from dataset
 z_score_filter: false                        # Filter cells based on euclidian distance to mean control expression in dataset
 control_neighbor_threshold: 0.0               # Filter cells based on percentage of neighbors that are from the same class, set to 0.0 to ignore
-min_cells_per_perturbation: 10                # Filter perturbations for a minimum number of cells WITHIN a dataset
+min_cells_per_perturbation: 50                # Filter perturbations for a minimum number of cells WITHIN a dataset
 min_cells_per_class: 50                    # Minimum number of cells per class (perturbation) ACROSS datasets
+min_dataset_frac: 0.6                       # Fraction of datasets a perturbation has to be shared across to be included in the pool
 
-## Mixscale filter:
-mixscale_filter: true                       # Filter cells by knockdown efficiency (based on mixscale: https://www.biorxiv.org/content/10.1101/2024.01.29.576933v2)
+## Efficiency filter:
+efficiency_filter: true                     # Custom python implementation of mixscale (much faster)
+mixscale_filter: false                       # Filter cells by knockdown efficiency (based on mixscale: https://www.biorxiv.org/content/10.1101/2024.01.29.576933v2)
 min_deg: 5                                  # Minimum amount of differentially expressed genes compared to control cells for each perturbation to pass filtering
 ctrl_dev: 0.0                               # Minimum standart deviation of perturbed cells mixscale score to control
 
@@ -81,6 +83,9 @@ resources:
     setup_mixscale:
       time: '4:00:00'
       mem: '20GB'
+
+    mixscale:
+      time: '48:00:00'
 
     filter_cells_by_efficiency:
       time: '48:00:00'

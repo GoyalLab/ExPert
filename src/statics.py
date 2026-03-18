@@ -17,6 +17,7 @@ class _DATA_SHEET_NT(NamedTuple):
 
 class _OBS_KEYS_NT(NamedTuple):
     DATASET_KEY: str = 'dataset'
+    BROAD_DATASET_KEY: str = 'ds_label'
     PERTURBATION_TYPE_KEY: str = 'perturbation_type'
     CELL_TYPE_KEY: str = 'celltype_broad'
     PERTURBATION_KEY: str = 'perturbation'
