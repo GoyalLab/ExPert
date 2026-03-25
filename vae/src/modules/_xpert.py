@@ -4,6 +4,7 @@ from src.modules._base import (
     Encoder, 
     GeneEmbeddingEncoder,
     SplitEncoder,
+    Decoder,
     DecoderSCVI, 
     EmbeddingAligner,
     HierarchicalAligner,
@@ -13,9 +14,8 @@ from src.modules._base import (
 )
 import src.utils.io as io
 from src.utils.constants import MODULE_KEYS, REGISTRY_KEYS, LOSS_KEYS, PREDICTION_KEYS
-import src.utils.embeddings as emb_utils
 import src.utils.common as co
-from src.utils.augmentations import BatchAugmentation
+from src.utils.augmentations import CrossDatasetMixup
 from src.losses.clip import ClipLoss
 
 from typing import Iterable
@@ -23,6 +23,7 @@ import numpy as np
 
 import torch
 import torch.nn.functional as F
+from torch.distributions import kl_divergence
 
 from scvi.data import _constants
 from scvi.data._constants import ADATA_MINIFY_TYPE
@@ -75,6 +76,10 @@ class XPert(VAE):
         gene_emb: torch.Tensor | None = None,
         cls_text_dict: dict | None = None,
         cls_weights: torch.Tensor | None = None,
+        ctx_weights: torch.Tensor | None = None,
+        ds_sim_weights: torch.Tensor | None = None,
+        ds_mean_anchors: torch.Tensor | None = None,
+        ds_std_anchors: torch.Tensor | None = None,
         ctrl_class_idx: int | None = None,
         feat_masks: torch.Tensor | None = None,
         use_adapter: bool = False,
@@ -84,8 +89,11 @@ class XPert(VAE):
         n_cats_per_cov: Iterable[int] | None = None,
         dropout_rate: float = 0.2,
         dispersion: Literal['gene', 'gene-batch', 'gene-label', 'gene-cell'] = 'gene',
-        log_variational: bool = True,
         use_cpm: bool = False,
+        log_variational: bool = True,
+        use_ds_anchors: bool = False,
+        global_scale: bool = False,
+        impute_missing: bool = False,
         gene_likelihood: Literal['zinb', 'nb', 'poisson', 'normal'] = 'zinb',
         latent_distribution: Literal['normal', 'ln'] = 'normal',
         encode_covariates: bool = False,
@@ -111,12 +119,15 @@ class XPert(VAE):
         module_quantile: float = 0.9,
         pathway_quantile: float = 0.7,
         use_cls_weights: bool = True,
+        use_ctx_weights: bool = True,
+        use_ds_sim_weights: bool = True,
         use_augmentation: bool = False,
         use_decoded_augmentation: bool = False,
         shuffle_context: bool = True,
         link_latents: bool = False,
         automatic_loss_scaling: bool = False,
         model_efficiency: bool = True,
+        reconstruct_raw_x: bool = True,
         extra_encoder_kwargs: dict | None = {},
         extra_decoder_kwargs: dict | None = {},
         extra_aligner_kwargs: dict | None = {},
@@ -150,7 +161,8 @@ class XPert(VAE):
             var_activation=var_activation,
             **vae_kwargs
         )
-
+        # Setup shared dimensions
+        self.n_shared = n_shared if n_shared is not None else n_latent
         # Setup control index
         self.ctrl_class_idx = ctrl_class_idx
         self.use_reconstruction_control = use_reconstruction_control
@@ -163,10 +175,37 @@ class XPert(VAE):
         self.l2_lambda = l2_lambda
         self.l_mask = l_mask
 
-        # Setup extra batch transformation params
+        # Setup feature masks
+        if feat_masks is not None:
+            self.register_buffer('feat_masks', feat_masks)
+        else:
+            self.feat_masks = None
+        # Setup gene embeddings
+        if gene_emb is not None:
+            self.register_buffer("gene_embedding", gene_emb.clone())
+
+        # ----------- Setup batch transformation options -------------
         self.use_cpm = use_cpm
         self.automatic_loss_scaling = automatic_loss_scaling
-
+        # Setup dataset expression anchors if given (optional)
+        if use_ds_anchors and ds_mean_anchors is not None and ds_std_anchors is not None:
+            self.register_buffer('ds_mean_anchors', ds_mean_anchors.clone().detach())
+            self.register_buffer('ds_std_anchors', ds_std_anchors.clone().detach())
+            self.use_ds_anchors = True
+        else:
+            self.use_ds_anchors = False
+        # Setup global mean and variance scaling (optional)
+        self.global_scale = global_scale
+        if self.global_scale:
+            self.register_buffer('running_mean', torch.zeros(n_input))
+            self.register_buffer('running_std', torch.ones(n_input))
+            self.register_buffer('n_batches_seen', torch.tensor(0.0))
+            self.ema_momentum = 0.01
+        self.impute_missing = impute_missing
+        # Impute missing expression values using gene embeddings
+        if self.impute_missing:
+            self._precompute_imputation_weights()
+            
         # Setup extra basic vae args
         self.min_kl = min_kl
 
@@ -184,29 +223,39 @@ class XPert(VAE):
         self.non_elbo_reduction = non_elbo_reduction
         
         # Setup data augmentation module
-        self.augmentation = BatchAugmentation(**extra_aug_kwargs) if use_augmentation else None
+        self.use_augmentation = use_augmentation
+        self.augmentation = CrossDatasetMixup(**extra_aug_kwargs) if use_augmentation else None
         # Additional batch augmentation via decoded sample
         self.use_decoded_augmentation = use_decoded_augmentation
         self.shuffle_context = shuffle_context
         # Setup class weights (optional)
-        self.cls_weights = cls_weights if use_cls_weights else None
+        if use_cls_weights and cls_weights is not None:
+            self.register_buffer('cls_weights', cls_weights)
+        else:
+            self.cls_weights = None
+        # Setup batch weights for reconstruction (optional)
+        if use_ctx_weights and ctx_weights is not None:
+            self.register_buffer('ctx_weights', ctx_weights)
+        else:
+            self.ctx_weights = None
+        # Setup dataset similarity weights (optional)
+        self.ds_sim_weights = ds_sim_weights if use_ds_sim_weights else None
+
         # Whether to model the efficiency score (only available if score is given)
         self.model_efficiency = model_efficiency
-
-        # Setup feature masks
-        if feat_masks is not None:
-            self.register_buffer('feat_masks', feat_masks)
-        else:
-            self.feat_masks = None
         
         # Setup external embeddings
         self.ctx_emb = torch.nn.Embedding.from_pretrained(ctx_emb, freeze=True) if ctx_emb is not None else None
         self.use_adapter = use_adapter
         if use_adapter and not link_latents:
-            extra_cls_emb_kwargs['n_output'] = n_latent
+            extra_cls_emb_kwargs['n_output'] = self.n_shared
         # Setup class embedding
         if cls_emb is not None or cls_text_dict is not None:
-            self.cls_emb = ClassEmbedding(pretrained_emb=cls_emb, class_texts=cls_text_dict, **extra_cls_emb_kwargs)
+            self.cls_emb = ClassEmbedding(
+                pretrained_emb=cls_emb, 
+                class_texts=cls_text_dict, 
+                **extra_cls_emb_kwargs
+            )
             self.n_cls = self.cls_emb.shape[0]
             self.n_cls_dim = self.cls_emb.shape[-1]
         else:
@@ -239,7 +288,7 @@ class XPert(VAE):
         self.gene_names = np.array(list(cls_text_dict.keys())) if cls_text_dict is not None else None
         # Set unseen indices for all layers
         self.unseen_gene_indices = torch.arange(self.n_labels, self.n_cls)
-        self.reset_cached_cls_emb(verbose=True, reset_labels=True)
+
         # Setup learnable temperatures
         self.use_learnable_hierarchy_temperatures = use_learnable_hierarchy_temperatures
         if use_learnable_hierarchy_temperatures:
@@ -249,7 +298,6 @@ class XPert(VAE):
         # Save if we have unseen embeddings or not
         self.has_unseen_ctx = self.n_ctx > n_batch
         self.has_unseen_cls = self.n_cls > n_labels
-        self.n_shared = n_shared if n_shared is not None else n_latent
 
         # Setup normalizations for en- and decoder
         use_batch_norm_encoder = use_batch_norm == 'encoder' or use_batch_norm == 'both'
@@ -294,6 +342,7 @@ class XPert(VAE):
         self.z_encoder = encoder_cls(**extra_encoder_kwargs)
 
         # ----- Setup decoder module -----
+        self.reconstruct_raw_x = reconstruct_raw_x
         # Covariate params
         self.decode_covariates = decode_covariates
         self.decode_ctx_emb = decode_ctx_emb
@@ -330,35 +379,42 @@ class XPert(VAE):
                 **extra_aligner_kwargs
             )    
         
-        # Init actual decoder
-        self.decoder = DecoderSCVI(
-            n_input=n_input_decoder,
-            n_output=n_input,
-            n_cat_list=decoder_cat_list,
-            n_hidden=n_hidden,
-            use_batch_norm=use_batch_norm_decoder, 
-            use_layer_norm=use_layer_norm_decoder,
-            scale_activation='softmax',
-            inject_covariates=deeply_inject_covariates,
-            n_dim_context_emb=n_ctx_dim_decoder,
-            **extra_decoder_kwargs,
-        )
+        # Init raw x (scvi) or norm x decoder
+        decoder_cls = DecoderSCVI if self.reconstruct_raw_x else Decoder
+        base_decoder_kwargs = {
+            'n_input': n_input_decoder,
+            'n_output': n_input,
+            'n_cat_list': decoder_cat_list,
+            'n_hidden': n_hidden,
+            'use_batch_norm': use_batch_norm_decoder, 
+            'use_layer_norm': use_layer_norm_decoder,
+            'scale_activation': 'softmax',
+            'inject_covariates': deeply_inject_covariates,
+            'n_dim_context_emb': n_ctx_dim_decoder,
+        }
+        base_decoder_kwargs.update(extra_decoder_kwargs)
+        self.decoder = decoder_cls(**base_decoder_kwargs)
         
         # Setup clip loss module
         extra_clip_kwargs['reduction'] = self.non_elbo_reduction
-        self.clip_loss = ClipLoss(**extra_clip_kwargs)
+        extra_clip_kwargs['ds_sim_weights'] = self.ds_sim_weights
+        self.clip_loss = ClipLoss(
+            latent_dim=self.n_shared,
+            n_labels=n_labels,
+            **extra_clip_kwargs
+        )
 
         # Setup an additional classifier on z, purely supervised
         self.classifier = Classifier(
-            n_input=n_latent,
+            n_input=self.n_shared,
             n_labels=self.n_labels,
             **extra_cls_kwargs,
         )
         
         # Setup efficiency head if enabled
         if self.model_efficiency:
-            self.efficiency_head = EfficiencyHead(n_latent)
             self.responder_head = EfficiencyHead(n_latent)
+            self.efficiency_head = EfficiencyHead(self.n_shared)
        
         # Check loss strategies
         self.set_align_ext_emb_strategies(align_ext_emb_loss_strategy)
@@ -376,7 +432,20 @@ class XPert(VAE):
                 raise ValueError(msg)
             else:
                 log.warning(msg)
-        # TODO: Add compatibiliy checks
+        # Log all batch transformations
+        self.transformations = []
+        if self.use_cpm:
+            self.transformations.append('cpm')
+        if self.log_variational:
+            self.transformations.append('log1p')
+        if self.use_ds_anchors:
+            self.transformations.append('ds_scale')
+        elif self.global_scale:
+            self.transformations.append('global_scale')
+        if self.impute_missing:
+            self.transformations.append('impute_missing')
+        if self.transformations:
+            log.info(f'Applying in-batch transformations: {self.transformations}')
         
     def get_device(self):
         # Set own device
@@ -456,14 +525,35 @@ class XPert(VAE):
         log.info(f'Successfully unfroze {key} parameters.')
         module.frozen = False
         
+    @property
+    def cached_cls_emb(self) -> torch.Tensor:
+        """Adapter applied fresh each access so gradients flow to the adapter,
+        while the (potentially expensive) encoder output is cached per epoch."""
+        return self.cls_emb.adapter(self._cached_raw_cls_emb)
+
+    @property
+    def cached_cls_proj(self) -> torch.Tensor:
+        """Return the per-epoch cached class projection (adapter + class_projection, detached)."""
+        if not hasattr(self, '_cached_cls_proj'):
+            self.reset_cached_cls_emb()
+        return self._cached_cls_proj
+
     def reset_cached_cls_emb(self, verbose: bool = False, reset_labels: bool = False):
-        """Reset embedding on epoch start"""
-        # Recompute gene embeddings
-        self.cached_cls_emb = self.cls_emb()
-        # Reset hierarchical labels
+        """Reset cached encoder output and projected class embeddings on epoch start.
+
+        The pre-adapter encoder output is stored (detached) and the adapter +
+        class projection are applied once per epoch.  The projected embeddings
+        are cached so the aligner can skip re-projecting every batch.
+        """
+        with torch.no_grad():
+            self._cached_raw_cls_emb = self.cls_emb.encode().detach()
+            # Cache the fully projected class embeddings (adapter + class_projection)
+            cls_emb = self.cls_emb.adapter(self._cached_raw_cls_emb)
+            self._cached_cls_proj = self.aligner.class_projection(cls_emb).detach()
+        # Reset hierarchical labels (no gradients needed for cluster assignment)
         if self.use_hierarchical_labels:
             if reset_labels:
-                self._set_hierarchical_labels(self.cached_cls_emb, verbose=verbose)
+                self._set_hierarchical_labels(self.cached_cls_emb.detach(), verbose=verbose)
         
     def _set_hierarchical_labels(
         self,
@@ -677,6 +767,42 @@ class XPert(VAE):
         self.G2M = G2M
         self.M2P = M2P
 
+    def _precompute_imputation_weights(self, n_neighbors: int = 10):
+        """Precompute imputation weights per dataset — do once before training."""
+        # Skip if feature masks or embeddings are missing
+        if self.feat_masks is None or not hasattr(self, 'gene_embedding'):
+            return
+        logging.info(f'[Setup] Computing missing gene imputation weights.')
+        # Get feature masks from model
+        feature_masks_per_dataset = self.feat_masks
+        # Get embeddings
+        gene_embeddings = self.gene_embedding
+        # Center gene embeddings
+        gene_embeddings = gene_embeddings - gene_embeddings.mean(dim=0)
+        # Normalize gene embeddings
+        E_norm = F.normalize(gene_embeddings, dim=-1)
+        # Calculate pairwise gene similarities
+        gene_sim = E_norm @ E_norm.T
+        # Compute impute weights for each dataset
+        for ds_idx, mask in enumerate(feature_masks_per_dataset):
+            observed = np.where(mask > 0)[0]
+            missing = np.where(mask == 0)[0]
+            
+            if len(missing) == 0:
+                continue
+            # Assign weights based on top K similar genes
+            k = min(n_neighbors, len(observed))
+            sim = gene_sim[np.ix_(missing, observed)]
+            top_k_idx = np.argsort(-sim, axis=1)[:, :k]
+            top_k_sims = torch.gather(sim, dim=1, index=top_k_idx)
+            weights = top_k_sims * top_k_sims / (top_k_sims.sum(axis=1, keepdims=True) + 1e-8)
+            
+            # Store as per-dataset buffers
+            self.register_buffer(f'imp_missing_{ds_idx}', torch.tensor(missing.copy()))
+            self.register_buffer(f'imp_observed_{ds_idx}', torch.tensor(observed.copy()))
+            self.register_buffer(f'imp_neighbor_{ds_idx}', torch.tensor(top_k_idx))
+            self.register_buffer(f'imp_weights_{ds_idx}', torch.tensor(weights.clone().detach(), dtype=torch.float32))
+    
     def draw_module(self):
         return
         from torchview import draw_graph
@@ -724,48 +850,85 @@ class XPert(VAE):
         for align_strategy in self.align_ext_emb_loss_strategies:
             if align_strategy not in self._align_ext_emb_loss_strategies:
                 raise ValueError(f'Unrecognized alignment strategy: {align_strategy}, choose one of {self._align_ext_emb_loss_strategies}')
-        
-    @torch.no_grad()
-    def _get_decoded_augmentation(
-        self,
-        tensors: dict[str, torch.Tensor],
-        incl_x: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        """Generate decoded batch as augmentation."""
-        # Run full VAE forward pass with no gradient
-        _tensors = {k: v for k, v in tensors.items()}
-        x = _tensors[MODULE_KEYS.X_KEY]
-        B = x.size(0)
-        # Inference
-        inference_outputs = self._regular_inference(**tensors)
-        generative_input = self._get_generative_input(_tensors, inference_outputs)
-        # Randomize context labels for generative part
-        if self.shuffle_context:
-            # Get shape of current label
-            label_shape = _tensors[MODULE_KEYS.BATCH_INDEX_KEY].shape
-            # Pick random context labels
-            generative_input[MODULE_KEYS.BATCH_INDEX_KEY] = torch.randint(0, self.n_ctx, label_shape, device=x.device, dtype=torch.long)
-            # Set batch variables
-            _tensors[MODULE_KEYS.BATCH_INDEX_KEY] = generative_input[MODULE_KEYS.BATCH_INDEX_KEY]
-        generative_output = self.generative(**generative_input)
-        # Get reconstructed X from output
-        px: Distribution = generative_output[MODULE_KEYS.PX_KEY]
-        # Overwrite X key
-        _tensors[MODULE_KEYS.X_KEY] = px.sample()
-        # Optionally concatenate original + augmented along batch dimension
-        if incl_x:
-            out = {}
-            for k, v in tensors.items():
-                v2 = _tensors.get(k, None)
-                # only cat batch-aligned tensors
-                if torch.is_tensor(v) and torch.is_tensor(v2) and v.shape == v2.shape:
-                    out[k] = torch.cat([v, v2], dim=0)
+
+    def _impute_missing(self, x: torch.Tensor, batch_index: torch.Tensor):
+        """Impute missing gene expressions based on pre-computed embedding similarities."""
+        # Clone original input since we assign new values
+        for ds_idx in torch.unique(batch_index):
+            ds_mask = batch_index.flatten() == ds_idx
+            key = ds_idx.item()
+
+            if not hasattr(self, f'imp_missing_{key}'):
+                continue
+            # Get imputation data
+            missing = getattr(self, f'imp_missing_{key}')          # (M,)
+            neighbor_idx = getattr(self, f'imp_neighbor_{key}')    # (M, K)
+            weights = getattr(self, f'imp_weights_{key}')          # (M, K)
+            observed = getattr(self, f'imp_observed_{key}')        # (G_obs,)
+            # Get observed dataset counts
+            x_ds = x[ds_mask]                                      # (B_ds, G)
+
+            # ---- Map neighbor indices to actual gene indices ----
+            obs_neighbors = observed[neighbor_idx]                 # (M, K)
+
+            # ---- Gather all neighbor expressions ----
+            # expand for gather: (B_ds, M, K)
+            idx = obs_neighbors.unsqueeze(0).expand(x_ds.size(0), -1, -1)
+
+            gathered = torch.gather(
+                x_ds.unsqueeze(1).expand(-1, obs_neighbors.size(0), -1),
+                dim=2,
+                index=idx
+            )                                                     # (B_ds, M, K)
+
+            # ---- Weighted sum ----
+            imputed = (gathered * weights.unsqueeze(0)).sum(dim=-1)  # (B_ds, M)
+
+            # ---- Assign back ----
+            x_ds[:, missing] = imputed              # modify copy
+            x[ds_mask] = x_ds                       # write back
+
+        return x
+
+    def _transform_x(self, x: torch.Tensor, batch_index: torch.Tensor):
+        # Apply CPM normalization to x
+        if self.use_cpm:
+            full_lib = x.sum(dim=1, keepdim=True).clamp(min=1)
+            x = x / full_lib * 1e6
+        # Apply log1p transformation to input batch
+        if self.log_variational:
+            x = torch.log1p(x)
+        # Impute missing gene expression
+        if self.impute_missing:
+            x = self._impute_missing(x, batch_index)
+        # Center x on dataset anchor if given
+        if self.use_ds_anchors:
+            ds_mean = self.ds_mean_anchors[batch_index.flatten()]
+            ds_std = self.ds_std_anchors[batch_index.flatten()]
+            x = (x - ds_mean) / (ds_std + 1e-6)
+        # Center on global mean and variance
+        elif self.global_scale:
+            if self.training:
+                batch_mean = x.mean(dim=0)
+                batch_std = x.std(dim=0).clamp(min=0.1)
+                
+                if self.n_batches_seen < 1:
+                    # First batch: initialize directly
+                    self.running_mean.copy_(batch_mean)
+                    self.running_std.copy_(batch_std)
                 else:
-                    # keep original as-is
-                    out[k] = v
-            return out
-        return _tensors
+                    # EMA update
+                    m = self.ema_momentum
+                    self.running_mean.mul_(1 - m).add_(batch_mean, alpha=m)
+                    self.running_std.mul_(1 - m).add_(batch_std, alpha=m)
+                
+                self.n_batches_seen += 1
+            
+            # Use running stats for both train and eval
+            x = (x - self.running_mean) / (self.running_std + 1e-6)
+        return x
         
+    @auto_move_data
     def _get_inference_input(
         self,
         tensors: dict[str, torch.Tensor | None],
@@ -779,15 +942,25 @@ class XPert(VAE):
         label = tensors[REGISTRY_KEYS.LABELS_KEY]
         cont_covs = tensors.get(REGISTRY_KEYS.CONT_COVS_KEY, None)
         cat_covs = tensors.get(REGISTRY_KEYS.CAT_COVS_KEY, None)
+        # Determine library size
+        if self.use_observed_lib_size:
+            library = torch.log(x.sum(1)).unsqueeze(1)
+        else:
+            library = None
         # Construct batch from data
         o = {
-            MODULE_KEYS.X_KEY: x,
             MODULE_KEYS.BATCH_INDEX_KEY: batch_index,
             MODULE_KEYS.LABEL_KEY: label,
-            MODULE_KEYS.G_EMB_KEY: tensors.get(REGISTRY_KEYS.GENE_EMB_KEY, None),
             MODULE_KEYS.CONT_COVS_KEY: cont_covs,
-            MODULE_KEYS.CAT_COVS_KEY: cat_covs
+            MODULE_KEYS.CAT_COVS_KEY: cat_covs,
+            MODULE_KEYS.LIBRARY_KEY: library,
+            MODULE_KEYS.CLS_EFF_KEY: tensors.get(REGISTRY_KEYS.CLS_EFF_KEY, None),
         }
+        # Apply x transformations
+        o[MODULE_KEYS.X_KEY] = self._transform_x(x, batch_index)
+        # Add batch transformations
+        if self.training and self.use_augmentation:
+            o.update(self.augmentation(o))
         return o
     
     @auto_move_data
@@ -796,23 +969,13 @@ class XPert(VAE):
         x: torch.Tensor,
         batch_index: torch.Tensor,
         label: torch.Tensor,
-        g: torch.Tensor | None = None,
+        library: torch.Tensor,
         cont_covs: torch.Tensor | None = None,
         cat_covs: torch.Tensor | None = None,
         n_samples: int = 1,
         **kwargs
     ) -> dict[str, torch.Tensor | Distribution | None]:
         """Run the regular inference process."""
-        x_ = x
-        # Determine library size
-        if self.use_observed_lib_size:
-            library = torch.log(x_.sum(1)).unsqueeze(1)
-        # Apply CMP normalization to x
-        if self.use_cpm:
-            x_ = x_ / library * 1e6
-        # Apply log1p transformation to input batch
-        if self.log_variational:
-            x_ = torch.log1p(x_)
         # Use feature masks if given and enabled
         if self.feat_masks is not None:
             feat_mask = self.feat_masks[batch_index.flatten()]
@@ -820,9 +983,9 @@ class XPert(VAE):
             feat_mask = None
 
         if cont_covs is not None and self.encode_covariates:
-            encoder_input = torch.cat((x_, cont_covs), dim=-1)
+            encoder_input = torch.cat((x, cont_covs), dim=-1)
         else:
-            encoder_input = x_
+            encoder_input = x
         if cat_covs is not None and self.encode_covariates:
             categorical_input = torch.split(cat_covs, 1, dim=1)
         else:
@@ -833,8 +996,7 @@ class XPert(VAE):
         # Perform forward pass through encoder
         inference_out: dict[str, torch.Tensor] = self.z_encoder(
             encoder_input, *categorical_input, 
-            g=g, feature_masks=feat_mask, 
-            ctx_label=batch_index, context_emb=ctx_emb
+            feature_masks=feat_mask,
         )
         # Unpack encoder output
         qz = inference_out[MODULE_KEYS.QZ_KEY]
@@ -870,18 +1032,10 @@ class XPert(VAE):
             MODULE_KEYS.CONT_COVS_KEY: cont_covs,
             MODULE_KEYS.CAT_COVS_KEY: cat_covs,
         }
-        # Add local latent
-        if self.encoder_type == 'split':
-            o.update({
-                # Local
-                'qzl': inference_out.get('qzl'),
-                'zl': inference_out.get('zl'),
-                'x_norm': inference_out.get('x_norm'),
-                'x_base': inference_out.get('x_base'),
-                'x_res': inference_out.get('x_res'),
-            })
+        # Forward other inputs
+        o.update(kwargs)
         return o
-    
+
     def _get_generative_input(
         self,
         tensors: dict[str, torch.Tensor],
@@ -905,7 +1059,59 @@ class XPert(VAE):
         }
     
     @auto_move_data
-    def generative(
+    def generative(self, *args, **kwargs) -> dict[str, Distribution | None]:
+        # Reconstruct normalized expression
+        if not self.reconstruct_raw_x:
+            return self._generative_norm(*args, **kwargs)
+        # Reconstruct raw data using scvi-style setup
+        else:
+            return self._generative_scvi(*args, **kwargs)
+    
+    def _generative_norm(
+        self,
+        z: torch.Tensor,
+        batch_index: torch.Tensor,
+        cont_covs: torch.Tensor | None = None,
+        cat_covs: torch.Tensor | None = None,
+        transform_batch: torch.Tensor | None = None,
+        **kwargs
+    ) -> dict[str, Distribution | None]:
+        """Run the generative process."""
+
+        # Likelihood distribution
+        if cont_covs is None:
+            decoder_input = z
+        elif z.dim() != cont_covs.dim():
+            decoder_input = torch.cat(
+                [z, cont_covs.unsqueeze(0).expand(z.size(0), -1, -1)], dim=-1
+            )
+        else:
+            decoder_input = torch.cat([z, cont_covs], dim=-1)
+
+        if cat_covs is not None:
+            categorical_input = torch.split(cat_covs, 1, dim=1)
+        else:
+            categorical_input = ()
+
+        if transform_batch is not None:
+            batch_index = torch.ones_like(batch_index) * transform_batch
+
+        # Perform decoder forward pass
+        px = self.decoder(
+            decoder_input,
+            *categorical_input,
+        )
+        
+        # Target latent distribution
+        pz = Normal(torch.zeros_like(z), torch.ones_like(z))
+
+        return {
+            MODULE_KEYS.PX_KEY: px,
+            MODULE_KEYS.PL_KEY: None,
+            MODULE_KEYS.PZ_KEY: pz,
+        }
+    
+    def _generative_scvi(
         self,
         z: torch.Tensor,
         library: torch.Tensor,
@@ -916,6 +1122,7 @@ class XPert(VAE):
         y: torch.Tensor | None = None,
         ctx_proj: torch.Tensor | None = None,
         transform_batch: torch.Tensor | None = None,
+        **kwargs
     ) -> dict[str, Distribution | None]:
         """Run the generative process."""
         from torch.nn.functional import linear
@@ -1004,14 +1211,11 @@ class XPert(VAE):
             MODULE_KEYS.PZ_KEY: pz,
         }
     
-    @auto_move_data
-    @torch.no_grad()
     def classify(
         self,
         x: torch.Tensor | None,
         batch_index: torch.Tensor | None = None,
         label: torch.Tensor | None = None,
-        g: torch.Tensor | None = None,
         cont_covs: torch.Tensor | None = None,
         cat_covs: torch.Tensor | None = None,
         use_posterior_mean: bool = True,
@@ -1046,14 +1250,15 @@ class XPert(VAE):
         """
         # Try caching inference and recalculate if missing
         if inference_outputs is None:
-            inference_outputs = self.inference(
-                x, 
-                batch_index, 
-                label, 
-                g, 
-                cont_covs, 
-                cat_covs,
-            )
+            # Get inference inputs
+            batch = {
+                REGISTRY_KEYS.X_KEY: x,
+                REGISTRY_KEYS.BATCH_KEY: batch_index,
+                REGISTRY_KEYS.LABELS_KEY: label,
+                REGISTRY_KEYS.CONT_COVS_KEY: cont_covs,
+                REGISTRY_KEYS.CAT_COVS_KEY: cat_covs
+            }
+            inference_outputs = self.inference(**self._get_inference_input(batch))
         # Get inference outputs
         qz_key = 'qzl' if 'qzl' in inference_outputs else MODULE_KEYS.QZ_KEY
         z_key = 'zl' if 'zl' in inference_outputs else MODULE_KEYS.Z_KEY
@@ -1065,29 +1270,37 @@ class XPert(VAE):
         # Optionally use different embeddings, fall back to internals if none are given
         if ctx_emb is None and self.ctx_emb is not None:
             ctx_emb = self.ctx_emb.weight
+        # Use cached projection when using default embeddings, otherwise project live
+        _use_cached = cls_emb is None
         if cls_emb is None:
             cls_emb = self.cached_cls_emb
-        # Subset class embedding to local (trained) classes
-        if local_predictions:
-            cls_emb = cls_emb[:self.n_labels]
 
         # Use regular alignment
         align_out: dict[str, torch.Tensor] = self.aligner(
-            x=_z, cls_emb=cls_emb,
+            x=_z,
+            cls_emb=None if _use_cached else cls_emb,
+            cls_proj=self.cached_cls_proj if _use_cached else None,
             return_logits=False
         )
         # Get aligned spaces
         z2c = align_out.get(MODULE_KEYS.Z_SHARED_KEY)
         c2z = align_out.get(MODULE_KEYS.CLS_PROJ_KEY)
+        # Subset class embedding to local (trained) classes
+        if local_predictions:
+            _c2z = c2z[:self.n_labels]
+        else:
+            _c2z = c2z
         # Get cell-wise T predictions if enabled
-        if self.model_efficiency and hasattr(self, 'last_t_gamma'):
+        if self.model_efficiency and hasattr(self, 'last_t_gamma') and self.last_t_gamma > 0:
             eff_hat = self.efficiency_head(z2c).clamp(max=self.eff_max) / self.eff_max
             T_i = self.aligner.temperature * (1 + self.last_t_gamma * (1 - eff_hat))
             T_i = T_i.clamp(min=0.07, max=1.0).unsqueeze(-1)
+            align_out['T_i'] = T_i
+        # Use global training alignment temperature
         else:
             T_i = self.aligner.temperature
         # Get logits
-        align_out[MODULE_KEYS.CLS_LOGITS_KEY] = self.clip_loss._logits_z2c(z2c, c2z, T=T_i)
+        align_out[MODULE_KEYS.CLS_LOGITS_KEY] = self.clip_loss._logits_z2c(z2c, _c2z, T=T_i)
         # Add response probability to alignment output
         align_out['response_prob'] = pf.compute_response_probability(align_out[MODULE_KEYS.CLS_LOGITS_KEY])
         
@@ -1151,7 +1364,7 @@ class XPert(VAE):
         return w
     
     # Soft responder target using sigmoid around threshold
-    def soft_responder_target(self, scores, threshold, steepness: float = 2.0):
+    def soft_responder_target(self, scores, threshold, steepness: float = 15.0):
         """Smooth binary target, 0.5 at threshold."""
         return torch.sigmoid(steepness * (scores.abs() - threshold)).flatten()
     
@@ -1162,43 +1375,66 @@ class XPert(VAE):
         generative_outputs: dict[str, Distribution | None],
         rl_weight: float = 1.0,
         kl_weight: float = 1.0,
-        adv_ctx_weight: float = 0.0,
-        ctx_weight: float = 0.0,
         cls_align_weight: float = 1.0,
-        l_kl_weight: float = 0.0,
-        decor_weight: float = 0.0,
+        contrastive_weight: float = 0.3,
         use_posterior_mean: bool = True,
         local_predictions: bool = True,
         T_align: float | None = None,
         clip_k: int | None = None,
-        aug_weight: float = 0.0,
         scale_rl_by_features: bool = False,
         lambda_eff: float = 0.1,
         T_gamma: float = 0.0,
+        gate_eff: float = 0.0,
+        clip_grad_scale: float = 1.0,
         **kwargs,
     ) -> LossOutput:
         # ---- DEBUG ----
         self._step = self._step + 1
         """Compute the loss."""
-        from torch.distributions import kl_divergence
-
+        
         # Unpack input tensor
-        x: torch.Tensor = inference_outputs[MODULE_KEYS.X_KEY]
         ctx: torch.Tensor = inference_outputs[MODULE_KEYS.BATCH_INDEX_KEY]
         cls: torch.Tensor = inference_outputs[MODULE_KEYS.LABEL_KEY]
         z: torch.Tensor = inference_outputs[MODULE_KEYS.Z_KEY]
         px: Distribution = generative_outputs[MODULE_KEYS.PX_KEY]
         qz: Distribution = inference_outputs[MODULE_KEYS.QZ_KEY]
         pz: Distribution = generative_outputs[MODULE_KEYS.PZ_KEY]
-        g: torch.Tensor | None = tensors.get(REGISTRY_KEYS.GENE_EMB_KEY, None)
-        weights: torch.Tensor | None = tensors.get(REGISTRY_KEYS.CLS_EFF_KEY, None)
+        weights: torch.Tensor | None = inference_outputs.get(MODULE_KEYS.CLS_EFF_KEY, None)
+        mixup_weights: torch.Tensor | None = inference_outputs.get('mixup_weights', None)
+        real_mask: torch.Tensor | None = inference_outputs.get('real_mask', None)
 
         # Compute basic kl divergence between prior and posterior x distributions
         kl_divergence_z_mat = kl_divergence(qz, pz)
-        # Calculate reconstruction loss over batch and all features
-        reconst_loss_mat = -px.log_prob(x)
+
+        # ------------------------------------------------
+        # Reconstruction loss
+        # ------------------------------------------------
+        extra_metrics = {}
+        if self.reconstruct_raw_x:
+            # Likelihood-based reconstruction (e.g. NB/ZINB)
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            # Add placeholders if mixup is enabled, will be masked out later anyways
+            if real_mask is not None:
+                _xd = cls.size(0) - real_mask.sum()
+                _xm = torch.zeros((int(_xd), int(x.size(1))), device=x.device)
+                x = torch.cat([x, _xm], dim=0)
+            reconst_loss_mat = -px.log_prob(x)
+        else:
+            # MSE reconstruction on normalized data
+            x = inference_outputs[MODULE_KEYS.X_KEY]
+            x_hat = px.mean
+            reconst_loss_mat = F.smooth_l1_loss(x_hat, x, reduction="none")
         
-        # Apply feature masking to loss        
+        # Apply reconstruction loss only to real cells
+        n_obs_minibatch = x.size(0)
+        if real_mask is not None:
+            _real_mask = real_mask.unsqueeze(-1)
+            reconst_loss_mat = reconst_loss_mat * _real_mask
+            kl_divergence_z_mat = kl_divergence_z_mat * _real_mask
+            n_obs_minibatch = real_mask.sum()
+        # ------------------------------------------------
+        # Apply feature masking
+        # ------------------------------------------------
         if self.feat_masks is not None:
             mask_batch = self.feat_masks[ctx.flatten()]
             reconst_loss_mat = reconst_loss_mat * mask_batch
@@ -1206,69 +1442,53 @@ class XPert(VAE):
         else:
             mask_batch = None
             valid_feat_count = None
-        
-        # Clamp KL to a minimum if option is provided
+
+        # ------------------------------------------------
+        # Clamp KL
+        # ------------------------------------------------
         if self.min_kl is not None:
             kl_divergence_z_mat = torch.clamp(kl_divergence_z_mat, min=self.min_kl)
-        # Aggregate elbo losses over latent dimensions / input features, will get batch normalized internally
-        if self.reduction == 'batchmean':
-            kl_divergence_z = kl_divergence_z_mat.sum(-1) # (b,)
-            kl_div_per_latent = kl_divergence_z_mat.sum(0) # (l,)
+
+        # ------------------------------------------------
+        # Reduction
+        # ------------------------------------------------
+        if self.reduction == "batchmean":
+            kl_divergence_z = kl_divergence_z_mat.sum(-1)          # (b,)
+            kl_div_per_latent = kl_divergence_z_mat.sum(0)         # (l,)
             reconst_loss = reconst_loss_mat.sum(-1)
-        elif self.reduction == 'mean':
-            kl_divergence_z = kl_divergence_z_mat.mean(-1) # (b,)
-            kl_div_per_latent = kl_divergence_z_mat.mean(0) # (l,)
-            # Normalize by valid features per cell
+
+        elif self.reduction == "mean":
+            kl_divergence_z = kl_divergence_z_mat.mean(-1)         # (b,)
+            kl_div_per_latent = kl_divergence_z_mat.mean(0)        # (l,)
+
             if self.feat_masks is not None:
-                reconst_loss = (reconst_loss_mat.sum(-1) / valid_feat_count)
+                reconst_loss = reconst_loss_mat.sum(-1) / valid_feat_count
             else:
                 reconst_loss = reconst_loss_mat.mean(-1)
+
             if scale_rl_by_features:
                 reconst_loss = reconst_loss * reconst_loss_mat.size(1)
+
         else:
             raise ValueError(f'reduction has to be either "batchmean" or "mean", got {self.reduction}')
 
-        # Use full batch by default
-        n_obs_minibatch = x.shape[0]
-        # Use full batch as default
-        ctrl_mask = None
-        n_obs_minibatch = x.shape[0]
-        # Handle control cells for elbo loss
-        if self.ctrl_class_idx is not None:
-            # Calculate control mask
-            ctrl_mask = (cls == self.ctrl_class_idx).reshape(-1)
-            # Check if there are any control cells in the batch
-            if ctrl_mask.sum() > 0:
-                # Calculate fraction of control cells in batch
-                ctrl_frac = x.shape[0] / max(ctrl_mask.sum(), 1)    # avoid div/0
-                # Divide elbo sum by class cells only
-                n_obs_minibatch = (~ctrl_mask).sum()
-                # Disregard elbo for control cells
-                if not self.use_reconstruction_control and not self.use_kl_control:
-                    reconst_loss = reconst_loss * ~ctrl_mask
-                    kl_divergence_z = kl_divergence_z * ~ctrl_mask
-                elif not self.use_reconstruction_control:
-                    reconst_loss = reconst_loss * ~ctrl_mask
-                    kl_weight = kl_weight * ctrl_frac
-                elif not self.use_kl_control:
-                    kl_divergence_z = kl_divergence_z * ~ctrl_mask
-                    rl_weight = rl_weight * ctrl_frac
-                else:
-                    # Use full batch
-                    n_obs_minibatch = x.shape[0]
-        
-        # Weighted reconstruction and KL
+        # ------------------------------------------------
+        # Weighted ELBO
+        # ------------------------------------------------
+        # Weight reconstruction by dataset support
+        if self.ctx_weights is not None:
+            reconst_loss = reconst_loss * self.ctx_weights[ctx.flatten()]
+            
         weighted_reconst_loss = (rl_weight * reconst_loss).mean()
         weighted_kl_local = (kl_weight * kl_divergence_z).mean()
 
-        # Save reconstruction losses
         kl_locals = {MODULE_KEYS.KL_Z_KEY: kl_divergence_z}
-        # Batch normalize elbo loss of reconstruction + kl --> batchmean reduction
+
         L_elbo = weighted_reconst_loss + weighted_kl_local
         total_loss = L_elbo
 
         # Create extra metric container
-        extra_metrics = {MODULE_KEYS.KL_Z_PER_LATENT_KEY: kl_div_per_latent}
+        extra_metrics[MODULE_KEYS.KL_Z_PER_LATENT_KEY] = kl_div_per_latent
 
         # Collect inital loss and extra parameters
         lo_kwargs = {
@@ -1277,23 +1497,12 @@ class XPert(VAE):
             'true_labels': cls,
             'n_obs_minibatch': n_obs_minibatch
         }
-        # Monitor latent space ranks
-        extra_metrics['z_rank'] = torch.linalg.matrix_rank(z).float().mean()
-
         # Collect extra outputs
         extra_outputs = {}
         
         # Re-format labels
         ctx = ctx.flatten()
         cls = cls.flatten()
-        
-        # Optional context classifier on z
-        if ctx_weight > 0:
-            ctx_z = qz.loc if use_posterior_mean else z
-            ctx_loss, ctx_pred, ctx_labels = self.context_loss(ctx_z, ctx)
-            total_loss = total_loss + ctx_weight * ctx_loss
-            extra_metrics['L_ctx'] = ctx_loss
-            extra_outputs['ctx_pred'] = ctx_pred
 
         # Set empty classification logits
         logits = None
@@ -1303,143 +1512,122 @@ class XPert(VAE):
         if 'qzl' in inference_outputs:
             _qz = inference_outputs['qzl']
             z_ = inference_outputs['zl']
-            has_local = True
         else:
             _qz = qz
             z_ = z
-            has_local = False
         # Base classification / clip losses on posterior mean or sampled latent space
         _z = _qz.loc if use_posterior_mean else z_
-        
-        # Split latent regularizations
-        if has_local:
-            # Add KL-loss on local latent distribution
-            if l_kl_weight > 0:
-                kl_divergence_zl_mat = kl_divergence(inference_outputs['qzl'], Normal(torch.zeros_like(z), torch.ones_like(z)))
-                # Aggregate elbo losses over latent dimensions / input features, will get batch normalized internally
-                kl_divergence_zl = self._reduce_loss(kl_divergence_zl_mat, self.non_elbo_reduction)
-                total_loss = total_loss + l_kl_weight * kl_divergence_zl
-                extra_metrics['kl_zl_local'] = kl_divergence_zl
-            # Add decorrelation regularizer on global vs local
-            if decor_weight > 0:
-                reg_decorr = self.z_encoder.decorrelation_reg(
-                    z_g=qz.loc if use_posterior_mean else z,
-                    z_l=_z
-                )
-                reg_decorr = self._reduce_loss(reg_decorr, self.non_elbo_reduction)
-                total_loss = total_loss + decor_weight * reg_decorr
-                extra_metrics['L_decorr'] = reg_decorr
+        # Scale gradients flowing from alignment/clip back into the encoder.
+        # 0.0 = full detach (encoder trains only on ELBO), 1.0 = full gradient (current behavior)
+        _z_align = co.grad_scale(_z, clip_grad_scale)
 
-        # Get class embedding transformer output
-        cls_emb = self.cached_cls_emb
-        # Do alignment forward pass and calculate losses
+        # Use per-epoch cached class projection (adapter + class_projection, detached)
+        cls2z = self.cached_cls_proj
+        # Do alignment forward pass — skip class_projection by passing cls_proj directly
         alignment_output = self.aligner(
-            x=_z, cls_emb=cls_emb, return_logits=False
+            x=_z_align, cls_proj=cls2z, return_logits=False
         )
         # Extract shared latent space
         z_shared = alignment_output.get(MODULE_KEYS.Z_SHARED_KEY)
-        # Extract the embedding projections to shared space
-        cls2z = alignment_output.get(MODULE_KEYS.CLS_PROJ_KEY)
+        # Normalize z_shared and cls2z once — reuse downstream instead of re-normalizing
+        z_shared_norm = F.normalize(z_shared, dim=-1)
+        cls2z_norm = F.normalize(cls2z, dim=-1)
         # Add projected embedding representations to extra outputs
-        extra_outputs[MODULE_KEYS.Z_SHARED_KEY] = F.normalize(z_shared, dim=-1).detach()
-        extra_outputs[MODULE_KEYS.CLS_PROJ_KEY] = F.normalize(cls2z, dim=-1).detach()
+        extra_outputs[MODULE_KEYS.Z_SHARED_KEY] = z_shared_norm.detach()
+        extra_outputs[MODULE_KEYS.CLS_PROJ_KEY] = cls2z_norm.detach()
 
         # Choose alignment temperature
         T_align = T_align if T_align is not None else self.aligner.temperature
         # Predict perturbation efficiency per cell
         if self.model_efficiency and weights is not None and lambda_eff > 0:
             weights = weights.flatten()
-            # Predict responders
-            responder_logits = self.responder_head(z_shared)
+            # Predict responders on z — use same gradient scaling as alignment path
+            responder_logits = self.responder_head(_z_align)
             responder_target = self.soft_responder_target(weights, threshold=2.0)
             responder_loss = F.binary_cross_entropy_with_logits(
                 responder_logits, responder_target, reduction='mean'
             )
-            extra_metrics['responder_loss'] = responder_loss
             total_loss = total_loss + lambda_eff * responder_loss
             # Responder gate
             gate = torch.sigmoid(responder_logits.detach()).squeeze(-1)
-            # Efficiency regression 
+            # Efficiency regression on clip space
             eff_hat = self.efficiency_head(z_shared)
             eff_loss = F.mse_loss(eff_hat, weights, reduction='mean')
             total_loss = total_loss + lambda_eff * eff_loss
-            extra_metrics['eff_loss'] = eff_loss
 
             # Temperature modulation — gate controls inclusion, eff controls sharpness
-            eff_max = weights.max()
-            if hasattr(self, 'last_eff_max'):
-                self.eff_max = torch.max(eff_max, self.last_eff_max)
-            else:
-                self.eff_max = eff_max
-            eff_norm = eff_hat.abs().detach().squeeze(-1).clamp(0, self.eff_max) / self.eff_max
+            eff_norm = eff_hat.abs().detach().squeeze(-1).clamp(0, 1.0)
             T_i = T_align * (1 + T_gamma * (1 - eff_norm))
             T_i = T_i.clamp(min=0.07, max=1.0).unsqueeze(-1)
+            # Keep track of last model T gamma for inference
+            self.last_t_gamma = T_gamma
+            # Pass gate as weights
+            gate_eff = gate_eff.clamp(min=0.0, max=1.0)
+            # Modulate clip weights by gate efficiency
+            clip_weights = (1 - gate_eff) + gate * gate_eff
+            # Add mixup weights if given
+            if mixup_weights is not None:
+                clip_weights = clip_weights * mixup_weights
+            # ------ Log outputs ------
+            extra_metrics['eff_loss'] = eff_loss
+            extra_metrics['responder_loss'] = responder_loss
+            extra_outputs['clip/weights'] = clip_weights
+            extra_outputs['responder_prob'] = gate
+            extra_outputs['responder_prob_target'] = responder_target
             # Log data distributions
             extra_outputs[REGISTRY_KEYS.CLS_EFF_KEY] = weights
             extra_outputs['eff_hat'] = eff_hat
             # Log T distribution
             extra_outputs['T_align_dist'] = T_i
-            # Keep track of last model T gamma for inference
-            self.last_t_gamma = T_gamma
-            # Pass gate as weights
-            clip_weights = gate
-            extra_outputs['clip/weights'] = eff_hat
-            extra_outputs['responder_prob'] = gate
-            extra_outputs['responder_prob_target'] = responder_target
         else:
             # Use actual weights for clip
             clip_weights = None
             T_i = None
         # Log global temperature
         extra_metrics['T_align'] = T_align
-        
+
+        # Calculate class similarities — use pre-normalized cls2z
+        if local_predictions:
+            local_targets = torch.arange(self.n_labels, device=cls2z.device)
+            # Add null targets to logits
+            if self.cls_emb.use_null_proxy:
+                # Determine targets
+                all_targets = torch.arange(cls2z.size(0), device=cls2z.device)
+                null_targets = all_targets[all_targets >= self.n_cls]
+                local_targets = torch.cat([local_targets, null_targets])
+            # Subset to local targets (use both raw and normalized)
+            _cls_emb: torch.Tensor = cls2z[local_targets]
+            _cls_emb_norm: torch.Tensor = cls2z_norm[local_targets]
+            n_cls = self.n_labels
+        else:
+            # Use all available targets
+            _cls_emb = cls2z
+            _cls_emb_norm = cls2z_norm
+            n_cls = self.n_cls
+
+        if io.non_zero(contrastive_weight):
+            # Get supcon loss and add to total loss — pass pre-normalized z
+            supcon_loss, pos_per_sample = self.clip_loss.cross_context_supcon_loss(
+                z=z_shared_norm,
+                cls_emb=_cls_emb_norm,
+                labels=cls,
+                contexts=ctx,
+                gate=clip_weights,
+                temperature=0.2,
+                pre_normalized=True,
+            )
+            extra_metrics['supcon_loss'] = supcon_loss
+            extra_metrics['pos_per_sample'] = pos_per_sample
+            total_loss = total_loss + contrastive_weight * supcon_loss
+
         # Add alignment loss if non-zero weight
         if io.non_zero(cls_align_weight):
-            # Adversial context loss
-            if adv_ctx_weight > 0:
-                L_adv_ctx, ctx_pred, ctx_labels = self.adversarial_context_loss(z_shared, ctx)
-                total_loss = total_loss + adv_ctx_weight * L_adv_ctx
-                extra_metrics['L_adv_ctx'] = L_adv_ctx
-                extra_outputs['adv_ctx_pred'] = ctx_pred
-                extra_outputs['adv_ctx_labels'] = ctx_labels
-            
-            # Get augmented aligment output
-            if self.training and self.augmentation is not None and aug_weight > 0:
-                aug_align_out = self.get_augmented_alignment(
-                    inference_outputs, cls_emb=cls_emb, T=T_align, g=g, use_posterior_mean=use_posterior_mean,
-                )
-                n_aug = aug_align_out[MODULE_KEYS.Z_SHARED_KEY].size(0)
-                # Set initial weights if None
-                clip_weights = torch.ones_like(cls, device=cls.device)
-                # Update clip loss inputs
-                z_shared = torch.cat(
-                    [z_shared, aug_align_out[MODULE_KEYS.Z_SHARED_KEY]], dim=0
-                )
-                cls = torch.cat((cls, aug_align_out[MODULE_KEYS.LABEL_KEY]), dim=0)
-                ctx = torch.cat((ctx, aug_align_out[MODULE_KEYS.BATCH_INDEX_KEY]), dim=0)
-                # Update loss kw args
-                lo_kwargs['true_labels'] = cls
-                # Update weights
-                clip_weights = torch.cat([clip_weights, torch.ones(n_aug, device=cls.device) * aug_weight], dim=0)
-            
-            # Calculate class similarities
-            if local_predictions:
-                local_targets = torch.arange(self.n_labels, device=cls2z.device)
-                # Add null targets to logits
-                if self.cls_emb.use_null_proxy:
-                    # Determine targets
-                    all_targets = torch.arange(cls2z.size(0), device=cls2z.device)
-                    null_targets = all_targets[all_targets >= self.n_cls]
-                    local_targets = torch.cat([local_targets, null_targets])
-                # Subset to local targets
-                _cls_emb: torch.Tensor = cls2z[local_targets]
-                n_cls = self.n_labels
-            else:
-                # Use all available targets
-                _cls_emb = cls2z
-                n_cls = self.n_cls
-                
-            # Calculate individual alignment losses
+            # Weight clip loss by dataset support
+            if self.ctx_weights is not None:
+                clip_weights = self.ctx_weights[ctx.flatten()]
+            # Compute full similarity matrix once (no temperature) — reused for all clip logits
+            full_sim = z_shared_norm @ _cls_emb_norm.T
+            # Calculate individual alignment losses — pass precomputed sim matrix
             alignment_losses: dict = self.clip_loss(
                 z=z_shared,
                 y=cls.flatten(),
@@ -1449,18 +1637,19 @@ class XPert(VAE):
                 k=clip_k,
                 weights=clip_weights,
                 T_i=T_i,
+                z_norm=z_shared_norm,
+                emb_norm=_cls_emb_norm,
+                full_sim=full_sim,
             )
             # Add margins to extra outputs
             extra_outputs['clip/margin'] = alignment_losses.pop('clip/margin', None)
-            # Get clip logits
-            _T = T_i if T_i is not None else T_align
-            logits = self.clip_loss._logits_z2c(z_shared, _cls_emb, T=_T)
+            # Full logits are returned directly from clip_loss (already over all local targets)
+            logits = alignment_losses.pop('clip/logits')
 
             # Add combined alignment loss to final loss
             align_loss = alignment_losses.pop(LOSS_KEYS.LOSS)
-            
+
             # Add some regularizers to class embedding
-            # TODO: add scheduled weights
             emb_prot_div_reg = self.cls_emb.prototype_div_reg(_cls_emb)
             extra_metrics['emb/prot_div_reg'] = emb_prot_div_reg
             align_loss = align_loss + 0.01 * emb_prot_div_reg
@@ -1485,9 +1674,9 @@ class XPert(VAE):
                 # Set to given weight
                 else:
                     self.cls_align_weight = cls_align_weight
-                    
-                # Log clip weight
-                extra_metrics['clip/weight'] = self.cls_align_weight
+            
+            # Log clip weight
+            extra_metrics['clip/weight'] = self.cls_align_weight
             
             # Add alignment loss to total loss
             total_loss = total_loss + self.cls_align_weight * align_loss
@@ -1509,16 +1698,3 @@ class XPert(VAE):
         # Set total loss
         lo_kwargs[LOSS_KEYS.LOSS] = total_loss
         return LossOutput(**lo_kwargs)
-
-    def on_load(self, model: BaseModelClass):
-        """Sync model adata manager on load"""
-        manager = model.get_anndata_manager(model.adata, required=True)
-        source_version = manager._source_registry[_constants._SCVI_VERSION_KEY]
-        version_split = source_version.split('.')
-
-        if int(version_split[0]) >= 1 and int(version_split[1]) >= 1:
-            return
-
-        # need this if <1.1 model is resaved with >=1.1 as new registry is
-        # updated on setup
-        manager.registry[_constants._SCVI_VERSION_KEY] = source_version

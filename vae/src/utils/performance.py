@@ -42,11 +42,15 @@ def performance_metric(actual, pred, labels, lib=None, mode='test'):
         df_cmp = compare_gene_pairs(actual, pred, gene2p)
         actual = df_cmp.actual
         pred = df_cmp.pathway_predicted
+    # Transform to string series
+    actual = pd.Series(actual, dtype=str)
+    pred = pd.Series(pred, dtype=str)
+    labels = pd.Series(labels, dtype=str)
     # Calculate metrics for new predictions
     cls_report = precision_recall_fscore_support(
-        actual.values.astype(str),
-        pred.values.astype(str),
-        labels=labels.values.astype(str),
+        actual,
+        pred,
+        labels=labels,
         average=None, 
         zero_division=np.nan)
     m = pd.DataFrame(cls_report, index=['precision', 'recall', 'f1-score', 'support'], columns=labels).T
@@ -176,157 +180,151 @@ def compare_gene_pairs(actual_genes, predicted_genes, gene2pathways):
         })
     return pd.DataFrame(rows)
 
-def calculate_prediction_stats(
-        y: np.ndarray, 
-        is_hit: np.ndarray, 
-        hit_idx: np.ndarray, 
-        top_n: int, 
-        labels: np.ndarray, 
-        top_predictions: np.ndarray, 
-        top_random_predictions: np.ndarray, 
-        is_random_hit: np.ndarray, 
-        predictions: pd.DataFrame
-    ) -> pd.DataFrame:
-    """Calculate basic statistics for predictions."""
-    stats_per_label = pd.DataFrame({
-        'y': np.concatenate([y[is_hit == 1], y[is_hit == 0]]),
-        'idx': np.concatenate([(top_n + 1 - hit_idx[is_hit == 1]) / (top_n + 1), np.repeat(0, np.sum(is_hit == 0))]),
-        'label': np.concatenate([labels[is_hit == 1], labels[is_hit == 0]]),
-        'prediction': np.concatenate([y[is_hit == 1], top_predictions[is_hit == 0][:, -1]]),
-        'random_prediction': np.concatenate([y[is_random_hit == 1], top_random_predictions[is_random_hit == 0][:, -1]])
-    })
-    stats_per_label['pred_label'] = predictions.columns[stats_per_label.prediction.values.astype(int)]
-    stats_per_label['random_pred_label'] = predictions.columns[stats_per_label.random_prediction.values.astype(int)]
-    return stats_per_label
-
-def calculate_metrics_for_group(
-        adata: ad.AnnData,
-        tmp_mask: np.ndarray, 
-        y: np.ndarray, 
-        max_idx: np.ndarray, 
-        random_max_idx: np.ndarray, 
-        predictions: pd.DataFrame, 
-        top_n: int, 
-        lib: dict | None,
-        cls_label: str = 'perturbation'
-    ) -> pd.DataFrame:
-    """Calculate metrics for a specific group and top_n value."""
-    idx = np.where(tmp_mask)[0]
-    tmp = adata[tmp_mask]
-    y = y[idx]
-    labels = tmp.obs[cls_label].values
-    
-    # Get top predictions and hits
-    top_predictions = max_idx[idx,-top_n:]
-    hit_mask = top_predictions == np.array(y)[:, np.newaxis]
-    hit_idx = np.argmax(hit_mask, axis=1)
-    is_hit = np.any(hit_mask, axis=1).astype(int)
-    
-    # Get random predictions and hits
-    top_random_predictions = random_max_idx[idx,-top_n:]
-    random_hit_mask = top_random_predictions == np.array(y)[:, np.newaxis]
-    is_random_hit = np.any(random_hit_mask, axis=1).astype(int)
-    
-    stats_per_label = calculate_prediction_stats(
-        y, is_hit, hit_idx, top_n, labels, top_predictions, 
-        top_random_predictions, is_random_hit, predictions
-    )
-    
-    # Transform labels
-    actual = stats_per_label.label.astype(str)
-    pred = stats_per_label.pred_label.astype(str)
-    random_pred = stats_per_label.random_pred_label.astype(str)
-    l = predictions.columns.astype(str)
-    
-    # Calculate metrics
-    metrics = pd.concat([
-        performance_metric(actual, pred, l, lib=None, mode='test'),
-        performance_metric(actual, random_pred, l, lib=None, mode='random')
-    ])
-    metrics['use_pathway'] = False
-    
-    if lib is not None:
-        pw_metrics = pd.concat([
-            performance_metric(actual, pred, l, lib=lib, mode='test'),
-            performance_metric(actual, random_pred, l, lib=lib, mode='random')
-        ])
-        pw_metrics['use_pathway'] = True
-        metrics = pd.concat([metrics, pw_metrics])
-    
-    return metrics[metrics.support > 0].copy()
-
 def compute_top_n_predictions(
         adata: ad.AnnData, 
         split_key: str = 'split',
         context_key: str = 'dataset',
         labels_key: str = 'cls_label',
         ctrl_key: str | None = None,
-        n: int = 20, 
+        n: int = 10,
         use_pathways: bool = False,
         train_perturbations: list[str] | None = None, 
-        predictions_key: str = 'soft_predictions'
+        predictions_key: str = 'soft_predictions',
+        n_random_samples: int = 10,
+        verbose: bool = True,
     ) -> pd.DataFrame:
+    from tqdm.auto import tqdm
     """Compute top N predictions with metrics across groups and splits."""
-    # Subset adata to ignore control cells in classification
     if ctrl_key is not None and ctrl_key in adata.obs[labels_key].unique():
-        _adata = adata[adata.obs[labels_key]!=ctrl_key]
+        _adata = adata[adata.obs[labels_key] != ctrl_key]
     else:
         _adata = adata
     
-    # Extract soft predictions from adata
     predictions = _adata.obsm[predictions_key]
-    # Create pathway library if toggled
     if use_pathways:
         lib = build_gene2pathways(genes=predictions.columns.values)
     else:
         lib = None
-    # Match actual to prediction label indices
+    
     label_to_idx = {label: idx for idx, label in enumerate(predictions.columns)}
-    # Get prediction ranks
+    n_cells, n_classes = predictions.shape
+    
+    # Argsort model predictions once
     max_idx = np.argsort(predictions.values, axis=1)
-    # Get random prediction ranks
-    random_predictions = pd.DataFrame(np.random.random(predictions.shape), columns=predictions.columns, index=predictions.index)
-    random_max_idx = np.argsort(random_predictions.values, axis=1)
-    # Collect top n predictions for all groups
+    
+    # Pre-generate all random orderings once
+    random_max_idxs = []
+    for _ in range(n_random_samples):
+        rand = np.random.random((n_cells, n_classes))
+        random_max_idxs.append(np.argsort(rand, axis=1))
+    
     top_n_predictions = []
     splits = [None] if split_key is None else _adata.obs[split_key].unique()
-
-    # Process each data split individually
+    if verbose:
+        splits = tqdm(splits, desc='Splits', leave=True)
+    
     for split in splits:
         split_mask = slice(None) if split is None else (_adata.obs[split_key] == split)
         split_ad = _adata[split_mask]
-        # Process each context individually
-        for ct in split_ad.obs[context_key].unique():
+        
+        # Pre-slice for this split
+        split_max_idx = max_idx[split_mask]
+        split_random_max_idxs = [r[split_mask] for r in random_max_idxs]
+        split_y = split_ad.obs[labels_key].map(label_to_idx).values
+        
+        contexts = split_ad.obs[context_key].unique()
+        if verbose:
+            contexts = tqdm(contexts, desc=f'Contexts ({split})', leave=False)
+        
+        for ct in contexts:
             context_mask = (split_ad.obs[context_key] == ct)
-            # Calculate metrics for each top N prediction to consider
-            split_y = split_ad.obs[labels_key].map(label_to_idx).values
-            for top_n in np.arange(n) + 1:
-                metrics = calculate_metrics_for_group(
-                    adata=split_ad, 
-                    tmp_mask=context_mask, 
-                    y=split_y,
-                    max_idx=max_idx[split_mask], 
-                    random_max_idx=random_max_idx[split_mask], 
-                    predictions=predictions, 
-                    top_n=top_n,
-                    lib=lib,
-                    cls_label=labels_key
+            ctx_idx = np.where(context_mask)[0]
+            ctx_y = split_y[ctx_idx]
+            ctx_labels = split_ad[context_mask].obs[labels_key].values
+            
+            # Pre-slice model and random predictions for this context
+            ctx_max_idx = split_max_idx[ctx_idx]
+            ctx_random_max_idxs = [r[ctx_idx] for r in split_random_max_idxs]
+            
+            top_n_range = np.arange(n) + 1
+            if verbose:
+                top_n_range = tqdm(top_n_range, desc=f'Top-N ({ct})', leave=False)
+            
+            for top_n in top_n_range:
+                # --- Model predictions ---
+                metrics = _compute_metrics_from_sliced(
+                    ctx_y, ctx_labels, ctx_max_idx, top_n,
+                    predictions, lib, mode='test',
                 )
                 metrics['top_n'] = top_n
                 metrics[context_key] = ct
                 if split_key is not None:
                     metrics[split_key] = split
                 top_n_predictions.append(metrics)
-    # Combine prediction metrics
+                
+                # --- Random baseline: batch over pre-generated orderings ---
+                random_metrics_list = []
+                for ctx_rand in ctx_random_max_idxs:
+                    rm = _compute_metrics_from_sliced(
+                        ctx_y, ctx_labels, ctx_rand, top_n,
+                        predictions, lib, mode='random',
+                    )
+                    random_metrics_list.append(rm)
+                
+                # Average random metrics
+                random_metrics = pd.concat(random_metrics_list)
+                numeric_cols = random_metrics.select_dtypes(include=np.number).columns
+                random_avg = random_metrics.groupby(random_metrics.index)[numeric_cols].mean()
+                for col in random_metrics.columns:
+                    if col not in numeric_cols:
+                        random_avg[col] = random_metrics_list[0][col]
+                
+                random_avg['top_n'] = top_n
+                random_avg[context_key] = ct
+                if split_key is not None:
+                    random_avg[split_key] = split
+                top_n_predictions.append(random_avg)
+    
     top_n_predictions = pd.concat(top_n_predictions, axis=0)
     top_n_predictions['label'] = top_n_predictions.index
-    # Add informations about zero-shot predictions
+    
     if train_perturbations is not None:
         top_n_predictions['is_training_perturbation'] = top_n_predictions.label.isin(train_perturbations)
-    # Overwrite split labels as random
-    random_mask = top_n_predictions['mode']=='random'
-    top_n_predictions.loc[random_mask,split_key] = 'random'
+    
+    random_mask = top_n_predictions['mode'] == 'random'
+    top_n_predictions.loc[random_mask, split_key] = 'random'
     return top_n_predictions
+
+
+def _compute_metrics_from_sliced(
+    y: np.ndarray,
+    labels: np.ndarray,
+    max_idx: np.ndarray,
+    top_n: int,
+    predictions: pd.DataFrame,
+    lib: dict | None,
+    mode: str = 'test',
+) -> pd.DataFrame:
+    """Compute metrics from pre-sliced arrays. No adata indexing needed."""
+    top_predictions = max_idx[:, -top_n:]
+    hit_mask = top_predictions == y[:, np.newaxis]
+    is_hit = np.any(hit_mask, axis=1).astype(int)
+    
+    pred_labels = np.where(is_hit == 1, y, top_predictions[:, -1])
+    
+    actual = labels.astype(str)
+    pred = predictions.columns[pred_labels.astype(int)].astype(str)
+    l = predictions.columns.astype(str)
+    
+    metrics = performance_metric(actual, pred, l, lib=None, mode=mode)
+    metrics['use_pathway'] = False
+    
+    if lib is not None:
+        pw_metrics = performance_metric(actual, pred, l, lib=lib, mode=mode)
+        pw_metrics['use_pathway'] = True
+        metrics = pd.concat([metrics, pw_metrics])
+    
+    return metrics[metrics.support > 0].copy()
 
 def collect_runs(base_dir: str):
     runs = []

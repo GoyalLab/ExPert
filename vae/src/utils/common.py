@@ -126,6 +126,24 @@ class GradientReversalFn(torch.autograd.Function):
 def grad_reverse(x: torch.Tensor, lamba_=1.0):
     return GradientReversalFn.apply(x, lamba_)
 
+class GradientScaleFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.scale, None
+
+def grad_scale(x: torch.Tensor, scale: float = 1.0):
+    """Scale gradients flowing back through x by `scale`. 0.0 = full detach, 1.0 = pass-through."""
+    if scale == 1.0:
+        return x
+    if scale == 0.0:
+        return x.detach()
+    return GradientScaleFn.apply(x, scale)
+
 
 def run_hyperparameter_search(
     data_module: pl.LightningDataModule,

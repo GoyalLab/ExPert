@@ -17,16 +17,17 @@ class DataSplitter(pl.LightningDataModule):
     """
     General data splitter supporting both supervised and contrastive training setups.
 
-    loader_type: {'supervised', 'contrastive', 'vanilla'}
+    loader_type: {'supervised', 'contrastive', 'default'}
         Controls which data loader is used.
     """
 
     def __init__(
         self,
         adata_manager: AnnDataManager,
-        loader_type: Literal['balanced', 'vanilla'] = 'balanced',
+        loader_type: Literal['balanced', 'default'] = 'balanced',
         train_size: float | None = 0.9,
         validation_size: float | None = None,
+        test_size: float | None = None,
         shuffle_set_split: bool = True,
         n_samples: int | None = 500,
         batch_size: int = 512,
@@ -50,6 +51,7 @@ class DataSplitter(pl.LightningDataModule):
         min_contexts_per_class: int | None = None,
         cap_per_group: int | None = None,
         min_dataset_fraction: float = 0.5,
+        weights_mode: Literal['labels', 'batches', 'both'] = 'both',
         **kwargs,
     ):
         super().__init__()
@@ -58,6 +60,7 @@ class DataSplitter(pl.LightningDataModule):
         self.train_size_is_none = not bool(train_size)
         self.train_size = 0.9 if self.train_size_is_none else float(train_size)
         self.validation_size = validation_size
+        self.test_size = test_size
         self.shuffle_set_split = shuffle_set_split
         self.drop_last = drop_last
         self.data_loader_kwargs = kwargs
@@ -72,6 +75,7 @@ class DataSplitter(pl.LightningDataModule):
         self.use_balanced_weights = use_balanced_weights
         self.use_balanced_epochs = use_balanced_epochs
         self.use_contrastive_loader = use_contrastive_loader
+        self.weights_mode = weights_mode
         
         self.batch_size = batch_size
         self.ctrl_class = ctrl_class
@@ -110,39 +114,73 @@ class DataSplitter(pl.LightningDataModule):
         """Split indices in train/test/val sets."""
         # === Split logic (identical to contrastive) ===
         if self.cache_indices is None:
+            # Define OOD test indices optionally by different label
+            split_ctxs = self.contexts if self.contexts is not None else self.batches
+            # Always statify based on batch label
+            ref_ctxs = self.batches
             if self.test_context_labels is not None:
                 # Ensure test contexts is an interable
                 test_ctxs = [self.test_context_labels] if isinstance(self.test_context_labels, str) else self.test_context_labels
-                ref_ctxs = self.contexts if self.contexts is not None else self.batches
-                test_mask = np.isin(ref_ctxs, test_ctxs)
+                test_mask = np.isin(split_ctxs, test_ctxs)
                 base_idx = self.indices[~test_mask]
-                test_idx = self.indices[test_mask]
+                ood_test_idx = self.indices[test_mask]
             else:
                 base_idx = self.indices
-                test_idx = []
+                ood_test_idx = []
 
-            # Stratified split for reproducibility
-            class_labels = self.labels[base_idx]
-            train_idx, val_idx = train_test_split(
+            # Create joint stratification labels
+            strat_labels = np.array([
+                f"{lbl}_{ctx}" for lbl, ctx in zip(self.labels[base_idx], ref_ctxs[base_idx])
+            ])
+
+            # First split: train vs (val + test)
+            train_idx, temp_idx = train_test_split(
                 base_idx,
                 train_size=self.train_size,
-                stratify=class_labels,
+                stratify=strat_labels,
                 shuffle=self.shuffle_set_split,
                 random_state=settings.seed,
             )
+            # Recompute strat labels for remaining set
+            temp_strat = np.array([
+                f"{lbl}_{ctx}" for lbl, ctx in zip(self.labels[temp_idx], ref_ctxs[temp_idx])
+            ])
 
+            # Determine val/test proportions relative to temp set
+            if self.validation_size is not None and self.test_size is not None:
+                val_ratio = self.validation_size / (self.validation_size + self.test_size)
+            # Use 50/50
+            else:
+                val_ratio = 0.5
+            # Split remaining cells into validation and id test
+            val_idx, test_idx = train_test_split(
+                temp_idx,
+                train_size=val_ratio,
+                stratify=temp_strat,
+                shuffle=self.shuffle_set_split,
+                random_state=settings.seed,
+            )
+            # Create split indices
             indices_train = np.array(train_idx)
             indices_val = np.array(val_idx)
             indices_test = np.array(test_idx)
+            indices_ood_test = np.array(ood_test_idx)
         else:
             indices_train = np.array(self.cache_indices.get("train"))
             indices_val = np.array(self.cache_indices.get("val"))
             indices_test = np.array(self.cache_indices.get("test"))
+            indices_ood_test = np.array(self.cache_indices.get("ood_test"))
 
         # === Assign splits ===
         self.train_idx = indices_train.astype(int)
         self.val_idx = indices_val.astype(int)
         self.test_idx = indices_test.astype(int)
+        self.ood_test_idx = indices_ood_test.astype(int)
+        # Setup stats
+        self.n_train = self.train_idx.shape[0]
+        self.n_val = self.val_idx.shape[0]
+        self.n_test = self.test_idx.shape[0]
+        self.n_ood_test = self.ood_test_idx.shape[0]
 
         # === Subset metadata ===
         self.train_labels = self.labels[self.train_idx]
@@ -151,11 +189,14 @@ class DataSplitter(pl.LightningDataModule):
         self.val_batches = self.batches[self.val_idx]
         self.test_labels = self.labels[self.test_idx] if len(self.test_idx) else None
         self.test_batches = self.batches[self.test_idx] if len(self.test_idx) else None
+        self.ood_test_labels = self.labels[self.ood_test_idx] if len(self.ood_test_idx) else None
+        self.ood_test_batches = self.batches[self.ood_test_idx] if len(self.ood_test_idx) else None
 
         # === Loader selection === use AnnDataLoader as fallback
         self.loader_class_train = AnnDataLoader
         self.loader_class_val = AnnDataLoader
         self.loader_class_test = AnnDataLoader
+        self.loader_class_ood_test = AnnDataLoader
 
         # Assign special loader types
         if "train" in self.use_special_for_split:
@@ -173,6 +214,8 @@ class DataSplitter(pl.LightningDataModule):
             indices = self.val_idx
         elif mode == "test":
             indices = self.test_idx
+        elif mode == "ood_test":
+            indices = self.ood_test_idx
         else:
             raise ValueError(f"Invalid split {mode}")
         return {
@@ -195,6 +238,9 @@ class DataSplitter(pl.LightningDataModule):
         elif mode == "test":
             labels = self.test_labels
             batches = self.test_batches
+        elif mode == "ood_test":
+            labels = self.ood_test_labels
+            batches = self.ood_test_batches
         else:
             raise ValueError(f"Invalid split {mode}")
         return {
@@ -207,7 +253,8 @@ class DataSplitter(pl.LightningDataModule):
             "min_contexts_per_class": self.min_contexts_per_class,
             "use_contrastive_loader": self.use_contrastive_loader,
             "min_dataset_fraction": self.min_dataset_fraction,
-            "cap_per_group": self.cap_per_group
+            "cap_per_group": self.cap_per_group,
+            "weights_mode": self.weights_mode
         }
         
     def _get_dataloader(self, mode: str):
@@ -221,7 +268,7 @@ class DataSplitter(pl.LightningDataModule):
         """
         kwargs = self.get_base_kwargs(mode)
         if mode in self.use_special_for_split:
-            if self.loader_type != "vanilla":
+            if self.loader_type != "default":
                 kwargs.update(self.get_special_kwargs(mode))    
         # Only shuffle train dataloader
         if mode != "train":
@@ -233,6 +280,8 @@ class DataSplitter(pl.LightningDataModule):
             dataloader_cls = self.loader_class_val
         elif mode == "test":
             dataloader_cls = self.loader_class_test
+        elif mode == "ood_test":
+            dataloader_cls = self.loader_class_ood_test
         else:
             raise ValueError(f"Invalid split {mode}")
         return dataloader_cls(self.adata_manager, **kwargs)
@@ -250,3 +299,8 @@ class DataSplitter(pl.LightningDataModule):
         if len(self.test_idx) == 0:
             return None
         return self._get_dataloader('test')
+    
+    def ood_test_dataloader(self):
+        if len(self.ood_test_idx) == 0:
+            return None
+        return self._get_dataloader('ood_test')

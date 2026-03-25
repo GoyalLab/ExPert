@@ -1,10 +1,9 @@
 import os
 from src.workflow_utils import (
-    load_configs, 
-    get_param_hash, 
-    save_config, 
-    read_data_sheet, 
-    check_config, 
+    load_configs,
+    get_param_hash,
+    save_config,
+    read_data_sheet,
     get_job_resources,
     estimate_resources
 )
@@ -46,7 +45,7 @@ DWNL_DIR = os.path.join(CACHE_DIR, 'raw')
 # process_dataset
 PROCESS_DIR = os.path.join(CACHE_DIR, 'processed')
 # filter_cells
-FILTER_DIR = os.path.join(CACHE_DIR, 'filtered')
+EFF_DIR = os.path.join(CACHE_DIR, 'efficiencies')
 # prepare_dataset
 PREPARE_DIR = os.path.join(CACHE_DIR, 'prepared')
 # HVG outputs
@@ -153,7 +152,16 @@ rule process_dataset:
 
 
 # 2.1 Filter cells based on perturbation efficiency
+PREPARE_INPUT = {
+    # Pre-processed dataset file
+    'dataset_file': os.path.join(PROCESS_DIR, "{dataset}.h5ad"),
+    # HVG pool
+    'pool': HVG_POOL,
+}
+# Calculate mixscale scores
 if config['mixscale_filter']:
+    # Add input
+    PREPARE_INPUT['scores_file'] = os.path.join(EFF_DIR, "{dataset}.csv")
     # Setup mixscale environment for mixscale runs
     rule setup_mixscale:
         output:
@@ -167,13 +175,13 @@ if config['mixscale_filter']:
             echo 'Settin up mixscale env'
             bash workflow/envs/setup_mixscale.sh > {output.setup_status}
             """
-    # Run mixscale for each dataset
+    # TODO: change output to be a csv file (scores series only), Run mixscale for each dataset
     rule mixscale:
         input:
             dataset_file = os.path.join(PROCESS_DIR, "{dataset}.h5ad"),
             setup_status = os.path.join(".snakemake/conda", ".mixscale_setup.txt")
         output:
-            filtered_file = os.path.join(FILTER_DIR, "{dataset}.h5ad")
+            scores_file = os.path.join(EFF_DIR, "{dataset}.csv")
         conda:
             "workflow/envs/mixscale.yaml"
         log:
@@ -203,20 +211,23 @@ if config['mixscale_filter']:
             """
             Rscript workflow/scripts/mixscale.R \\
             -i {input.dataset_file} \\
-            -o {output.filtered_file} \\
+            -o {output.scores_file} \\
             -d {params.min_deg} \\
             -t {params.ctrl_dev} \\
             --pcol {params.perturbation_col} \\
             -c {params.ctrl_key} \\
             -n {resources.cpus_per_task}
             """
+# Calculate custom mixscale scores
 elif config['efficiency_filter']:
-    # Run mixscale for each dataset
+    # Add input
+    PREPARE_INPUT['scores_file'] = os.path.join(EFF_DIR, "{dataset}.csv")
+    # Run custom python mixscale implementation for each dataset
     rule filter_cells_by_efficiency:
         input:
             dataset_file = os.path.join(PROCESS_DIR, "{dataset}.h5ad"),
         output:
-            filtered_file = os.path.join(FILTER_DIR, "{dataset}.h5ad")
+            scores_file = os.path.join(EFF_DIR, "{dataset}.csv")
         log:
             os.path.join(LOG, 'filter_cells_by_efficiency', "{dataset}.log")
         params:
@@ -241,21 +252,25 @@ elif config['efficiency_filter']:
             output = lambda wildcards: os.path.join(LOG, 'filter_cells_by_efficiency', f"{wildcards.dataset}.slurm.log")
         script:
             "workflow/scripts/efficiency_filter.py"
+# Skip efficiency step as input for prepare
 else:
-    # Skip this step and set output to previous step
-    FILTER_DIR = PROCESS_DIR
+    PREPARE_INPUT['scores_file'] = None
 
 
 # 3. Determine highly variable genes in each dataset
 rule determine_hvg:
     input:
-        os.path.join(FILTER_DIR, "{dataset}.h5ad")
+        os.path.join(PROCESS_DIR, "{dataset}.h5ad")
     output:
         os.path.join(HVG_DIR, "{dataset}_hvgs.csv")
     log:
         os.path.join(LOG, 'determine_hvg', "{dataset}.log")
     resources:
-        **get_job_resources(config['resources'], job_name='determine_hvg', output=os.path.join(LOG, 'determine_hvg', "{dataset}.slurm.log"))
+        **get_job_resources(
+            config['resources'], 
+            job_name='determine_hvg',
+            output = lambda wildcards: os.path.join(LOG, 'determine_hvg', f"{wildcards.dataset}.slurm.log")
+         )
     script:
         "workflow/scripts/determine_hvgs.py"
 
@@ -279,8 +294,7 @@ rule build_gene_pool:
 # 5. Prepare each dataset for the merge
 rule prepare_dataset:
     input:
-        pool = HVG_POOL,
-        dataset_file = os.path.join(FILTER_DIR, "{dataset}.h5ad"),
+        **PREPARE_INPUT
     output:
         prepared = os.path.join(PREPARE_DIR, "{dataset}.h5ad"),
         obs = os.path.join(OBS_DIR, "{dataset}.csv")
@@ -292,15 +306,15 @@ rule prepare_dataset:
     resources:
         time = config['resources']['jobs']['prepare_dataset']['time'],
         mem = lambda wc: estimate_resources(
-            os.path.join(FILTER_DIR, f"{wc.dataset}.h5ad"),
+            os.path.join(PROCESS_DIR, f"{wc.dataset}.h5ad"),
             resource_config=config["resources"],
-            factor=2,
+            factor=4,
             job_name='prepare_dataset'
         )['mem'],
         partition = lambda wc: estimate_resources(
-            os.path.join(FILTER_DIR, f"{wc.dataset}.h5ad"),
+            os.path.join(PROCESS_DIR, f"{wc.dataset}.h5ad"),
             resource_config=config["resources"],
-            factor=2,
+            factor=4,
             job_name='prepare_dataset'
         )['partition'],
         output = lambda wildcards: os.path.join(LOG, 'prepare', f"{wildcards.dataset}.slurm.log")
@@ -309,18 +323,14 @@ rule prepare_dataset:
 
 
 # 6. Merge datasets into meta-set
-
 rule merge_datasets:
     input:
-        obs_files = expand(os.path.join(OBS_DIR, "{dataset}.csv"), dataset=DATASET_NAMES),
-        pool = HVG_POOL,
         dataset_files = expand(os.path.join(PREPARE_DIR, "{dataset}.h5ad"), dataset=DATASET_NAMES)
     output:
         merged_set = MERGED_OUTPUT_FILE
     log:
         os.path.join(LOG, "merge.log")
     params:
-        meta_sheet = DATASET_SHEET,
         merge_method = config['merge_method']
     resources:
         **get_job_resources(config['resources'], job_name='merge_datasets', output=os.path.join(LOG, 'merge.slurm.log'))

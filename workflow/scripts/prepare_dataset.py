@@ -13,14 +13,15 @@ def prepare_dataset(dataset_file: str, pool_file: str, prepared_path: str, obs_p
 
 
 if __name__ == "__main__":
-    # handle logging
-    log_file = snakemake.log[0]
-    setup_logger(log_file)
     # execute dataset preparation
     try:
+        # handle logging
+        log_file = snakemake.log[0]
+        setup_logger(log_file)
         prepare_dataset(
             dataset_file=snakemake.input.dataset_file,
             pool_file=snakemake.input.pool,
+            scores_file=snakemake.input.scores_file,
             prepared_path=snakemake.output.prepared,
             obs_path=snakemake.output.obs,
             zero_pad=snakemake.params.zero_pad,

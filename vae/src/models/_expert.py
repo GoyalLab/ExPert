@@ -72,6 +72,8 @@ class ExPert(
     _LATENT_CLS_PROJ_KEY = f"{__qualname__}_latent_cls_proj"
     _LATENT_Z_SHARED_UMAP = f"{__qualname__}_latent_h_umap"
     _LATENT_UMAP = f"{__qualname__}_latent_umap"
+    _TRAINING_STATE_FNAME = 'training_state.pt'
+    _FINAL_MODEL_DNAME = 'model'
 
 
     def __init__(
@@ -85,12 +87,21 @@ class ExPert(
         cls_text_dict: dict | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
+        use_cpm: bool = False,
+        log_variational: bool = True,
+        use_ds_anchors: bool = False,
+        scale: bool = False,
         use_full_cls_emb: bool = False,
         use_gene_emb: bool = False,
+        use_ds_sim_weights: bool = False,
         ctrl_class: str | None = None,
+        experimental: bool = False,
+        reconstruct_raw_x: bool = True,
+        model_log_dir: str | None = None,
         **model_kwargs,
     ):
         super().__init__(adata)
+        self.experimental = experimental
         self._model_kwargs = dict(model_kwargs)
         # Save class text information for manual transformer training
         self.cls_text_dict = cls_text_dict
@@ -102,9 +113,22 @@ class ExPert(
         self.n_labels = self.summary_stats.n_labels
         # Whether to use the full class embedding
         self.use_full_cls_emb = use_full_cls_emb
-        # Create placeholder for log directory
-        self.model_log_dir = None
+        # Whether to calculate dataset specific mean expression anchors
+        self.use_ds_anchors = use_ds_anchors
+        # Whether to scale entire input adata.X
+        self.scale = scale
+        # These options are mutually exlcusive
+        if self.use_ds_anchors and self.scale:
+            raise ValueError(f'Options "use_ds_anchors" and "scale" are mutually exclusive.')
+        # Use dataset similarity matrix
+        self.use_ds_sim_weights = use_ds_sim_weights
         self.ctrl_class = ctrl_class
+        # Batch normalizations
+        self.use_cpm = use_cpm
+        self.log_variational = log_variational
+        # Check if adata.X is raw data or not
+        self.raw_x = self._x_is_raw()
+        self.reconstruct_raw_x = reconstruct_raw_x
 
         # Initialize indices and labels for this model
         self._setup()
@@ -138,15 +162,23 @@ class ExPert(
             cls_sim=cls_sim,
             cls_text_dict=self.cls_text_dict,
             cls_weights=self.cls_weights,
+            ctx_weights=self.ds_recon_weights,
             ctrl_class_idx=self.ctrl_class_idx,
             ctx_emb=self.ctx_emb,
             feat_masks=self.feat_masks,
+            ds_sim_weights=self.ds_sim_weights,
+            ds_mean_anchors=self.ds_mean_anchors,
+            ds_std_anchors=self.ds_std_anchors,
             gene_emb=self.gene_emb if self.use_gene_emb else None,
+            use_cpm=self.use_cpm,
+            log_variational=self.log_variational,
+            use_ds_anchors=self.use_ds_anchors,
             dropout_rate=dropout_rate,
             n_continuous_cov=self.summary_stats.get('n_extra_continuous_covs', 0),
             n_cats_per_cov=n_cats_per_cov,
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
+            reconstruct_raw_x=self.reconstruct_raw_x,
             **self._model_kwargs,
         )
         # Fresh initialization, set params accordingly
@@ -154,14 +186,22 @@ class ExPert(
         self.init_params_ = self._get_init_params(locals())
         self.was_pretrained = False
         self.is_evaluated = False
+        # Stage counter: tracks how many checkpoint-resume cycles this model has been through
+        self._training_stage = 0
+        self._from_checkpoint = False
+        # Setup versioned log directory and logger
+        self._base_log_dir = model_log_dir
+        self._version_dir = None
+        self.model_log_dir = None
+        self._logger = None
+        self._setup_log_dir(model_log_dir)
         # Give model summary
         self.n_unseen_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_unseen_labels'] if REGISTRY_KEYS.CLS_EMB_INIT in adata.uns else None
         self._model_summary_string = (
             f"{self.__class__} Model with the following params: \n"
             f"n_classes: {self.n_labels}, "
             f"n_unseen_classes: {self.n_unseen_labels}, \n"
-            f"n_contexts: {n_batch}, "
-            f"n_unseen_contexts: {self.n_unobs_ctx}, \n" if self.n_unobs_ctx > 0 else "\n"
+            f"n_contexts: {n_batch}, \n"
             f"use_gene_emb: {self.use_gene_emb}, \n"
             f"use_raw_text: {self.use_raw_text}"
         )
@@ -171,7 +211,28 @@ class ExPert(
         # Include control class information
         if self.ctrl_class is not None and self.ctrl_class_idx is not None:
             self._model_summary_string += f"\nctrl_class: {self.ctrl_class}\n"
+        # Display adata.X transformations
+        if self.transformations:
+            tstrs = '"' + ', '.join(self.transformations) + '"'
+            self._model_summary_string += f"\ntransformations: {tstrs}\n"
         
+    def _x_is_raw(self):
+        # For backed data, sample a small chunk to check
+        if self.adata.isbacked:
+            sample = self.adata.X[:min(1000, self.adata.n_obs)]
+            if sp.issparse(sample):
+                data = sample.data
+            else:
+                data = sample[sample != 0]
+        else:
+            X = self.adata.X
+            if sp.issparse(X):
+                data = X.data  # nonzero values only
+            else:
+                data = X[X != 0]
+        # Raw counts: all integers
+        return np.allclose(data, np.round(data), atol=1e-6)    
+
     def _setup_gene_emb(self):
         # Assign gene embedding
         if self.use_gene_emb:
@@ -183,7 +244,7 @@ class ExPert(
             ext_en_kw['use_ext_emb'] = True
             ext_en_kw['n_dim_gene_emb'] = emb_dim
             self._model_kwargs['extra_encoder_kwargs'] = ext_en_kw
-            log.info(f'Initialized gene embedding with {emb_dim} dimensions')
+            log.info(f'[Setup] Initialized gene embedding with {emb_dim} dimensions')
             # Convert to dense if sparse
             if sp.issparse(gene_emb):
                 gene_emb = gene_emb.todense()
@@ -202,11 +263,11 @@ class ExPert(
         # Get the matrix from .varm and check type
         feat_masks = self.adata.varm[feat_mask_key].T
         if not isinstance(feat_masks, np.ndarray):
-            raise ValueError(f'Feature mask has to be an np.ndarray with contexs as index, got {feat_masks.__class__}.')
+            raise ValueError(f'[Setup] Feature mask has to be an np.ndarray with contexs as index, got {feat_masks.__class__}.')
         # Get mask indices from .uns if they exist
         feat_mask_idx = self.adata.uns.get(REGISTRY_KEYS.FEAT_MASK_IDX_KEY)
         if feat_mask_idx is None:
-            raise KeyError(f'Missing feature mask index in adata.uns[{REGISTRY_KEYS.FEAT_MASK_IDX_KEY}]')
+            raise KeyError(f'[Setup] Missing feature mask index in adata.uns[{REGISTRY_KEYS.FEAT_MASK_IDX_KEY}]')
         # Ensure ordering is the same as index to batch order
         ordered_masks = []
         # Check each batch index
@@ -214,7 +275,7 @@ class ExPert(
             dataset_name = self.idx_to_batch.iloc[batch_idx]
             # Error if training data index is missing in feature mask index
             if dataset_name not in feat_mask_idx:
-                raise KeyError(f"Batch '{dataset_name}' not found in feature mask index.")
+                raise KeyError(f"[Setup] Batch '{dataset_name}' not found in feature mask index.")
             # Match indices
             mask_row_idx = feat_mask_idx[dataset_name]
             ordered_masks.append(feat_masks[mask_row_idx])
@@ -222,7 +283,7 @@ class ExPert(
         ordered_masks = np.stack(ordered_masks)
         # Final shape sanity check
         if ordered_masks.shape[0] != len(self.idx_to_batch):
-            raise RuntimeError("Feature mask ordering mismatch with batch mapping.")
+            raise RuntimeError("[Setup] Feature mask ordering mismatch with batch mapping.")
         # Store as tensor
         self.feat_masks = torch.tensor(ordered_masks, dtype=torch.float32)
             
@@ -246,12 +307,12 @@ class ExPert(
             ctx_emb: pd.DataFrame = self.adata.uns[ctx_emb_key]
             # Get the embedding from adata and check if it's a dataframe
             if not isinstance(self.adata.uns[ctx_emb_key], pd.DataFrame):
-                raise ValueError(f'Context embedding has to be a dataframe with contexs as index, got {ctx_emb.__class__}.')
+                raise ValueError(f'[Setup] Context embedding has to be a dataframe with contexs as index, got {ctx_emb.__class__}.')
 
             # Get observed and unobserved context labels
             _obs_contexts_mask = self.idx_to_batch.isin(ctx_emb.index)
             if _obs_contexts_mask.sum() != self.idx_to_batch.shape[0]:
-                raise ValueError(f'Missing contexts in external context embedding. {self.idx_to_batch[~_obs_contexts_mask].values}')
+                raise ValueError(f'[Setup] Missing contexts in external context embedding. {self.idx_to_batch[~_obs_contexts_mask].values}')
             _obs_ctx_labels = self.idx_to_batch[_obs_contexts_mask]
             _unobs_ctx_labels = ctx_emb.index.difference(_obs_ctx_labels)
             self.n_unobs_ctx = _unobs_ctx_labels.shape[0]
@@ -262,6 +323,55 @@ class ExPert(
             # Convert to tensor
             self.ctx_emb = io.to_tensor(ctx_emb)
             
+    def _compute_dataset_weights_from_anchors(self):
+        """Dataset similarity from precomputed anchors."""
+        # Combine mean and std into a single descriptor per dataset
+        # Both carry information: mean = location bias, std = spread/noise profile
+        import torch.nn.functional as F
+        ds_means = self.ds_mean_anchors
+        ds_stds = self.ds_std_anchors
+        if ds_means is None or ds_stds is None:
+            return
+        descriptors = torch.cat([ds_means, ds_stds], dim=1)  # (n_datasets, 2*n_genes)
+        # Normalize descriptors
+        descriptors = F.normalize(descriptors, dim=-1)
+        # Pairwise cosine similarity
+        sim_matrix = descriptors @ descriptors.T
+        
+        # Convert to contrastive weights: dissimilar pairs = higher weight
+        weight_matrix = 1.0 - sim_matrix
+        weight_matrix.fill_diagonal_(0)
+        
+        # Normalize so mean weight = 1
+        mask = weight_matrix > 0
+        if mask.any():
+            weight_matrix[mask] /= weight_matrix[mask].mean()
+        
+        return weight_matrix.clamp(min=0.05)  # avoid zero weights
+            
+    def _setup_ds_sim(self):
+        """Set or calculate dataset similarity matrix for downstream weights."""
+        if not self.use_ds_sim_weights:
+            self.ds_sim_weights = None
+            return
+        # Add context embedding if given
+        ds_sim_registry = self.adata_manager.registry['field_registries'].get(REGISTRY_KEYS.DATASET_SIM_KEY, {})
+        if len(ds_sim_registry) != 0:
+            # Get registry keys for context embedding in adata
+            ds_sim_reg_key = ds_sim_registry.get('original_key')
+            ds_sim_key = ds_sim_registry['data_registry'].get('attr_key') if ds_sim_reg_key is None else ds_sim_reg_key
+            # Extract context embedding from adata
+            ds_sim_weights: np.ndarray = self.adata.uns[ds_sim_key]
+            # Get the embedding from adata and check if it's a dataframe
+            if not isinstance(ds_sim_weights, np.ndarray):
+                raise ValueError(f'[Setup] Context embedding has to be a dataframe with contexs as index, got {ds_sim_weights.__class__}.')
+            # Add dataset weights to model
+            self.ds_sim_weights = io.to_tensor(ds_sim_weights)
+        else:
+            log.info(f'[Setup] Calculating dataset similarities.')
+            # Calculate simiarities from dataset anchors
+            self.ds_sim_weights = self._compute_dataset_weights_from_anchors()
+            
     def _setup_labels(self):
         labels_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         self.original_label_key = labels_state_registry.original_key
@@ -269,6 +379,16 @@ class ExPert(
         self._code_to_label = dict(enumerate(self._label_mapping))
         self.idx_to_label = np.array(self._label_mapping)
         self.n_labels = len(self._label_mapping)
+
+    def _setup_cat_cov_labels(self):
+        cat_cov_reg = self.adata_manager.registry.get('field_registries').get(REGISTRY_KEYS.CAT_COVS_KEY).get('state_registry')
+        if not cat_cov_reg:
+            self.idx_to_cat_cov = None
+        else:
+            idx_to_cat_cov = []
+            for k, vs in cat_cov_reg['mappings'].items():
+                idx_to_cat_cov.extend(vs)
+            self.idx_to_cat_cov = np.array(idx_to_cat_cov)
 
     def _setup_class_embeddings(self):
         cls_emb_registry = self.adata_manager.registry["field_registries"].get(
@@ -325,7 +445,7 @@ class ExPert(
             return
 
         if self.cls_text_dict is None:
-            raise ValueError("Raw text mode enabled but no text dictionary provided.")
+            raise ValueError("[Setup] Raw text mode enabled but no text dictionary provided.")
         
         # Remove empty text entries
         self.cls_text_dict = {k: v for k, v in self.cls_text_dict.items() if isinstance(v, str) and len(v) > 0}
@@ -334,16 +454,20 @@ class ExPert(
         unseen = [k for k in self.cls_text_dict if k not in self._label_mapping]
 
         if len(observed) != self.n_labels:
-            raise ValueError("Missing class texts for observed labels.")
-
-        ordered_keys = sorted(observed) + sorted(unseen)
+            raise ValueError("[Setup] Missing class texts for observed labels.")
+        # Inlcude all or just observable keys in texts
+        if self.use_full_cls_emb:
+            ordered_keys = sorted(observed) + sorted(unseen)
+        else:
+            ordered_keys = sorted(observed)
+        # Subset and order texts
         self.cls_text_dict = {k: self.cls_text_dict[k] for k in ordered_keys}
 
         self.idx_to_label = np.array(ordered_keys)
         self.n_train_labels = len(observed)
         self.n_unseen_labels = len(unseen)
 
-        log.info(f"Registered {len(self.cls_text_dict)} class texts.")
+        log.info(f"[Setup] Registered {len(self.cls_text_dict)} class texts.")
         
     def _setup_control_class(self):
         self.ctrl_class_idx = None
@@ -353,13 +477,13 @@ class ExPert(
 
         # Ensure labels exist
         if self.idx_to_label is None:
-            raise RuntimeError("Labels must be initialized before setting control class.")
+            raise RuntimeError("[Setup] Labels must be initialized before setting control class.")
 
         matches = np.where(self.idx_to_label == self.ctrl_class)[0]
 
         if len(matches) == 0:
             log.warning(
-                f"Specified control class '{self.ctrl_class}' not found in labels. Ignoring."
+                f"[Setup] Specified control class '{self.ctrl_class}' not found in labels. Ignoring."
             )
             self.ctrl_class = None
             return
@@ -370,11 +494,11 @@ class ExPert(
         if self.cls_emb is not None:
             if self.ctrl_class_idx >= self.n_train_labels:
                 log.info(
-                    "Control class is not in training labels; embedding will be learned."
+                    "[Setup] Control class is not in training labels; embedding will be learned."
                 )
 
         log.info(
-            f"Registered control class '{self.ctrl_class}' at index {self.ctrl_class_idx}."
+            f"[Setup] Registered control class '{self.ctrl_class}' at index {self.ctrl_class_idx}."
         )
         
     def _setup_class_weights(self):
@@ -385,7 +509,128 @@ class ExPert(
         weights = 1.0 / np.sqrt(class_counts)
         weights = weights / weights.mean()
         self.cls_weights = torch.tensor(weights.values, dtype=torch.float32)
+        
+    def _setup_batch_weights(self):
+        """Inverse dataset frequency weights for reconstruction loss."""
+        ds_counts = self.adata.obs[self.original_batch_key].value_counts()
+        ds_counts = ds_counts[self.idx_to_batch]
+        weights = 1.0 / ds_counts
+        weights /= weights.mean()  # mean weight = 1
+        # Add to model
+        self.ds_recon_weights = torch.tensor(weights, dtype=torch.float32)
 
+    def _setup_dataset_anchors(self):
+        """Calculate dataset-specific expression anchors."""
+        if not self.use_ds_anchors:
+            self.ds_mean_anchors = None
+            self.ds_std_anchors = None
+            return
+        log.info(f'[Setup] Calculating dataset expression anchors.')
+        
+        X = self.adata.X.copy()
+        # Apply in-batch normalizations to calculate accurate anchors
+        if self.raw_x:
+            # Apply CPM normalization
+            if self.use_cpm:
+                if sp.issparse(X):
+                    row_sums = np.asarray(X.sum(axis=1)).flatten()
+                    row_sums = np.clip(row_sums, 1, None)
+                    diag = sp.diags(1e6 / row_sums)
+                    X = diag @ X
+                else:
+                    row_sums = X.sum(axis=1, keepdims=True)
+                    row_sums = np.clip(row_sums, 1, None)
+                    X = X / row_sums * 1e6
+            # Apply log1p normalization
+            if self.log_variational:
+                if sp.issparse(X):
+                    X.data = np.log1p(X.data)
+                else:
+                    X = np.log1p(X)
+        
+        # Get per-dataset feature masks
+        feat_masks = self.feat_masks  # (n_datasets, n_genes)
+        
+        batch_labels = self.adata.obs[self.original_batch_key].values
+        n_genes = X.shape[1]
+        n_datasets = len(self.idx_to_batch)
+        
+        mean_matrix = np.zeros((n_datasets, n_genes), dtype=np.float32)
+        std_matrix = np.ones((n_datasets, n_genes), dtype=np.float32)  # default 1 not 0
+        
+        for i, ds in enumerate(self.idx_to_batch):
+            # Get dataset-specific expression matrix
+            ds_data = X[batch_labels == ds]
+            
+            # Get feature mask for this dataset
+            if feat_masks is not None:
+                if isinstance(feat_masks, torch.Tensor):
+                    fmask = feat_masks[i].cpu().numpy().astype(bool)
+                else:
+                    fmask = np.asarray(feat_masks[i]).astype(bool)
+            else:
+                fmask = np.ones(n_genes, dtype=bool)
+            
+            # Compute stats only on observed genes
+            if sp.issparse(ds_data):
+                ds_observed = ds_data[:, fmask]
+                m = np.asarray(ds_observed.mean(axis=0)).flatten()
+                sq = ds_observed.copy()
+                sq.data **= 2
+                mean_sq = np.asarray(sq.mean(axis=0)).flatten()
+                var = np.maximum(mean_sq - m ** 2, 0)
+                mean_matrix[i, fmask] = m
+                std_matrix[i, fmask] = np.sqrt(var).clip(min=0.1)
+            else:
+                ds_observed = ds_data[:, fmask]
+                mean_matrix[i, fmask] = ds_observed.mean(axis=0)
+                std_matrix[i, fmask] = ds_observed.std(axis=0).clip(min=0.1)
+        # Assign to class
+        self.ds_mean_anchors = io.to_tensor(mean_matrix)
+        self.ds_std_anchors = io.to_tensor(std_matrix)
+
+    def _setup_X(self):
+        """Apply normalizations to x directly and reconstruct that if option is toggled."""
+        self.transformations = []
+        # Skip normalization if we reconstruct raw data or if input data is already normalized
+        if self.reconstruct_raw_x or not self.raw_x:
+            logging.info(f'[Setup] Using original adata.X for reconstruction.')
+            return
+        import scanpy as sc
+        # Apply CPM normalization
+        if self.use_cpm:
+            logging.info(f'[Setup] Applying CPM')
+            sc.pp.normalize_total(self.adata, target_sum=1e6)
+            # Disable option for in-batch normalization
+            self.use_cpm = False
+            self.transformations.append('cpm')
+        # Apply log1p normalization
+        if self.log_variational:
+            logging.info(f'[Setup] Applying Log1p')
+            sc.pp.log1p(self.adata)
+            # Disable option for in-batch
+            self.log_variational = False
+            self.transformations.append('log1p')
+        # Apply per-dataset scaling
+        if self.use_ds_anchors:
+            logging.info(f'[Setup] Applying dataset-wise scaling')
+            # Get dataset-specific means and stds
+            bmap = {x: i for i, x in enumerate(self.idx_to_batch)}
+            batch_index = np.array([bmap[x] for x in self.adata.obs[self.original_batch_key]])
+            ds_mean = self.ds_mean_anchors[batch_index].detach().cpu().numpy()
+            ds_std = self.ds_std_anchors[batch_index].detach().cpu().numpy()
+            # Scale adata.X for dataset-specific mean and std
+            X = (self.adata.X - ds_mean) / (ds_std + 1e-6)
+            self.adata.X = sp.csr_matrix(X)
+            # Disable option for in-batch
+            self.use_ds_anchors = False
+            self.transformations.append('ds_scale')
+        elif self.scale:
+            logging.info(f'[Setup] Scaling')
+            # There is no in-batch option for that so it doesn't need to be toggled off
+            sc.pp.scale(self.adata)
+            self.transformations.append('scale')
+        
     def _setup(self):
         """Setup adata for training. Prepare embeddings."""
         # Initialize both embeddings as None
@@ -400,6 +645,8 @@ class ExPert(
         self._setup_ctx_emb()
         # Setup class labels
         self._setup_labels()
+        # Setup covariate labels
+        self._setup_cat_cov_labels()
         # Setup class embeddings
         self._setup_class_embeddings()
         # Setup class texts
@@ -408,7 +655,52 @@ class ExPert(
         self._setup_control_class()
         # Setup class weights based on occurence in data
         self._setup_class_weights()
+        # Setup dataset weights based on support
+        self._setup_batch_weights()
+        # Setup dataset expression anchors
+        self._setup_dataset_anchors()
+        # Setup dataset similarity weights if given
+        self._setup_ds_sim()
+        # Setup adata.X if needed
+        self._setup_X()
         
+    def _setup_log_dir(self, base_log_dir: str | None) -> None:
+        """Setup versioned log directory under base_log_dir.
+
+        Layout::
+
+            <base_log_dir>/
+              {name}_v0/                      ← version_dir (shared across stages)
+                stage_0/                      ← model_log_dir (per-stage: tb logs, evaluate output)
+                stage_1/
+              {name}_v1/                      ← new version (fresh run)
+                ...
+
+        - ``self._version_dir``: ``{base}/{name}_vN/`` — shared across stages.
+        - ``self.model_log_dir``: ``{base}/{name}_vN/stage_M/`` — per-stage outputs and tb logs.
+        """
+        if base_log_dir is None:
+            return
+        import re
+        import lightning.pytorch as _pl
+        os.makedirs(base_log_dir, exist_ok=True)
+        # Find existing version directories
+        pattern = re.compile(rf'^{re.escape(self._name)}_v(\d+)$')
+        existing = []
+        for entry in os.listdir(base_log_dir):
+            m = pattern.match(entry)
+            if m and os.path.isdir(os.path.join(base_log_dir, entry)):
+                existing.append(int(m.group(1)))
+        version = (max(existing) + 1) if existing else 0
+        # Set logging output version and path
+        self._version = version
+        self._version_str = f'{self._name}_v{version}'
+        self._logger = _pl.loggers.TensorBoardLogger(
+            save_dir=base_log_dir, name='', version=self._version_str,
+        )
+        self.model_log_dir = self._logger.log_dir
+        self._ckpt_dir = os.path.join(self.model_log_dir, 'checkpoints')
+
     def print_summary(self, max_depth: int = 3) -> None:
         """Print overview of module"""
         from pytorch_lightning.utilities.model_summary import ModelSummary
@@ -429,7 +721,11 @@ class ExPert(
         else:
             return ctx_emb
 
-    def get_cls_emb(self, use_full_cls_emb: bool | None = None, return_dataframe: bool = False) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def get_cls_emb(
+            self, 
+            use_full_cls_emb: bool | None = None, 
+            return_dataframe: bool = False,
+        ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Helper getter to return either training or full class embedding"""
         if self.cls_emb is None:
             return None, None
@@ -742,9 +1038,6 @@ class ExPert(
         from tqdm import tqdm
         # Check if model has been trained
         self._check_if_trained(warn=False)
-        # Log usage of gene embeddings
-        if self.gene_emb is not None:
-            log.info(f'Using model gene embeddings ({self.gene_emb.shape})')
         # Ensure adata has the correct features
         if adata is not None:
             adata = self.align_model_features(adata, inplace=False)
@@ -822,7 +1115,6 @@ class ExPert(
                     x,
                     batch_index=batch,
                     label=l,
-                    g=self.gene_emb,
                     cat_covs=cat_covs,
                     cont_covs=cont_covs,
                     use_posterior_mean=use_posterior_mean,
@@ -999,6 +1291,13 @@ class ExPert(
                 }
             },
         }
+    
+    def _set_data_split_indices(self, data_splitter: torch.nn.Module):
+        """Manually set split indices."""
+        self.train_indices = getattr(data_splitter, "train_idx", None)
+        self.validation_indices = getattr(data_splitter, "val_idx", None)
+        self.test_indices = getattr(data_splitter, "test_idx", None)
+        self.ood_test_indices = getattr(data_splitter, "ood_test_idx", None)
         
     @devices_dsp.dedent
     def train(
@@ -1006,14 +1305,14 @@ class ExPert(
         config: dict[str, Any], 
         minify_adata: bool = False,
         cache_data_splitter: bool = True,
+        verbose: bool = True,
     ):
         """Train the model.
 
         Parameters
         ----------
-        TODO: fill in parameteres
-        data_params: dict
-            **kwargs for src.modules._splitter.ContrastiveDataSplitter
+        config: dict[str, dict]
+            full config with subconfigs for model setup and training
         """
         from src.tune._statics import CONF_KEYS
         # Unpack run config dictionary
@@ -1050,13 +1349,14 @@ class ExPert(
         # Add control class index to data params
         data_params['ctrl_class'] = self.ctrl_class
 
-        # Cache indices if model was pre-trained
+        # Cache indices if model was pre-trained or resumed from checkpoint
         if self.was_pretrained and cache_data_splitter:
             log.info(f'Re-using pre-training data split.')
             cache_indices = {
                 'train': self.train_indices,
                 'val': self.validation_indices,
-                'test': getattr(self, 'test_indices', np.array([]))
+                'test': getattr(self, 'test_indices', np.array([])),
+                'ood_test': getattr(self, 'ood_test_indices', np.array([]))
             }
             # Add to splitter params
             data_params['cache_indices'] = cache_indices
@@ -1067,6 +1367,9 @@ class ExPert(
             train_size=train_size,
             **data_params,
         )
+        data_splitter.setup()
+        # Set indices for checkpointing
+        self._set_data_split_indices(data_splitter)
         # Setup training plan
         plan_kwargs: dict = train_params.pop('plan_kwargs', {})
 
@@ -1074,10 +1377,17 @@ class ExPert(
         plan_kwargs['_code_to_label'] = self.idx_to_label.copy()
         # Share batch labels with training plan
         plan_kwargs['batch_labels'] = self._batch_mapping.copy()
+        # Share covariate labels with training plan
+        plan_kwargs['cov_labels'] = self.idx_to_cat_cov.copy()
         # Create training plan
         training_plan = self.get_training_plan(**plan_kwargs)
-        # Check if tensorboard logger is given
-        logger = train_params.get('logger')
+        # Reuse cached logger or pick up from train_params
+        logger = train_params.get('logger') or self._logger
+        if logger is not None:
+            # Cache for subsequent train() calls (resumes append to same log dir)
+            self._logger = logger
+            train_params['logger'] = logger
+            log.info(f'[Logging] model_log_dir={logger.log_dir}')
         callbacks = []
         # Manage early stopping callback
         early_stopping_start_epoch = train_params.pop('early_stopping_start_epoch')
@@ -1087,6 +1397,7 @@ class ExPert(
             # Create custom delayed early stopping using the start epoch parameter
             early_stopping_callback = DelayedEarlyStopping(
                 start_epoch=early_stopping_start_epoch,
+                warmup_epochs=plan_kwargs.get('n_epochs_warmup', 400),
                 monitor=train_params.get('early_stopping_monitor', 'validation_loss'),
                 min_delta=train_params.get('early_stopping_min_delta', 0.0),
                 patience=train_params.get('early_stopping_patience', 0.0),
@@ -1094,31 +1405,39 @@ class ExPert(
             )
             # Add to callbacks
             callbacks.append(early_stopping_callback)
-        # Add test callback
-        check_test_every_n_epoch = train_params.pop('check_test_every_n_epoch')
-        if check_test_every_n_epoch is not None:
-            test_callback = PeriodicTestCallback(every_n_epochs=check_test_every_n_epoch)
-            callbacks.append(test_callback)
+  
         # Manage checkpoint callback
         use_checkpoint = train_params.pop('checkpoint', False)
         checkpoint_monitor = train_params.pop('checkpoint_monitor', 'validation_loss')
         checkpoint_mode = train_params.pop('checkpoint_mode', 'max')
-        # Save most recent log dir TODO: ensure model_log_dir is saved with model
-        self.model_log_dir = logger.log_dir if logger is not None else None
-        checkpoint_dir = None
-        # Create checkpoint for max validation f1-score model
-        if logger is not None and use_checkpoint:
-            # Create checkpoint instance, save only best model
-            checkpoint_dir = f"{self.model_log_dir}/checkpoints"
+        # Create checkpoint — uses our overridden save() which includes training state
+        if use_checkpoint and self._ckpt_dir is not None:
+            checkpoint_dir = self._ckpt_dir
+            # Start with fresh checkpoint dir since the current one is already loaded
+            if self._from_checkpoint and os.path.exists(checkpoint_dir) and os.listdir(checkpoint_dir):
+                import shutil
+                log.info(f'Cleaning up temporary checkpoints.')
+                shutil.rmtree(checkpoint_dir)
+            ckpt_fn = "{epoch}-{step}-{"+checkpoint_monitor+":.4f}"
             checkpoint_callback = SaveCheckpoint(
-                dirpath=checkpoint_dir,  # match logger directory
+                dirpath=checkpoint_dir,
+                filename=ckpt_fn,
                 monitor=checkpoint_monitor,
                 mode=checkpoint_mode,
                 save_top_k=1,
+                load_best_on_end=True,
             )
             log.info(f'Saving model checkpoints to: {checkpoint_dir}')
-            # Add to list of callbacks
             callbacks.append(checkpoint_callback)
+        else:
+            checkpoint_dir = None
+        # Add resume callback to restore optimizer/scheduler/epoch state from a loaded checkpoint
+        resume_state = getattr(self, '_resume_training_state', None)
+        if resume_state is not None and resume_state.get('optimizer_state_dict') is not None:
+            from src.utils._callbacks import ResumeTrainingStateCallback
+            callbacks.append(ResumeTrainingStateCallback(resume_state))
+            self._resume_training_state = None
+
         # Add callbacks to Trainer kwargs
         train_params['callbacks'] = callbacks
         # Check val every epoch if we have callbacks registered
@@ -1150,22 +1469,24 @@ class ExPert(
             runner.trainer.logger.log_hyperparams(hparams)
         # Save training plan to model
         self.training_plan = training_plan
-        # Update model summary to include if it's trained on fixed or full class embedding
-        self.use_full_cls_emb = bool(plan_kwargs.get('use_full_cls_emb'))
-        if not self.was_pretrained:
-            self._model_summary_string += f",\nuse_full_cls_emb: {self.use_full_cls_emb}"
-        self.__repr__()
+        # Print model summary
+        if verbose:
+            self.__repr__()
         # Save runner in model
         self.last_runner = runner
+        # Set module to train mode
+        self.module.train()
         # Train model
         runner()
+        # Auto-save after training (includes training state for resume)
+        if self.model_log_dir is not None:
+            save_dir = os.path.join(self.model_log_dir, self._FINAL_MODEL_DNAME)
+            self.save(save_dir, overwrite=True)
         # Add latent representation to model
         self._register_latent_variables()
-        # TODO: Test call
-        # test_out = runner.trainer.test(self, datamodule=data_splitter)
         # Minify the model if enabled and adata is not already minified
         if minify_adata and not self.is_minified:
-            log.info(f'Minifying adata with latent distribution')
+            log.info(f'Minifying adata using latent distribution')
             self.minify_adata(use_latent_qzm_key=self._LATENT_QZM_KEY, use_latent_qzv_key=self._LATENT_QZV_KEY)
             
     def _add_missing_query_registry(self, adata: ad.AnnData):
@@ -1237,33 +1558,29 @@ class ExPert(
             adata_manager.validate()
         return adata
     
-    def _get_available_splits(self) -> list[str]:
+    def _get_available_splits(self) -> dict[str, np.ndarray]:
         """Get list of available data splits in the model.
         
         Returns
         -------
-        list[str]
+        dict[str, np.ndarray]
             List of available split names ('train', 'val', 'test')
         """
-        return [
-            split for split, indices in {
+        return {
+            split: indices for split, indices in {
                 'train': getattr(self, 'train_indices', None),
                 'val': getattr(self, 'validation_indices', None), 
-                'test': getattr(self, 'test_indices', None)
+                'test': getattr(self, 'test_indices', None),
+                'ood_test': getattr(self, 'ood_test_indices', None)
             }.items() if indices is not None and len(indices) > 0
-        ]
+        }
     
     def _get_split_indices(self, split: str) -> np.ndarray:
         """Get model split indices by split key (train, val/validation, test)"""
-        if split not in self._get_available_splits():
+        avail_splits = self._get_available_splits()
+        if split not in avail_splits:
             raise ValueError(f'Model does not have indices for split: {split}, has to be one of {self._get_available_splits()}')
-        if split == 'train':
-            return self.train_indices
-        if split in ['val', 'validation']:
-            return self.validation_indices
-        if split == 'test':
-            return self.test_indices
-        return None
+        return avail_splits.get(split)
         
     def _get_split_adata(self, split: str, ignore_ctrl: bool = True) -> ad.AnnData:
         """Get AnnData subset for a specific split and optionally filter control cells.
@@ -1441,12 +1758,14 @@ class ExPert(
             ignore_ctrl: bool = True,
             z_shared: bool = True,
             use_z: bool = False,
-            load_from_checkpoint: bool = False,
+            minify_adata: bool = True,
         ) -> dict[pd.DataFrame] | None:
         """Run model evaluation for all available data splits registered with the model."""
         if self.is_evaluated and not force:
-            log.info('This model has already been evaluated, pass force=True to re-evaluate.')
+            log.info('[Eval] This model has already been evaluated, pass force=True to re-evaluate.')
             return
+        # Set module to evaluation mode
+        self.module.eval()
         # Save model to tensorboard logger directory if registered
         if getattr(self, 'model_log_dir', None) is not None:
             base_output_dir = self.model_log_dir
@@ -1457,34 +1776,34 @@ class ExPert(
                 base_output_dir = output_dir
                 model_output_dir = os.path.join(output_dir, 'model')
             else:
-                log.warning('Could not find model tensorboard log directory or a specified "output_dir", skipping model saving.')
+                log.warning('[Eval] Could not find model tensorboard log directory or a specified "output_dir", skipping model saving.')
                 base_output_dir = None
                 model_output_dir = None
-        # Try to load model from checkpoint if option is given and checkpoint directory is available
-        if load_from_checkpoint:
-            log.info('Loading model from checkpoint before evaluation.')
-            self.load_model_checkpoint()
         # Refactor results mode to always be a list of options or None
         results_mode: list[str] | None = [results_mode] if results_mode is not None and not isinstance(results_mode, list) else None
         # Run full prediction for all registered data
-        log.info('Running model predictions on all data splits.')
+        log.info('[Eval] Running model predictions on all data splits.')
         self._register_model_predictions(force=force, use_z=use_z)
         # Run classification report for all data splits
-        log.info('Generating reports.')
+        log.info('[Eval] Generating reports.')
         self._register_classification_report(force=force, ignore_ctrl=ignore_ctrl)
-        
-        # Plot evalutation results if specified
-        log.info('Plotting evaluation results.')
-        if plot:
-            self._plot_evalutation(output_dir=base_output_dir, z_shared=z_shared)
+
+        # Minify the model if enabled and adata is not already minified
+        if minify_adata and not self.is_minified:
+            log.info(f'[Eval] Minifying adata using latent distribution')
+            self.minify_adata(use_latent_qzm_key=self._LATENT_QZM_KEY, use_latent_qzv_key=self._LATENT_QZV_KEY)
         # Save model only if we have an output directory
         if model_output_dir is not None:
             # Always save anndata if its minified else fall back to parameter
             save_anndata = True if self.is_minified else save_anndata
             save_ad_txt = 'with' if save_anndata else 'without'
             adata_txt = 'adata (minified)' if self.is_minified else 'adata'
-            log.info(f'Saving model {save_ad_txt} {adata_txt} to: {model_output_dir}')
+            log.info(f'[Eval] Saving model {save_ad_txt} {adata_txt} to: {model_output_dir}')
             self.save(dir_path=model_output_dir, save_anndata=save_anndata, overwrite=True, keep_emb=True)
+        # Plot evalutation results if specified
+        log.info('[Eval] Plotting evaluation results.')
+        if plot:
+            self._plot_evalutation(output_dir=base_output_dir, z_shared=z_shared)
         # Create evalutaion return object
         return_obj = None
         if results_mode is not None:
@@ -1499,12 +1818,12 @@ class ExPert(
                 }
             # Save reports as seperate files in output directory
             if 'save' in results_mode:
-                log.info(f'Saving evaluation metrics to: {base_output_dir}')
+                log.info(f'[Eval] Saving evaluation metrics to: {base_output_dir}')
                 sum_o = os.path.join(base_output_dir, f'{self._name}_eval_summary.csv')
                 rep_o = os.path.join(base_output_dir, f'{self._name}_eval_report.csv')
                 eval_summary.to_csv(sum_o)
                 eval_report.to_csv(rep_o)
-        log.info(f'Evaluation done.')
+        log.info(f'[Eval] Evaluation done.')
         # Return 
         return return_obj
     
@@ -1532,11 +1851,15 @@ class ExPert(
         pl.plot_confusion(y, y_hat, plt_file=o)
         # Plot mode umap using combined projection
         groups = [self.original_batch_key, self.original_label_key]
+        # Check if efficiency score is given
+        eff_state_registry = self.adata_manager.registry.get('field_registries').get(REGISTRY_KEYS.CLS_EFF_KEY, {})
+        eff_key = eff_state_registry.get('data_registry', {}).get('attr_key', None)
+        if eff_key is not None:
+            groups.append(eff_key)
         for group in groups:
             # Plot a umap projection for every group
             o = os.path.join(plt_dir, f'umap_{split}_{group}.png')
             pl.plot_umap(adata, slot=self._LATENT_UMAP, hue=group, output_file=o)
-        # Plot latent projections
 
     def _plot_eval_splits(self, plt_dir: str) -> None:
         """Generate all split-specific plots."""
@@ -1565,6 +1888,16 @@ class ExPert(
             mean_split='test',
             N=self.adata.obsm[PREDICTION_KEYS.SOFT_PREDICTION_KEY].shape[-1]
         )
+        # Plot top N performance over datasets
+        top_n_ds_o = os.path.join(plt_dir, f'top_n_ds_{metric}.png')
+        pl.plot_top_n_performance_per_dataset(
+            self.adata.uns[PREDICTION_KEYS.TOP_N_PREDICTION_KEY],
+            context_key=self.original_batch_key,
+            split_key='split',
+            metric=metric,
+            output_file=top_n_ds_o
+        )
+        # Get latent space key
         z_key = self._LATENT_Z_SHARED_KEY if z_shared else self._LATENT_Z_KEY
         # Calculate UMAP for latent space based on latent mean
         pl.calc_umap(self.adata, rep=z_key, slot_key=self._LATENT_UMAP)
@@ -1577,8 +1910,17 @@ class ExPert(
         # Plot full UMAP colored by batch label
         umap_label_o = os.path.join(plt_dir, f'full_umap_{self.original_label_key}.png')
         pl.plot_umap(self.adata, slot=self._LATENT_UMAP, hue=self.original_label_key, output_file=umap_label_o)
-        # TODO: Plot shared z umap with context and class embedding markers on it
-        # Combine z_shared with 
+        # Plot shared z umap with context and class embedding markers on it
+        umap_proxy_o = os.path.join(plt_dir, f'full_umap_proxy.png')
+        pl.plot_umap_with_proxies(
+            self.adata, 
+            latent_key=z_key, 
+            proxy_key=self._LATENT_CLS_PROJ_KEY,
+            perturbation_col=self.original_label_key,
+            batch_key=self.original_batch_key,
+            idx_to_label=self.idx_to_label,
+            output_file=umap_proxy_o
+        )
         # Plot individual splits
         self._plot_eval_splits(plt_dir)
         return
@@ -1804,76 +2146,117 @@ class ExPert(
     def load_model_checkpoint(
         self, 
         model_dir: str | None = None,
-        n: int = 0,
-        checkpoint_dirname: str = 'checkpoints',
         model_name: str = 'model.pt',
-    ):
-        import os
-        import glob
-        
-        model_dir = getattr(self, 'model_log_dir', None)
+    ):  
+        # Check if a model directory is available
+        model_dir = model_dir if model_dir is not None else getattr(self, 'model_log_dir', None)
         if model_dir is None:
             return
-        # Look for checkpoints
-        checkpoint_dir = os.path.join(model_dir, checkpoint_dirname)
-        if os.path.exists(checkpoint_dir) and n > -1:
-            checkpoint_model_paths = glob.glob(f'{checkpoint_dir}/**/{model_name}')
-            if len(checkpoint_model_paths) > 0:
-                checkpoint_model_p = checkpoint_model_paths[n] if n > 0 and n < len(checkpoint_model_paths) else checkpoint_model_paths[0]
-                log.info(f'Loading model checkpoint {checkpoint_model_p}.')
-                ckpt = torch.load(checkpoint_model_p, map_location="cpu")
-                self.module.load_state_dict(ckpt["state_dict"])
-
-    @classmethod
-    def load_checkpoint(
-        cls,
-        model_dir: str,
-        adata: AnnData | None = None,
-        n: int = 0,
-        checkpoint_dirname: str = 'checkpoints',
-        model_name: str = 'model.pt',
-        default_dirname: str = 'model'
-    ):
-        import os
         import glob
         # Look for checkpoints
-        checkpoint_dir = os.path.join(model_dir, checkpoint_dirname)
-        if os.path.exists(checkpoint_dir) and n > -1:
-            checkpoint_model_paths = glob.glob(f'{checkpoint_dir}/**/{model_name}')
-            if len(checkpoint_model_paths) > 0:
-                checkpoint_model_p = checkpoint_model_paths[n] if n > 0 and n < len(checkpoint_model_paths) else checkpoint_model_paths[0]
-                log.info(f'Loading model checkpoint {checkpoint_model_p}.')
-                checkpoint_model_dir = os.path.dirname(checkpoint_model_p)
-                return cls.load(checkpoint_model_dir, adata=adata)
-        log.info(f'Could not find model checkpoint(s). Using default "{default_dirname}" directory.')    
-        model_state_dir = os.path.join(model_dir, default_dirname)
-        return cls.load(model_state_dir, adata=adata)
+        ckpt_paths = glob.glob(os.path.join(model_dir, '**', model_name), recursive=True)
+        if ckpt_paths:
+            latest = max(ckpt_paths, key=os.path.getmtime)
+            log.info(f'[Checkpoint] Loading model checkpoint {latest}.')
+            ckpt = torch.load(latest, map_location=self.device)
+            self.module.load_state_dict(ckpt["model_state_dict"])
     
     @classmethod
-    def load(cls, dir_path: str, **kwargs):
+    def load(cls, dir_path: str, use_latest_checkpoint: bool = True, **kwargs):
+        # Resolve to the latest checkpoint directory if requested
+        used_ckpt = False
+        if use_latest_checkpoint:
+            import glob
+            ckpt_paths = glob.glob(os.path.join(dir_path, '**', 'model.pt'), recursive=True)
+            if ckpt_paths:
+                latest = max(ckpt_paths, key=os.path.getmtime)
+                dir_path = os.path.dirname(latest)
+                log.info(f'[Load] Resolved to latest checkpoint: {dir_path}')
+                used_ckpt = True
+        # Load latest model
         model = super().load(dir_path, **kwargs)
-        # Add directory to model
-        model.model_log_dir = dir_path
+        # Mark checkpoint usage in model
+        model._from_checkpoint = used_ckpt
+
+        # Restore training state if saved alongside the model
+        state_path = os.path.join(dir_path, cls._TRAINING_STATE_FNAME)
+        if os.path.exists(state_path):
+            state = torch.load(state_path, map_location='cpu')
+            prev_stage = state.get('_training_stage', 0)
+            model._version = state.get('_version', 0)
+            model._training_stage = prev_stage + 1
+            model.was_pretrained = True
+            model._resume_training_state = {
+                'optimizer_state_dict': state.get('optimizer_state_dict'),
+                'scheduler_state_dict': state.get('scheduler_state_dict'),
+                'epoch': state.get('epoch', 0),
+                'global_step': state.get('global_step', 0),
+            }
+            # Restore split indices
+            for key, attr in [('train', 'train_indices'), ('val', 'validation_indices'),
+                              ('test', 'test_indices'), ('ood_test', 'ood_test_indices')]:
+                idx = state.get('split_indices', {}).get(key)
+                if idx is not None:
+                    setattr(model, attr, np.asarray(idx))
+            # Restore version_dir and setup logger for the next training stage
+            saved_version_dir = state.get('model_log_dir')
+            if saved_version_dir is not None:
+                import lightning.pytorch as _pl
+                model.model_log_dir = saved_version_dir
+                model._ckpt_dir = os.path.join(saved_version_dir, 'checkpoints')
+                model._logger = _pl.loggers.TensorBoardLogger(
+                    save_dir=saved_version_dir, name='', version='',
+                )
+            epoch = model._resume_training_state['epoch']
+            step = model._resume_training_state['global_step']
+            log.info(f'[Load] Restored training state {prev_stage} → stage {model._training_stage} (epoch {epoch}, step {step})')
         return model
-        
-    
+
     def save(self, *args, **kwargs) -> None:
-        """Save wrapper to handle external model embeddings"""
+        """Save model weights, embeddings, and training state for full resume."""
         keep_emb = bool(kwargs.pop('keep_emb', None))
         # Handle external model embeddings if anndata is saved with model
         if self.cls_emb is not None and bool(kwargs.get('save_anndata', None)):
-            # Convert embeddings to numpy arrays
             if keep_emb:
                 self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_EMB_KEY])
                 if REGISTRY_KEYS.CLS_SIM_KEY in self.adata.uns:
                     self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY] = np.array(self.adata.uns[REGISTRY_KEYS.CLS_SIM_KEY])
-            # Remove embeddings completely
             else:
                 self.adata.uns.pop(REGISTRY_KEYS.CLS_EMB_KEY, None)
                 self.adata.uns.pop(REGISTRY_KEYS.CLS_SIM_KEY, None)
-        # Save model as you would normally
+        # Save model as scvi normally does (model.pt with state_dict + registry)
         super().save(*args, **kwargs)
+        # Save training state alongside the model for full resume
+        dir_path = args[0] if args else kwargs.get('dir_path')
+        if dir_path is not None:
+            state = {
+                'model_log_dir': getattr(self, 'model_log_dir', None),
+                '_training_stage': getattr(self, '_training_stage', 0),
+                '_version': getattr(self, '_version', None),
+                'split_indices': {
+                    'train': getattr(self, 'train_indices', None),
+                    'val': getattr(self, 'validation_indices', None),
+                    'test': getattr(self, 'test_indices', None),
+                    'ood_test': getattr(self, 'ood_test_indices', None),
+                },
+            }
+            # Include optimizer/scheduler state if training plan is available
+            training_plan = getattr(self, 'training_plan', None)
+            if training_plan is not None:
+                optim = training_plan.optimizers()
+                if optim is not None:
+                    state['optimizer_state_dict'] = optim.state_dict()
+                schedulers = training_plan.lr_schedulers()
+                if schedulers is not None:
+                    sched = schedulers if not isinstance(schedulers, list) else schedulers[0]
+                    if hasattr(sched, 'scheduler'):
+                        sched = sched['scheduler'] if isinstance(sched, dict) else sched.scheduler
+                    state['scheduler_state_dict'] = sched.state_dict()
+                state['epoch'] = training_plan.current_epoch
+                state['global_step'] = training_plan.global_step
+            torch.save(state, os.path.join(dir_path, self._TRAINING_STATE_FNAME))
     
+
     @classmethod
     @setup_anndata_dsp.dedent
     def setup_anndata(
@@ -1885,6 +2268,7 @@ class ExPert(
         class_emb_uns_key: str | None = 'cls_embedding',
         gene_emb_varm_key: str | None = None,
         feature_mask_varm_key: str | None = None,
+        dataset_sim_uns_key: str | None = None,
         size_factor_key: str | None = None,
         efficiency_key: str | None = None,
         cast_to_csr: bool = True,
@@ -1897,8 +2281,8 @@ class ExPert(
         """
         Setup AnnData object for training an ExPert model.
         """
-        if not isinstance(adata.X, sp.csr_matrix) and cast_to_csr:
-            log.info('Converting adata.X to csr matrix to boost training efficiency.')
+        if not isinstance(adata.X, sp.csr_matrix) and cast_to_csr and not adata.isbacked:
+            log.info('[Registry] Converting adata.X to csr matrix to boost training efficiency.')
             adata.X = sp.csr_matrix(adata.X)
         setup_method_args = cls._get_setup_method_args(**locals())
         
@@ -1913,19 +2297,23 @@ class ExPert(
         ]
         # Add class embedding matrix with shape (n_labels, class_emb_dim)
         if class_emb_uns_key is not None and class_emb_uns_key in adata.uns:
-            log.info(f'Registered class embedding from adata.uns[{class_emb_uns_key}].')
+            log.info(f'[Registry] Registered class embedding from adata.uns[{class_emb_uns_key}].')
             anndata_fields.append(StringUnsField(REGISTRY_KEYS.CLS_EMB_KEY, class_emb_uns_key))
         # Add context embedding matrix with shape (n_contexts, context_emb_dim)
         if context_emb_uns_key is not None and context_emb_uns_key in adata.uns:
-            log.info(f'Registered context embedding from adata.uns[{context_emb_uns_key}].')
+            log.info(f'[Registry] Registered context embedding from adata.uns[{context_emb_uns_key}].')
             anndata_fields.append(StringUnsField(REGISTRY_KEYS.CTX_EMB_KEY, context_emb_uns_key))
+        # Add context embedding matrix with shape (n_contexts, context_emb_dim)
+        if dataset_sim_uns_key is not None and dataset_sim_uns_key in adata.uns:
+            log.info(f'[Registry] Registered dataset similarity weights from adata.uns[{dataset_sim_uns_key}].')
+            anndata_fields.append(StringUnsField(REGISTRY_KEYS.DATASET_SIM_KEY, dataset_sim_uns_key))
         # Add gene embedding matrix with shape (n_vars, emb_dim)
         if gene_emb_varm_key is not None and gene_emb_varm_key in adata.varm:
-            log.info(f'Registered gene embedding from adata.varm[{gene_emb_varm_key}].')
+            log.info(f'[Registry] Registered gene embedding from adata.varm[{gene_emb_varm_key}].')
             anndata_fields.append(VarmField(REGISTRY_KEYS.GENE_EMB_KEY, gene_emb_varm_key))
         # Add dataset-specific feature masks
         if feature_mask_varm_key is not None and feature_mask_varm_key in adata.varm:
-            log.info(f'Registered gene embedding from adata.varm[{feature_mask_varm_key}].')
+            log.info(f'[Registry] Registered gene embedding from adata.varm[{feature_mask_varm_key}].')
             anndata_fields.append(VarmField(REGISTRY_KEYS.FEAT_MASK_KEY, feature_mask_varm_key))
         # Register latent fields of adata is minified
         adata_minify_type = _get_adata_minify_type(adata)

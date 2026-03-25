@@ -3,8 +3,8 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler, BatchSampler, Sampler
 from copy import deepcopy
-from collections import defaultdict
-from typing import List, Iterator, Optional, Union, Iterable
+from collections import defaultdict, Counter
+from typing import List, Iterator, Optional, Union, Iterable, Literal
 import logging
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -132,6 +132,7 @@ class BalancedAnnDataLoader(DataLoader):
         target_per_group: int | None = None,
         max_ratio: float = 3.0,
         min_group_samples: int = 4,
+        weights_mode: Literal['labels', 'batches', 'both'] = 'both',
         **kwargs,
     ):
         # --- prepare indices
@@ -152,6 +153,7 @@ class BalancedAnnDataLoader(DataLoader):
 
         # use balanced weights
         self.use_balanced_weights = use_balanced_weights
+        self.weights_mode = weights_mode
 
         # --- labels
         if labels is None:
@@ -190,6 +192,16 @@ class BalancedAnnDataLoader(DataLoader):
                 max_ratio=max_ratio,
                 min_samples=min_group_samples,
             )
+            
+        # Store contrastive params for rebuilding each epoch
+        self._contrastive_params = dict(
+            n_classes_per_batch=n_classes_per_batch,
+            n_samples_per_class=n_samples_per_class,
+            min_contexts_per_class=min_contexts_per_class,
+            cap_per_group=cap_per_group,
+            min_dataset_fraction=min_dataset_fraction,
+            use_class_weights=self.use_balanced_weights,
+        )
 
         # --- create sampler
         if sampler is None:
@@ -198,14 +210,12 @@ class BalancedAnnDataLoader(DataLoader):
                     self._sampler = _MutableBatchSampler(
                         BatchSampler(self._epoch_balancer, batch_size=batch_size, drop_last=drop_last)
                     )
+                elif use_contrastive_loader:
+                    self._sampler = self._build_contrastive_sampler()
                 else:
-                    # compute inverse-frequency weights per class
-                    unique_labels, counts = np.unique(labels, return_counts=True)
-                    class_weights = 1.0 / counts
-                    if self.use_balanced_weights:
-                        class_weights = compute_class_weight("balanced", classes=unique_labels, y=labels)
-                    sample_weights = np.array([class_weights[np.where(unique_labels == l)[0][0]] for l in labels])
-
+                    # Get sample weights
+                    sample_weights = self._get_sample_weights()
+                    # Create sampler
                     sampler = WeightedRandomSampler(
                         weights=torch.DoubleTensor(sample_weights),
                         num_samples=self.n_samples,
@@ -220,16 +230,6 @@ class BalancedAnnDataLoader(DataLoader):
         else:
             self.kwargs.update({"sampler": sampler})
 
-        # Store contrastive params for rebuilding each epoch
-        self._contrastive_params = dict(
-            n_classes_per_batch=n_classes_per_batch,
-            n_samples_per_class=n_samples_per_class,
-            min_contexts_per_class=min_contexts_per_class,
-            cap_per_group=cap_per_group,
-            min_dataset_fraction=min_dataset_fraction,
-            use_class_weights=self.use_balanced_weights,
-        )
-
         if iter_ndarray:
             self.kwargs.update({"collate_fn": lambda x: x})
         # Save parameters
@@ -241,9 +241,47 @@ class BalancedAnnDataLoader(DataLoader):
         logger.info(
             f"Initialized BalancedAnnDataLoader with {len(self.dataset)} samples, "
             f"{len(np.unique(labels))} classes, batch size {batch_size}, "
+            f"Weights: {self.weights_mode}, "
             f"Contrastive: {use_contrastive_loader}, "
             f"Balanced epochs: {self.use_balanced_epochs}."
         )
+
+    def _get_sample_weights(self):
+        if self.weights_mode == 'both':
+            # Group by dataset x class
+            group_keys = list(zip(self.labels, self.batches))
+            group_counts = Counter(group_keys)
+            
+            if self.use_balanced_weights:
+                # Sqrt-balanced: reduces imbalance without extreme upsampling
+                sample_weights = np.array([
+                    1.0 / np.sqrt(group_counts[(l, b)] + 1)
+                    for l, b in group_keys
+                ])
+            else:
+                sample_weights = np.array([
+                    1.0 / group_counts[(l, b)]
+                    for l, b in group_keys
+                ])
+            # Normalize to mean 1
+            sample_weights /= sample_weights.mean()
+            return sample_weights
+        else:
+            # Weight by labels
+            if self.weights_mode == 'labels':
+                labels = self.labels
+            # Weight by batches/datasets
+            elif self.weights_mode == 'batches':
+                labels = self.batches
+            else:
+                raise ValueError(f"Unknown weights_mode: {self.weights_mode}")
+            
+            unique_labels, counts = np.unique(labels, return_counts=True)
+            if self.use_balanced_weights:
+                class_weights = compute_class_weight("balanced", classes=unique_labels, y=labels)
+            else:
+                class_weights = 1.0 / counts
+            return np.array([class_weights[np.where(unique_labels == l)[0][0]] for l in labels])
 
     def _build_weighted_sampler(self, batch_size, drop_last):
         """Build weighted random sampler, optionally from balanced subset."""
@@ -446,6 +484,7 @@ class WeightedContrastiveBatchSamplerOld(Sampler[List[int]]):
         use_class_weights: bool = True,
         strict: bool = True,
         seed: int | None = None,
+        **kwargs
     ):
         super().__init__(None)
         self.indices = np.asarray(indices)
@@ -710,7 +749,6 @@ class WeightedContrastiveBatchSampler(Sampler[List[int]]):
         # Draw samples — single pre-allocated array
         result = np.empty(self.n_samples_per_class, dtype=np.int64)
         pos = 0
-        datasets_used_mask = 0  # bit cheaper than a set for small n
 
         for j in range(pick_n):
             ci = ctx_idx[j]

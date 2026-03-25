@@ -14,6 +14,7 @@ class _REGISTRY_KEYS_NT(NamedTuple):
     CLS_EMB_KEY: str = "cls_embedding"
     CLS_SIM_KEY: str = "cls_embedding_sim"
     CLS_EMB_INIT: str = "CLS_EMB_INIT"
+    DATASET_SIM_KEY: str = "dataset_sim"
     FEAT_MASK_KEY: str = "feature_mask_per_dataset"
     FEAT_MASK_IDX_KEY: str = "dataset_to_mask_idx"
     CLS_EFF_KEY: str = "cls_efficiency"
@@ -35,6 +36,7 @@ class _MODULE_KEYS(NamedTuple):
     B_KEY: str = "b"
     G_EMB_KEY: str = "g"
     C_EMB_KEY: str = "e"
+    CLS_EFF_KEY: str = "cls_eff"
     # inference (rna)
     Z_KEY: str = "z"
     QZ_KEY: str = "qz"

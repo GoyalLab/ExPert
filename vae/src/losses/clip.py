@@ -185,6 +185,8 @@ class ClipLoss(nn.Module):
 
     def __init__(
         self,
+        latent_dim: int,
+        n_labels: int,
         use_reverse: bool = False,
         unique_proxies: bool = True,
         reduction: str = 'mean',
@@ -200,10 +202,13 @@ class ClipLoss(nn.Module):
         null_threshold: float = 0.5,
         alpha: float = 0.7,
         global_weight: float = 0.3,
-        contrastive_weight: float = 0.3,
         eps: float = 1e-6,
         supervision_dropout_rate: float = 0.0,
         cls_weights: torch.Tensor | None = None,
+        ds_sim_weights: torch.Tensor | None = None,
+        use_cls_prototypes: bool = False,
+        blend_alpha: float = 1.0,
+        momentum: float = 0.9,
     ):
         super().__init__()
 
@@ -221,7 +226,6 @@ class ClipLoss(nn.Module):
         self.alpha = alpha
         self.use_reverse = use_reverse and alpha != 1.0
         self.global_weight = global_weight
-        self.contrastive_weight = contrastive_weight
         # Null class settings
         self.null_frac_target = null_frac_target
         self.null_threshold = null_threshold
@@ -229,6 +233,11 @@ class ClipLoss(nn.Module):
         self.supervision_dropout_rate = supervision_dropout_rate
         # Class weights based on support
         self.cls_weights = cls_weights
+        # Dataset similarity weights
+        if ds_sim_weights is not None:
+            self.register_buffer('ds_sim_weights', ds_sim_weights.clone().detach())
+        else:
+            self.ds_sim_weights = None
         
         # Set batch memory
         if self.memory_size > 0:
@@ -240,6 +249,13 @@ class ClipLoss(nn.Module):
             unique_proxies = True
         else:
             self.use_memory = False
+
+        # Set running mean proxies
+        self.use_cls_prototypes = use_cls_prototypes
+        self.momentum = momentum
+        self.blend_alpha = blend_alpha
+        self.register_buffer("cell_prototypes", torch.zeros(n_labels, latent_dim))
+        self.register_buffer("proto_counts", torch.zeros(n_labels))
 
     @torch.no_grad()
     def _update_memory(self, z, y):
@@ -262,6 +278,19 @@ class ClipLoss(nn.Module):
             excess = self.mem_z.size(0) - self.memory_size
             self.mem_z = self.mem_z[excess:]
             self.mem_y = self.mem_y[excess:]
+
+    @torch.no_grad()
+    def _update_z_means(self, z: torch.Tensor, labels: torch.Tensor):
+        # Get update momemtum
+        for c in labels.unique():
+            # Get class mean
+            z_mean = z[labels == c].mean(0)
+            # Update prototypes
+            self.proto_counts[c] += 1
+            momentum = self.momentum
+            self.cell_prototypes[c] = (
+                (1 - momentum) * self.cell_prototypes[c] + momentum * z_mean
+            ) 
             
     @property
     def memory_buffer_size(self):
@@ -285,57 +314,107 @@ class ClipLoss(nn.Module):
     def cross_context_supcon_loss(
         self,
         z: torch.Tensor,
+        cls_emb: torch.Tensor,
         labels: torch.Tensor,
         contexts: torch.Tensor,
         gate: torch.Tensor | None = None,
-        T_i: torch.Tensor | None = None,
-        temperature: float = 0.2,
+        temperature: float = 0.1,
+        cross_dataset_emphasis: float = 0.8,
+        min_dataset_weights: float = 0.2,
+        pre_normalized: bool = False,
     ):
         """
-        Supervised contrastive loss forcing SAME LABEL across DIFFERENT CONTEXTS together.
-        Gated by responder probability and modulated by per-sample temperature.
+        Supervised contrastive loss: same label + different context = positive.
+        Weighted by dataset dissimilarity and gated by responder probability.
         """
-        z = F.normalize(z, dim=-1)
+        # Normalize embeddings (skip if already normalized)
+        if not pre_normalized:
+            z = F.normalize(z, dim=-1)
+        # Update running mean
+        if self.use_cls_prototypes:
+            self._update_z_means(z, labels)
         B = z.size(0)
         device = z.device
 
-        # Per-pair temperature: use geometric mean of both samples' T_i
-        if T_i is not None:
-            T_i = T_i.squeeze(-1)  # (B,)
-            pair_T = torch.sqrt(T_i[:, None] * T_i[None, :])  # (B, B)
-        else:
-            pair_T = temperature
+        # Calculate similarity across cells
+        sim = (z @ z.T) / temperature
+        mask_self = torch.eye(B, device=device, dtype=torch.bool)
         
-        # Get pair-wise similarity
-        sim = z @ z.T / pair_T
-
-        # Remove self similarity
-        mask_self = torch.eye(B, dtype=torch.bool, device=device)
-        sim = sim.masked_fill(mask_self, -1e9)
-
-        # Positives = same label AND different context
-        pos_mask = (
-            (labels[:, None] == labels[None, :]) &
-            (contexts[:, None] != contexts[None, :])
-        )
-        # SupCon loss
-        log_denom = torch.logsumexp(sim, dim=1)
-        sim_pos = sim.masked_fill(~pos_mask, -1e9)
-        log_pos = torch.logsumexp(sim_pos, dim=1)
-
-        valid = pos_mask.any(dim=1)
-        # Check if there are any positives in the batch
-        if valid.any():
-            loss = -(log_pos[valid] - log_denom[valid])
-            # Gate by responder probability
-            if gate is not None:
-                gate_valid = gate[valid]
-                loss = (loss * gate_valid).sum() / gate_valid.sum().clamp(min=1)
-            else:
-                loss = loss.mean()
-            return loss
+        # Positive mask: same label, non-self
+        pos_mask = (labels[:, None] == labels[None, :]) & ~mask_self
+        # Calculate context mask
+        same_ctx = (contexts[:, None] == contexts[None, :]).float()
+        # Positive weights from dataset dissimilarity
+        if self.ds_sim_weights is not None:
+            pair_weights = self.ds_sim_weights[contexts[:, None], contexts[None, :]]
         else:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            pair_weights = 1.0 - same_ctx
+        # Blend: at emphasis=0, all positives weighted 1.0
+        #        at emphasis=1, same-dataset gets min_same_weight, cross gets ds_weights
+        blended = (1.0 - cross_dataset_emphasis) + cross_dataset_emphasis * (
+            same_ctx * min_dataset_weights + (1.0 - same_ctx) * pair_weights
+        )
+        # Only apply weight to positives
+        pair_weights = blended * pos_mask.float()
+        
+        pair_weights = pair_weights * pos_mask.float()
+
+        if gate is not None:
+            gate = gate.squeeze()
+            gate_pair = torch.min(gate[:, None], gate[None, :])
+            pair_weights = pair_weights * gate_pair
+
+        # Negative weights: upweight same-dataset negatives (harder, more informative)
+        neg_mask = ~pos_mask & ~mask_self
+        same_ctx_neg = (contexts[:, None] == contexts[None, :]) & neg_mask
+        diff_ctx_neg = (contexts[:, None] != contexts[None, :]) & neg_mask
+
+        neg_weights = torch.ones(B, B, device=device)
+        neg_weights[same_ctx_neg] = 2.0   # same-dataset negatives are harder, upweight
+        neg_weights[diff_ctx_neg] = 0.5   # cross-dataset negatives are easier, downweight
+        neg_weights[mask_self] = 0.0
+
+        # Apply negative weights to denominator
+        sim_masked = sim.masked_fill(mask_self, -1e9)
+        weighted_sim_for_denom = sim_masked + torch.log(neg_weights.clamp(min=1e-8))
+        log_denom = torch.logsumexp(weighted_sim_for_denom, dim=1)
+
+        # Weighted positives as numerator
+        log_prob = sim_masked - log_denom[:, None]
+
+        n_positives = pair_weights.sum(dim=1)
+        valid = n_positives > 1e-8
+
+        if not valid.any():
+            return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(0.0)
+        # Calculate weighted log probability
+        weighted_log_prob = (log_prob * pair_weights).sum(dim=1)
+        
+        # Modulate by similarity to class text embedding projections
+        if self.use_cls_prototypes and cls_emb is not None:
+            proto_new = (1 - self.blend_alpha) * cls_emb[labels]
+            proto_old = self.blend_alpha * self.cell_prototypes[labels]
+            proto = F.normalize(proto_new + proto_old, dim=-1)
+            proto_sim = (z * proto).sum(-1) / temperature
+
+            proto_log_prob = proto_sim - log_denom
+
+            weighted_log_prob = weighted_log_prob + proto_log_prob
+            n_positives += 1.0
+        # Construct final loss
+        loss = -weighted_log_prob[valid] / n_positives[valid]
+        # Log number of positives per cell and mean
+        pos_per_sample = pos_mask.sum(dim=1).float().mean()
+        eff_pos_per_sample = n_positives.mean()
+        
+        # Apply per-cell weight gate to loss
+        if gate is not None:
+            sample_gate = gate[valid]
+            loss = (loss * sample_gate).sum() / sample_gate.sum().clamp(min=1e-8)
+        else:
+            loss = loss.mean()
+
+        return loss, pos_per_sample
     
     # --------------------------------------------------
     # HARD NEGATIVE CE
@@ -444,13 +523,16 @@ class ClipLoss(nn.Module):
         if self.normalize:
             z = F.normalize(z, dim=-1)
             proxies = F.normalize(proxies, dim=-1)
+        return self._logits_z2c_prenorm(z, proxies, T)
+
+    def _logits_z2c_prenorm(self, z_norm, proxies_norm, T: float):
+        """Compute logits from already-normalized z and proxies."""
         # Supports single or multi-proxy
-        if proxies.ndim == 3:
-            sim = torch.einsum("bd,cmd->bcm", z, proxies)
-            # Center logits on batch mean
+        if proxies_norm.ndim == 3:
+            sim = torch.einsum("bd,cmd->bcm", z_norm, proxies_norm)
             s = torch.logsumexp(sim / T, dim=-1)
         else:
-            s = (z @ proxies.T) / T
+            s = (z_norm @ proxies_norm.T) / T
         # Center logits on mean over all predictions
         if self.center_logits:
             s = s - s.mean(dim=-1, keepdim=True)
@@ -608,11 +690,57 @@ class ClipLoss(nn.Module):
             weight=self.cls_weights
         )
     
+    def _global_loss_from_sim(
+        self,
+        full_sim: torch.Tensor,
+        y: torch.Tensor,
+        T: float,
+    ):
+        """Global loss using precomputed similarity matrix — column indexing instead of matmul."""
+        C = full_sim.size(1)
+        device = full_sim.device
+        unique_y = y.unique()
+
+        target = int(min(self.n_global, C))
+        n_extra = int(max(target - unique_y.numel(), 0))
+
+        neg_pool = torch.arange(C, device=device)
+        neg_candidates = neg_pool[~torch.isin(neg_pool, unique_y)]
+
+        if neg_candidates.numel() > 0 and n_extra > 0:
+            extra = neg_candidates[
+                torch.randperm(neg_candidates.numel(), device=device)[:n_extra]
+            ]
+            global_idx = torch.cat([unique_y, extra])
+        else:
+            global_idx = unique_y
+
+        # Remap targets
+        remap = torch.full((C,), -1, device=device)
+        remap[global_idx] = torch.arange(global_idx.size(0), device=device)
+        targets_global = remap[y]
+
+        # Index columns from precomputed sim + apply temperature
+        logits_full = self._apply_temperature(full_sim[:, global_idx], T)
+        return F.cross_entropy(
+            logits_full,
+            targets_global,
+            reduction='none',
+            weight=self.cls_weights
+        )
+
     def intra_class_spread(self, z: torch.Tensor, y: torch.Tensor):
         """Enforce intra class spread to prevent collapse."""
         sim = z @ z.T
         same = y[:,None] == y[None,:]
         return sim[same].mean()
+
+    def _apply_temperature(self, sim: torch.Tensor, T) -> torch.Tensor:
+        """Apply temperature and optional centering to a similarity matrix."""
+        s = sim / T
+        if self.center_logits:
+            s = s - s.mean(dim=-1, keepdim=True)
+        return s
 
     def forward(
         self,
@@ -625,60 +753,97 @@ class ClipLoss(nn.Module):
         weights: torch.Tensor | None = None,
         T_i: torch.Tensor | None = None,
         class_repel: float = 0.0,
+        z_norm: torch.Tensor | None = None,
+        emb_norm: torch.Tensor | None = None,
+        full_sim: torch.Tensor | None = None,
     ):
 
         # Flatten class labels
         y = y.flatten()
-        # store original supervised batch
-        z_batch = z
-        # Add some noise to the latent space during training
-        if self.training and self.noise_std > 0:
-            z_batch = z_batch + torch.randn_like(z_batch) * self.noise_std
-            #proxies = proxies + torch.randn_like(proxies) * self.noise_std
-            #proxies = F.normalize(proxies, dim=-1)
-        # Add memory negatives
-        if self.training and self.use_memory and self.mem_z.numel() > 0:
-            mem_z = F.normalize(self.mem_z.to(z.device), dim=-1)
-            mem_y = self.mem_y.to(z.device)
-            # append ONLY to embeddings used for similarity
-            z_all = torch.cat([z_batch, mem_z], dim=0)
-            y_all = torch.cat([y, mem_y], dim=0)
+        # Modulate weights by dataset simiarities if given
+        if self.ds_sim_weights is not None:
+            ds_w = self.ds_sim_weights.mean(-1)[ctx]
+            weights = ds_w if weights is None else weights * ds_w
 
-            # weights must match too
-            if weights is not None:
-                pad = torch.ones(mem_y.size(0), device=z.device)
-                weights = torch.cat([weights, pad], dim=0)
-        else:
-            z_all = z_batch
-            y_all = y
-        
-        # ---------- select proxies ----------
-        z_norm, proxies, targets, inv, support_weights = self._select_proxies(
-            z_all, y_all, emb,
-        )
-        
-        # ---------- supervised contrastive loss -----
-        if self.contrastive_weight > 0:
-            loss_supcon = self.cross_context_supcon_loss(
-                z_batch, y, ctx, weights, T_i, temperature=T
-            )
-        else:
-            loss_supcon = 0.0
-
-        # -------------------------
-        # compute logits vs class embeddings
-        # -------------------------
+        T_rev = T_i.mean() if T_i is not None else T
         T_i = T_i if T_i is not None else T
-        logits = self._logits_z2c(z_norm, proxies, T_i)
+
+        # ---- Fast path: precomputed full similarity matrix ----
+        if full_sim is not None:
+            # full_sim is (B, C) = z_norm @ emb_norm.T, no temperature
+            # Derive all logits by column-indexing + temperature
+            if self.unique_proxies:
+                unique_classes, inv = torch.unique(y, return_inverse=True)
+                logits = self._apply_temperature(full_sim[:, unique_classes], T_i)
+                targets = inv
+            else:
+                logits = self._apply_temperature(full_sim, T_i)
+                targets = y
+
+            # Support weights from class weights
+            if self.cls_weights is not None:
+                support_weights = self.cls_weights[unique_classes] if self.unique_proxies else self.cls_weights
+            else:
+                support_weights = None
+
+            # z_norm / proxies for reverse loss (if needed)
+            z_norm_internal = z_norm
+            full_logits = self._apply_temperature(full_sim, T_i)
+        # ---- Slow path: compute logits from scratch ----
+        else:
+            z_batch = z
+            # Add some noise to the latent space during training
+            if self.training and self.noise_std > 0:
+                z_batch = z_batch + torch.randn_like(z_batch) * self.noise_std
+                z_norm = None
+            # Add memory negatives
+            if self.training and self.use_memory and self.mem_z.numel() > 0:
+                mem_z = F.normalize(self.mem_z.to(z.device), dim=-1)
+                mem_y = self.mem_y.to(z.device)
+                z_all = torch.cat([z_batch, mem_z], dim=0)
+                y_all = torch.cat([y, mem_y], dim=0)
+                z_norm = None
+                if weights is not None:
+                    pad = torch.ones(mem_y.size(0), device=z.device)
+                    weights = torch.cat([weights, pad], dim=0)
+            else:
+                z_all = z_batch
+                y_all = y
+
+            z_sel, proxies, targets, inv, support_weights = self._select_proxies(
+                z_all, y_all, emb,
+            )
+
+            if self.normalize:
+                if z_norm is None:
+                    z_norm = F.normalize(z_sel, dim=-1)
+                if emb_norm is not None:
+                    unique_classes = torch.unique(y_all) if self.unique_proxies else None
+                    proxies_norm = emb_norm[unique_classes] if unique_classes is not None else emb_norm
+                else:
+                    proxies_norm = F.normalize(proxies, dim=-1)
+            else:
+                z_norm = z_sel
+                proxies_norm = proxies
+
+            logits = self._logits_z2c_prenorm(z_norm, proxies_norm, T_i)
+            z_norm_internal = z_norm
+            full_logits = logits  # best we have without full_sim
+
+        # ---- Shared loss computation ----
         loss_z2c = self._hard_negative_ce(
             logits, targets, k, weights=support_weights
         )
-        # Add full embedding logits
+
+        # Global loss
         if self.use_global:
-            loss_z2c_full = self.global_loss(z_norm, y, emb, T_i)
+            if full_sim is not None:
+                loss_z2c_full = self._global_loss_from_sim(full_sim, y, T_i)
+            else:
+                loss_z2c_full = self.global_loss(z_norm_internal, y, emb, T_i)
         else:
             loss_z2c_full = 0.0
-        
+
         # Weight logits based on margin to others (certainty)
         with torch.no_grad():
             margin_vals = logit_margins(logits, targets)
@@ -686,42 +851,29 @@ class ClipLoss(nn.Module):
 
         # Calculate responder weights
         if self.infer_weights:
-            inf_weights = infer_responder_weights(
-                logits=logits,
-                y=targets,
-            )
+            inf_weights = infer_responder_weights(logits=logits, y=targets)
         else:
-            # Set all weights to 1
             inf_weights = torch.ones(logits.size(0), device=targets.device)
-        
+
         # Weight loss weights per cell
         if self.training:
-            # Apply cell weights
             if weights is None:
                 weights = inf_weights
-            #else:
-            #    weights = weights * inf_weights
         else:
-            # Never use weights in validation
             weights = None
 
-        # ---------- reverse ----------
-        if self.use_reverse and inv is not None:
-            rev_T = T_i.mean() if T_i is not None else T
+        # Reverse loss
+        if self.use_reverse and full_sim is None and inv is not None:
             loss_c2z = self._clip_reverse_loss(
-                z_norm,     # batch + memory
-                proxies,   # full class embeddings
-                targets,     # batch + memory
-                rev_T,          # Use base T
+                z_norm_internal, proxies, targets, T_rev,
             )
         else:
             loss_c2z = 0.0
-            
-        # Log margin between pos and neg
-        m = margin(logits, targets).detach().item()
-        # Get logit entropy
-        e = entropy(logits).detach().item()
-        
+
+        # Log margin between pos and neg (avoid .item() GPU sync)
+        m = margin(logits, targets).detach()
+        e = entropy(logits).detach()
+
         # Apply supervision dropout
         if self.training and self.supervision_dropout_rate > 0:
             sup_drop = torch.bernoulli(
@@ -729,13 +881,14 @@ class ClipLoss(nn.Module):
             )
             loss_z2c = loss_z2c * sup_drop
             loss_c2z = loss_c2z * sup_drop
-            
-        # Apply intra-class repel to prevent collapse and overfitting
+
+        # Intra-class repel
         if class_repel > 0:
-            loss_cls_repel = self.intra_class_spread(z_norm, y)
+            _z_repel = z_norm if z_norm is not None else z_norm_internal
+            loss_cls_repel = self.intra_class_spread(_z_repel, y)
         else:
             loss_cls_repel = 0.0
-        
+
         # ---------- reduce -----------
         loss_z2c = self._reduce_loss(loss_z2c, weights=weights)
         loss_z2c_full = self._reduce_loss(loss_z2c_full, weights=weights)
@@ -746,27 +899,21 @@ class ClipLoss(nn.Module):
         loss = loss_z2c
         if self.use_global:
             loss = (1-self.global_weight) * loss + self.global_weight * loss_z2c_full
-        
-        # Add class repel loss
         loss = loss + class_repel * loss_cls_repel
-
-        # Add reverse loss with alpha on forward
         if self.use_reverse:
             loss = self.alpha * loss + (1-self.alpha) * loss_c2z
-        # Add contrastive loss
-        if self.contrastive_weight > 0:
-            loss = loss + self.contrastive_weight * loss_supcon
+
         # Update memory (after loss)
         if self.training and self.use_memory:
             self._update_memory(z.detach(), y.detach())
-        # Collect loss results
+
         return {
             LOSS_KEYS.LOSS: loss,
+            "clip/logits": full_logits.detach(),
             "clip/loss_z2c": loss_z2c,
             "clip/loss_c2z": loss_c2z,
             "clip/loss_z2c_full": loss_z2c_full,
             "clip/loss_cls_repel": loss_cls_repel,
-            "clip/loss_supcon": loss_supcon,
             "clip/margin_item": m,
             "clip/entropy": e,
             "clip/margin": margin_vals,

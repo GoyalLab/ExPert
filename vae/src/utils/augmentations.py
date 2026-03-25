@@ -11,6 +11,98 @@ def soft_rank(x, tau=1.0):
     return P.sum(-1) / x.size(-1)
 
 
+class CrossDatasetMixup(nn.Module):
+    """
+    Cross-dataset mixup augmentation. Mixes same-class cells from different
+    datasets to create synthetic bridge representations.
+    
+    Returns original batch concatenated with mixed samples, plus per-sample
+    weights (1.0 for real, scaled by lambda for synthetic).
+    """
+
+    def __init__(
+        self,
+        mixup_alpha: float = 0.4,
+        synthetic_weight: float = 0.5,
+    ):
+        super().__init__()
+        self.mixup_alpha = mixup_alpha
+        self.synthetic_weight = synthetic_weight
+
+    def _mixup(self, x, y, ctx):
+        B = x.size(0)
+        device = x.device
+
+        ctx_flat = ctx.view(-1)
+        y_flat = y.view(-1)
+
+        # Valid partner mask: same class, different dataset
+        valid_partners = (y_flat[:, None] == y_flat[None, :]) & (ctx_flat[:, None] != ctx_flat[None, :])
+
+        has_partner = valid_partners.any(dim=1)
+        idx = torch.where(has_partner)[0]
+        n_valid = len(idx)
+
+        if n_valid == 0:
+            return x.clone(), ctx.clone(), torch.zeros(B, device=device)
+
+        # For each valid sample, pick a random partner
+        # Mask invalid candidates with 0 probability, then sample via multinomial
+        partner_probs = valid_partners[idx].float()  # (n_valid, B)
+        partner_indices = torch.multinomial(partner_probs, num_samples=1).squeeze(-1)  # (n_valid,)
+
+        # Sample lambdas
+        lam = torch.distributions.Beta(
+            self.mixup_alpha, self.mixup_alpha
+        ).sample((n_valid,)).to(device)
+
+        # Mix
+        x_mixed = x.clone()
+        x_mixed[idx] = lam[:, None] * x[idx] + (1 - lam[:, None]) * x[partner_indices]
+
+        # Random context from either parent
+        ctx_mixed = ctx.clone()
+        use_partner_ctx = torch.rand(n_valid, device=device) > 0.5
+        ctx_mixed[idx] = torch.where(
+            use_partner_ctx,
+            ctx_flat[partner_indices],
+            ctx_flat[idx],
+        ).unsqueeze(-1)
+
+        # Weights: balanced mix = higher weight
+        weights = torch.zeros(B, device=device)
+        weights[idx] = self.synthetic_weight * (1 - (lam - 0.5).abs() * 2)
+
+        return x_mixed, ctx_mixed, weights
+
+    def forward(self, batch):
+        x = batch[MODULE_KEYS.X_KEY].float()
+        ctx = batch[MODULE_KEYS.BATCH_INDEX_KEY]
+        y = batch[MODULE_KEYS.LABEL_KEY]
+
+        # Generate mixup samples
+        x_mixed, ctx_mixed, mix_weights = self._mixup(x, y, ctx)
+
+        # Real samples get weight 1.0
+        real_weights = torch.ones(x.size(0), device=x.device)
+        # Create mask for real vs mixup
+        mixup = torch.zeros(x_mixed.size(0), device=x.device)
+        real_mask = torch.cat([real_weights, mixup], dim=0)
+
+        # Concatenate [real, mixed]
+        return {
+            MODULE_KEYS.X_KEY: torch.cat([x, x_mixed], dim=0),
+            MODULE_KEYS.BATCH_INDEX_KEY: torch.cat([ctx, ctx_mixed], dim=0).flatten(),
+            MODULE_KEYS.LABEL_KEY: torch.cat([y, y], dim=0).flatten(),
+            MODULE_KEYS.CONT_COVS_KEY: batch[MODULE_KEYS.CONT_COVS_KEY].repeat(2, 1) if batch.get(MODULE_KEYS.CONT_COVS_KEY) is not None else None,
+            MODULE_KEYS.CAT_COVS_KEY: batch[MODULE_KEYS.CAT_COVS_KEY].repeat(2, 1) if batch.get(MODULE_KEYS.CAT_COVS_KEY) is not None else None,
+            MODULE_KEYS.LIBRARY_KEY: batch[MODULE_KEYS.LIBRARY_KEY].repeat(2, 1) if batch.get(MODULE_KEYS.LIBRARY_KEY) is not None else None,
+            MODULE_KEYS.CLS_EFF_KEY: batch[MODULE_KEYS.CLS_EFF_KEY].repeat(2, 1) if batch.get(MODULE_KEYS.CLS_EFF_KEY) is not None else None,
+            'mixup_weights': torch.cat([real_weights, mix_weights], dim=0),
+            'real_mask': real_mask
+        }
+
+
 class BatchAugmentation(nn.Module):
 
     def __init__(

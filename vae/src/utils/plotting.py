@@ -5,6 +5,7 @@ import scanpy as sc
 import anndata as ad
 
 from typing import Literal
+from pandas.api.types import is_numeric_dtype
 
 import umap
 
@@ -54,74 +55,165 @@ def calc_umap(adata: ad.AnnData, rep: str = 'X_pca', slot_key: str | None = None
     adata.obsm[slot_key] = _umap.fit_transform(adata.obsm[rep])
     return _umap if return_umap else None
 
-def plot_umap(
-        adata: ad.AnnData, 
-        slot: str, 
-        hue: str, 
-        output_file: str | None = None,
-        title: str = '',
-        show_spines: bool = True,
-        **scatter_kwargs,
-    ) -> None:
-    # Check if adata.obsm slot exists
+def _prepare_umap_df(adata: ad.AnnData, slot: str, hue: str) -> pd.DataFrame:
+    """Construct plotting dataframe."""
     if slot not in adata.obsm:
-        raise ValueError(f'Could not find {slot} slot in adata.obsm.')
-    # Get slot umap data
+        raise ValueError(f"Could not find {slot} slot in adata.obsm.")
+
     data = adata.obsm[slot]
-    # Add column labels and construct plotting dataframe
-    cols = 'UMAP' + pd.Series(np.arange(data.shape[1])+1).astype(str)
+
+    cols = "UMAP" + pd.Series(np.arange(data.shape[1]) + 1).astype(str)
     embedding = pd.DataFrame(data, columns=cols)
-    # Transfer hue label from adata.obs
-    embedding[hue] = adata.obs[hue].values
-    # Add palette if less than 103 labels are given
-    n_hue = embedding[hue].nunique()
-    # Enable palette with legend
-    if n_hue < 103:
-        pal = get_pal(n_hue)
-        scatter_kwargs['palette'] = pal
-        scatter_kwargs['legend'] = True
-    # Disable legend for too many labels
+
+    if hue in adata.obs:
+        embedding[hue] = adata.obs[hue].values
+    elif hue in adata.var:
+        embedding[hue] = adata.var[hue].values
     else:
-        scatter_kwargs['legend'] = True
-    # Create plot
-    plt.figure(dpi=300)
-    default_scatter_kwargs = {'s': 4, 'alpha': 0.5}
+        raise ValueError(f"{hue} not found in adata.obs or adata.var")
+
+    return embedding
+
+
+def _plot_umap_categorical(
+    embedding: pd.DataFrame,
+    hue: str,
+    title: str,
+    output_file: str | None,
+    show_spines: bool,
+    **scatter_kwargs,
+):
+
+    n_hue = embedding[hue].nunique()
+
+    if n_hue < 103:
+        scatter_kwargs["palette"] = get_pal(n_hue)
+        scatter_kwargs["legend"] = True
+    else:
+        scatter_kwargs["legend"] = True
+
+    fig, ax = plt.subplots(dpi=300)
+
+    default_scatter_kwargs = {"s": 4, "alpha": 0.5}
     default_scatter_kwargs.update(scatter_kwargs)
-    ax = sns.scatterplot(
-        embedding, x='UMAP1', y='UMAP2', 
+
+    sns.scatterplot(
+        data=embedding,
+        x="UMAP1",
+        y="UMAP2",
         hue=hue,
-        **default_scatter_kwargs
+        ax=ax,
+        **default_scatter_kwargs,
     )
-    # Toggle spines
+
     if not show_spines:
         for spine in ax.spines.values():
             spine.set_visible(False)
-    # Set axes labels
+
     ax.set_xticks([])
     ax.set_yticks([])
-    plt.xlabel('')
-    plt.ylabel('')
-    plt.title(title)
-    # Push legend outside of the plot if we want to show it
-    if scatter_kwargs.get('legend', False):
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_title(title)
+
+    if scatter_kwargs.get("legend", False):
         max_labels_per_col = 20
         ncol = max(int(n_hue / max_labels_per_col), 1)
-        plt.legend(
+
+        ax.legend(
             title=hue,
             bbox_to_anchor=(1.05, 1),
             loc="upper left",
-            borderaxespad=0, 
+            borderaxespad=0,
             markerscale=2,
-            ncol=ncol
+            ncol=ncol,
         )
-    # Just show the plot if no output file is provided
+
     if output_file is None:
         plt.show()
-    # Save the plot to the given file path
     else:
-        plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    # Close the plot in any case
+        plt.savefig(output_file, dpi=300, bbox_inches="tight")
+
     plt.close()
+
+
+def _plot_umap_continuous(
+    embedding: pd.DataFrame,
+    hue: str,
+    title: str,
+    output_file: str | None,
+    show_spines: bool,
+    cmap="viridis",
+    **scatter_kwargs,
+):
+
+    fig, ax = plt.subplots(dpi=300)
+
+    default_scatter_kwargs = {"s": 4, "alpha": 0.5}
+    default_scatter_kwargs.update(scatter_kwargs)
+
+    sc = ax.scatter(
+        embedding["UMAP1"],
+        embedding["UMAP2"],
+        c=embedding[hue],
+        cmap=cmap,
+        **default_scatter_kwargs,
+    )
+
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label(hue)
+
+    if not show_spines:
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_title(title)
+
+    if output_file is None:
+        plt.show()
+    else:
+        plt.savefig(output_file, dpi=300, bbox_inches="tight")
+
+    plt.close()
+
+
+def plot_umap(
+    adata: ad.AnnData,
+    slot: str,
+    hue: str,
+    output_file: str | None = None,
+    title: str = "",
+    show_spines: bool = True,
+    **scatter_kwargs,
+):
+    """
+    Plot UMAP embedding with automatic handling of categorical vs continuous hues.
+    """
+
+    embedding = _prepare_umap_df(adata, slot, hue)
+
+    if is_numeric_dtype(embedding[hue]):
+        _plot_umap_continuous(
+            embedding,
+            hue,
+            title,
+            output_file,
+            show_spines,
+            **scatter_kwargs,
+        )
+    else:
+        _plot_umap_categorical(
+            embedding,
+            hue,
+            title,
+            output_file,
+            show_spines,
+            **scatter_kwargs,
+        )
 
 def plot_umaps(
         adata: ad.AnnData,
@@ -313,168 +405,363 @@ def plot_top_n_performance(
         plt.show()
     # Close the plot
     plt.close()
-    
-def plot_umap_with_proxies(
-    latent_space: np.ndarray,
-    labels: np.ndarray,
-    covs: np.ndarray,
-    modes: np.ndarray | None = None,
-    cls_emb: np.ndarray | None = None,
-    code_to_label: dict[int, str] | None = None,
-    title_prefix: str = "",
-    save_path: str | None = None,
-    n_obs: int | None = None,
-    palette: str = 'tab20'
-):
-    N = latent_space.shape[0]
-    modes = np.asarray(modes) if modes is not None else np.repeat("mode", N)
 
-    # ----------------------------------------------------------
-    # Combine latent space with proxy/class embeddings
-    # ----------------------------------------------------------
-    if cls_emb is not None:
-        n_proxies = cls_emb.shape[0]
+def plot_top_n_performance_per_dataset(
+        top_n_predictions: pd.DataFrame,
+        context_key: str = 'dataset',
+        split_key: str = 'split',
+        output_file: str | None = None,
+        metric: Literal['f1-score', 'accuracy', 'precision', 'recall'] = 'f1-score',
+        show_random: bool = True,
+        top_n: int = 10,
+        top_n_step: int = 1,
+        figsize_per_row: tuple[float, float] = (14, 3.5),
+        **kwargs,
+    ) -> None:
+    """
+    Plot top-N performance per dataset.
+    Rows = top_n values, x = dataset, y = metric, hue = split.
+    Point size = class support within context.
+    """
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
 
-        proxy_labels = np.arange(n_proxies)
-        proxy_covs = np.repeat("proxy", n_proxies)
-        proxy_modes = np.repeat("proxy", n_proxies)
+    data = top_n_predictions[top_n_predictions.top_n <= top_n].copy()
+    data['top_n'] = pd.to_numeric(data['top_n'])
 
-        proxy_is_obs = (
-            np.array([True] * n_obs + [False] * (n_proxies - n_obs))[:n_proxies]
-            if n_obs is not None
-            else np.ones(n_proxies, dtype=bool)
+    # Include random in split hue
+    if show_random:
+        data.loc[data['mode'] == 'random', split_key] = 'random'
+    else:
+        data = data[data['mode'] != 'random']
+
+    # Subsample top_n values by step
+    top_n_values = sorted(data['top_n'].unique())
+    top_n_values = [t for t in top_n_values if (t - 1) % top_n_step == 0 or t == max(top_n_values)]
+    data = data[data['top_n'].isin(top_n_values)]
+
+    n_rows = len(top_n_values)
+    datasets = sorted(data[context_key].unique())
+    ds_to_x = {ds: i for i, ds in enumerate(datasets)}
+    splits = sorted(data[split_key].unique())
+    split_palette = sns.color_palette('tab10', n_colors=len(splits))
+    split_to_color = dict(zip(splits, split_palette))
+
+    # Support-based sizing
+    if 'support' in data.columns:
+        global_support = data['support'].values
+        s_min, s_max = 15, 120
+    else:
+        global_support = None
+
+    fig, axes = plt.subplots(
+        n_rows, 1,
+        figsize=(figsize_per_row[0], figsize_per_row[1] * n_rows),
+        squeeze=False,
+        sharex=True,
+    )
+
+    for row, tn in enumerate(top_n_values):
+        ax = axes[row, 0]
+        tn_data = data[data['top_n'] == tn]
+
+        # Boxplot per split
+        sns.boxplot(
+            data=tn_data,
+            x=context_key,
+            y=metric,
+            hue=split_key,
+            order=datasets,
+            hue_order=splits,
+            ax=ax,
+            showfliers=False,
+            boxprops=dict(alpha=0.3),
+            width=0.7,
+            **kwargs,
         )
 
-        embeddings_all = np.concatenate([latent_space, cls_emb], axis=0)
+        # Scatter overlay with support-based sizing
+        jitter_width = 0.7 / len(splits)
+        for s_idx, split in enumerate(splits):
+            split_data = tn_data[tn_data[split_key] == split]
+            if len(split_data) == 0:
+                continue
+
+            x_pos = split_data[context_key].map(ds_to_x).values
+            offset = (s_idx - len(splits) / 2 + 0.5) * jitter_width
+            x_jittered = x_pos + offset + np.random.uniform(-jitter_width * 0.3, jitter_width * 0.3, size=len(x_pos))
+
+            if global_support is not None and 'support' in split_data.columns:
+                support = split_data['support'].values
+                sizes = np.sqrt(support)
+                sizes = (sizes - np.sqrt(global_support.min())) / (np.sqrt(global_support.max()) - np.sqrt(global_support.min()) + 1e-6)
+                sizes = s_min + sizes * (s_max - s_min)
+            else:
+                sizes = 30
+
+            ax.scatter(
+                x_jittered,
+                split_data[metric].values,
+                c=[split_to_color[split]],
+                s=sizes,
+                alpha=0.6,
+                linewidths=0,
+                zorder=5,
+            )
+
+        # Per-split mean annotation
+        split_means = tn_data.groupby(split_key)[metric].mean()
+        mean_str = ' | '.join([f'{s}: {split_means.get(s, 0):.2f}' for s in splits if s != 'random'])
+        ax.set_title(f'Top {tn}  —  {mean_str}', fontsize=10, fontweight='bold')
+
+        ax.set_ylabel(metric.capitalize(), fontsize=9)
+        ax.set_ylim(0, 1.05)
+        ax.get_legend().remove()
+
+        if row < n_rows - 1:
+            ax.set_xlabel('')
+        else:
+            ax.set_xlabel('')
+            ax.set_xticks(range(len(datasets)))
+            ax.set_xticklabels(datasets, rotation=45, ha='right', fontsize=8)
+
+    # Shared legend at top
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=split_to_color[s], alpha=0.7, label=s) for s in splits]
+    if global_support is not None:
+        legend_elements.append(plt.scatter([], [], s=s_min, c='gray', alpha=0.6, label=f'support={int(global_support.min())}'))
+        legend_elements.append(plt.scatter([], [], s=s_max, c='gray', alpha=0.6, label=f'support={int(global_support.max())}'))
+    fig.legend(
+        handles=legend_elements,
+        loc='upper center',
+        ncol=len(legend_elements),
+        fontsize=8,
+        bbox_to_anchor=(0.5, 1.02),
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    if output_file is not None:
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    else:
+        plt.show()
+    plt.close()
+    
+def plot_umap_with_proxies(
+    adata,
+    latent_key: str,
+    proxy_key: str | None = None,
+    perturbation_col: str = "perturbation",
+    batch_key: str | None = None,
+    idx_to_label: np.ndarray | None = None,
+    arrows_to_proxy: bool = False,
+    arrow_frac: float = 0.02,
+    palette: str = "tab20",
+    title: str = "",
+    output_file: str | None = None,
+):
+    # --------------------------------------------------
+    # Add latent space
+    # --------------------------------------------------
+    latent = adata.obsm[latent_key]
+    # Normalize latent
+    latent = latent / (np.linalg.norm(latent, axis=1, keepdims=True) + 1e-12)
+    N = latent.shape[0]
+    # Collect perturbation values
+    perturbations = adata.obs[perturbation_col].astype(str).values
+    # Collect covariates
+    covs = (
+        adata.obs[batch_key].astype(str).values
+        if batch_key is not None
+        else np.repeat("cell", N)
+    )
+
+    # --------------------------------------------------
+    # Add proxies
+    # --------------------------------------------------
+    proxies = None
+    proxy_labels = None
+    # Add class proxies if they exist
+    if proxy_key and proxy_key in adata.uns:
+        # Get class proxies from model adata and normalize
+        proxies = adata.uns[proxy_key]
+        # Normalize proxies
+        proxies = proxies / (np.linalg.norm(proxies, axis=1, keepdims=True) + 1e-12)
+
+        if proxies.ndim == 3:
+            proxies = proxies.mean(1)
+
+        n_proxies = proxies.shape[0]
+        proxy_labels = np.arange(n_proxies).astype(int)
+        # Annotate proxies
+        if idx_to_label is not None:
+            proxy_labels = idx_to_label[proxy_labels]
+        else:
+            proxy_labels = proxy_labels.astype(str)
+        observed = set(perturbations)
+
+        proxy_is_obs = np.array([p in observed for p in proxy_labels])
+
+        embeddings_all = np.concatenate([latent, proxies], axis=0)
 
         df = pd.DataFrame({
-            "label_id": np.concatenate([labels, proxy_labels]),
-            "cov": np.concatenate([covs, proxy_covs]),
-            "mode": np.concatenate([modes, proxy_modes]),
+            "label": np.concatenate([perturbations, proxy_labels]),
+            "cov": np.concatenate([covs, np.repeat("proxy", n_proxies)]),
             "is_proxy": np.concatenate([np.zeros(N, bool), np.ones(n_proxies, bool)]),
-            "is_observed": np.concatenate([np.ones(N, bool), proxy_is_obs])
+            "is_observed": np.concatenate([np.ones(N, bool), proxy_is_obs]),
         })
 
     else:
-        embeddings_all = latent_space
-        n_proxies = 0
+        # No proxies, just use latent space for plotting
+        embeddings_all = latent
         df = pd.DataFrame({
-            "label_id": labels,
+            "label": perturbations,
             "cov": covs,
-            "mode": modes,
             "is_proxy": np.zeros(N, bool),
             "is_observed": np.ones(N, bool),
         })
 
-    # Human-readable class names
-    if code_to_label is not None:
-        df["label"] = code_to_label[df["label_id"]]
-    else:
-        df["label"] = df["label_id"].astype(str)
-
-    # ----------------------------------------------------------
-    # UMAP transform
-    # ----------------------------------------------------------
+    # --------------------------------------------------
+    # UMAP
+    # --------------------------------------------------
     reducer = umap.UMAP(n_components=2)
     emb_2d = reducer.fit_transform(embeddings_all)
+
     df["UMAP1"] = emb_2d[:, 0]
     df["UMAP2"] = emb_2d[:, 1]
 
-    # ----------------------------------------------------------
-    # Base scatter function
-    # ----------------------------------------------------------
-    def _scatter(ax, data, hue, title, plot_proxy=True, legend=True):
-        # Get color map
+    # --------------------------------------------------
+    # observed vs unseen label
+    # --------------------------------------------------
+    df["obs_proxy"] = np.where(
+        df.is_proxy,
+        np.where(df.is_observed, "Observed proxy", "Unseen proxy"),
+        "Cells",
+    )
+
+    # --------------------------------------------------
+    # scatter helper
+    # --------------------------------------------------
+    def _scatter(ax, data, hue, title, plot_proxy=True, annot=False):
         unique_labels = sorted(data[hue].unique())
-        _palette = sns.color_palette(palette, len(unique_labels))
-        color_map = dict(zip(unique_labels, _palette))
-        # Non-proxy points
+        pal = sns.color_palette(palette, len(unique_labels))
+        color_map = dict(zip(unique_labels, pal))
+
         sns.scatterplot(
             data=data[~data.is_proxy],
-            x="UMAP1", y="UMAP2",
+            x="UMAP1",
+            y="UMAP2",
             hue=hue,
             palette=color_map,
-            s=6, alpha=0.6, ax=ax,
-            legend=False  # manual legend later
+            s=6,
+            alpha=0.6,
+            ax=ax,
+            legend=False,
         )
 
-        # Proxy points
         if plot_proxy and data.is_proxy.any():
+
+            proxy_df = data[data.is_proxy]
+
             sns.scatterplot(
-                data=data[data.is_proxy],
-                x="UMAP1", y="UMAP2",
+                data=proxy_df,
+                x="UMAP1",
+                y="UMAP2",
                 hue=hue,
                 palette=color_map,
-                marker="X", s=70,
-                edgecolor="black", linewidth=0.6,
-                ax=ax, legend=False
+                marker="X",
+                s=80,
+                edgecolor="black",
+                linewidth=0.6,
+                ax=ax,
+                legend=False,
             )
 
-            # ----------------------------------------------
-            # Add text labels for proxies (<=200)
-            # ----------------------------------------------
-            if data.is_proxy.sum() <= 200:
-                proxy_df = data[data.is_proxy]
+            # label proxies if not too many
+            if annot and proxy_df.shape[0] <= 200:
                 for _, row in proxy_df.iterrows():
                     ax.text(
-                        row["UMAP1"] + 0.01,
-                        row["UMAP2"] + 0.01,
-                        str(row[hue]),
+                        row["UMAP1"] + 0.02,
+                        row["UMAP2"] + 0.02,
+                        row[hue],
                         fontsize=7,
                         color=color_map[row[hue]],
-                        weight="bold"
+                        weight="bold",
                     )
 
         ax.set_title(title)
-        ax.set_xlabel("UMAP1")
-        ax.set_ylabel("UMAP2")
+        ax.set_xticks([])
+        ax.set_yticks([])
 
-        # Add legend with consistent colors
-        if legend:
-            handles = [
-                plt.Line2D([0], [0], marker="o", color=color_map[l],
-                           linestyle="", markersize=6, label=l)
-                for l in unique_labels
-            ]
-            ax.legend(
-                handles=handles,
-                bbox_to_anchor=(1.05, 1),
-                loc="upper left",
-                fontsize="small",
-                title=hue,
+    # --------------------------------------------------
+    # figure layout
+    # --------------------------------------------------
+    ncols = 3 if batch_key else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4), dpi=150)
+
+    axes = np.array(axes).flatten()
+
+    _scatter(
+        axes[0],
+        df,
+        "label",
+        f"{title} Perturbations",
+        annot=True
+    )
+    _scatter(
+        axes[1],
+        df,
+        "obs_proxy",
+        f"{title} Observed vs Unseen proxies",
+    )
+    if batch_key:
+        _scatter(
+            axes[2],
+            df,
+            "cov",
+            f"{title} Contexts",
+            plot_proxy=False,
+        )
+
+    # --------------------------------------------------
+    # optional arrows to nearest proxy
+    # --------------------------------------------------
+    if arrows_to_proxy and proxies is not None:
+        from sklearn.metrics import pairwise_distances
+        cell_z = latent
+        proxy_z = proxies
+
+        D = pairwise_distances(cell_z, proxy_z)
+        nearest = np.argmin(D, axis=1)
+
+        cell_umap = emb_2d[:N]
+        proxy_umap = emb_2d[N:]
+
+        rng = np.random.default_rng(0)
+        idx = rng.choice(N, int(N * arrow_frac), replace=False)
+
+        for i in idx:
+            j = nearest[i]
+            axes[0].annotate(
+                "",
+                xy=proxy_umap[j],
+                xytext=cell_umap[i],
+                arrowprops=dict(
+                    arrowstyle="-",
+                    color="gray",
+                    alpha=0.3,
+                    linewidth=0.5,
+                ),
             )
 
-    # ----------------------------------------------------------
-    # 4-panel figure
-    # ----------------------------------------------------------
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9), dpi=150)
-
-    df_obs_only = df[(df.is_proxy & df.is_observed) | (~df.is_proxy)]
-    _scatter(axes[0, 0], df_obs_only, "label",
-             f"{title_prefix} Observed Proxies Only",
-             plot_proxy=True, legend=False)
-
-    _scatter(axes[0, 1], df, "is_observed",
-             f"{title_prefix} Observed & unobserved proxies",
-             plot_proxy=True, legend=True)
-
-    # Unseen proxies only
-    df_unseen_only = df[(df.is_proxy & ~df.is_observed)]
-    df_unseen_only = pd.concat([df[~df.is_proxy], df_unseen_only])
-    _scatter(axes[1, 0], df_unseen_only, "label",
-             f"{title_prefix} Unseen Proxies Only",
-             plot_proxy=True, legend=False)
-
-    _scatter(axes[1, 1], df, "cov",
-             f"{title_prefix} Covariates",
-             plot_proxy=False, legend=True)
-
     plt.tight_layout()
-
-    if save_path:
-        fig.savefig(save_path, dpi=200)
-
-    plt.show()
+    # Save plot to file
+    if output_file:
+        fig.savefig(output_file, dpi=300, bbox_inches="tight")
+    # Show plot
+    else:
+        plt.show()
+    # Close plot
+    plt.close(fig)
     return df, fig
 
 def plot_confusion_full(

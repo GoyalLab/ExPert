@@ -8,7 +8,7 @@ import collections
 from collections.abc import Callable, Iterable
 from typing import Literal, Iterable, Optional
 
-from torch.distributions import Normal
+from scvi.distributions import Normal
 from transformers import AutoTokenizer, AutoModel
 
 from src.utils.constants import MODULE_KEYS
@@ -236,12 +236,14 @@ class FunnelFCLayers(nn.Module):
         use_layer_norm: bool = True,
         use_activation: bool = True,
         inject_covariates: bool = False,
+        injection_from_layer: int = 0,
         activation_fn: nn.Module = nn.GELU,
         **kwargs,
     ):
         super().__init__()
 
         self.inject_covariates = inject_covariates
+        self.injection_from_layer = injection_from_layer
         self.use_activation = use_activation
         self.use_layer_norm = use_layer_norm
         self.kwargs = kwargs
@@ -283,7 +285,7 @@ class FunnelFCLayers(nn.Module):
     
     def inject_into_layer(self, layer_num) -> bool:
         """Helper to determine if covariates should be injected."""
-        return layer_num > 0 and self.inject_covariates
+        return layer_num >= self.injection_from_layer and self.inject_covariates
 
     def forward(self, x: torch.Tensor, *cat_list: torch.Tensor) -> torch.Tensor:
         # One-hot encode categorical covariates
@@ -660,9 +662,13 @@ class Encoder(nn.Module):
         noise_sigma_add: float = 0.01,
         encoder_type: Literal["funnel", "fc", "transformer"] = "funnel",
         context_integration_method : Literal["concat", "film", "attention"] | None = None,
-        use_ranks: bool = False,
+        normalize_x: bool = False,
         x_weight: float = 0.0,
         use_emb: bool = True,
+        linear_gene_proj: bool = True,
+        init_emb_pca: bool = True,
+        post_emb_ln: bool = False,
+        residual_scale: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -688,12 +694,14 @@ class Encoder(nn.Module):
         self.noise_sigma = noise_sigma
         self.noise_sigma_add = noise_sigma_add
         self.context_integration_method = context_integration_method
-        self.use_ranks = use_ranks
-        
+        self.normalize_x = normalize_x
+        # Add residual x on top x @ E
+        self.residual_scale = min(max(residual_scale, 0.0), 1.0)
+
         # Add gene ranks as secondary input source
         base_n_input = n_input
         self.x_weight = x_weight
-        if use_ranks:
+        if normalize_x:
             # Also include raw x (scaled)
             if x_weight > 0:
                 base_n_input += n_input
@@ -735,14 +743,33 @@ class Encoder(nn.Module):
                     self.gene_embedding = nn.Parameter(llm_init.clone())
 
                 # Learnable projection from LLM dim --> desired dim
-                self.gene_proj = nn.Sequential(
-                    nn.Linear(d_llm, self.n_gene_emb*2),
-                    nn.LayerNorm(self.n_gene_emb*2),
-                    nn.GELU(),
-                    nn.Linear(self.n_gene_emb*2, self.n_gene_emb),
-                )
-                # Add normalization
-                self.post_emb_ln = nn.LayerNorm(self.n_gene_emb)
+                if linear_gene_proj:
+                    self.gene_proj = nn.Linear(d_llm, self.n_gene_emb, bias=False)
+                    if init_emb_pca:
+                        # Initialize as top right singular vectors — optimal linear projection
+                        _, _, Vt = torch.linalg.svd(llm_init, full_matrices=False)
+                        self.gene_proj.weight.data = Vt[:self.n_gene_emb]
+                else:
+                    self.gene_proj = nn.Sequential(
+                        nn.Linear(d_llm, self.n_gene_emb*2),
+                        nn.LayerNorm(self.n_gene_emb*2),
+                        nn.GELU(),
+                        nn.Linear(self.n_gene_emb*2, self.n_gene_emb),
+                    )
+                # Add direct path
+                self.residual = nn.Linear(n_input, self.n_gene_emb, bias=False)
+                # Init small so semantic path dominates early
+                nn.init.normal_(self.residual.weight, std=0.01)
+                # Add optional normalization
+                self.post_emb_ln = nn.LayerNorm(self.n_gene_emb) if post_emb_ln else None
+                # Quick check after init
+                with torch.no_grad():
+                    E_proj = self.gene_proj(self.gene_embedding)
+                    E_orig = self.gene_embedding
+                    # Pairwise similarity should be preserved
+                    sim_orig = F.cosine_similarity(E_orig[:10].unsqueeze(1), E_orig[10:20].unsqueeze(0), dim=-1)
+                    sim_proj = F.cosine_similarity(E_proj[:10].unsqueeze(1), E_proj[10:20].unsqueeze(0), dim=-1)
+                    logging.info(f"Embedding PCA similarity correlation: {np.corrcoef(sim_orig.flatten().numpy(), sim_proj.flatten().numpy())[0,1]:.4f}")
             # Use learnable embedding
             else:
                 # If no LLM init provided, learn embedding directly
@@ -778,7 +805,7 @@ class Encoder(nn.Module):
         # Debug
         self.c = 0
         
-    def normalize_x(self, x: torch.Tensor, feature_masks: torch.Tensor):
+    def _normalize_x(self, x: torch.Tensor, feature_masks: torch.Tensor):
         if feature_masks is None:
             # Simple normalization over all features
             cell_mean = x.mean(dim=1, keepdim=True) 
@@ -812,48 +839,63 @@ class Encoder(nn.Module):
         else:
             return x_norm
     
-    def forward(self, x: torch.Tensor, *cat_list: int, feature_masks: torch.Tensor | None = None, **kwargs):
-        # Optional multiplicative noise injection
-        if self.training and self.noise_sigma:
-            noise = torch.exp(
-                torch.randn_like(x) * self.noise_sigma
-            )
-            x = x * noise
-        
-        # Add ranks to input data
-        if self.use_ranks:
+    def forward(self, x: torch.Tensor, *cat_list: int, feature_masks: torch.Tensor | None = None, **kwargs):     
+        # Normalize input x
+        if self.normalize_x:
             # Normalize x by feature mask and introduce soft ranking
-            x = self.normalize_x(x, feature_masks)
-        
-        # Optional additive noise injection on normalized x
-        if self.training and self.noise_sigma_add:
-            x = x + torch.randn_like(x) * self.noise_sigma_add
+            x = self._normalize_x(x, feature_masks)
         
         # Use gene embedding as projection
         if self.use_emb:
-            # Scale by number of active genes (important!)
+            # Scale by number of active genes
             if feature_masks is not None:
                 n_active = feature_masks.sum(dim=1, keepdim=True).clamp(min=1.0)
                 x = x / torch.sqrt(n_active)
-
+            # Branch off x for residual pathway
+            x_res = x
             # Get pretrained gene embedding projection
             if self.gene_proj is not None:
                 E = self.gene_proj(self.gene_embedding)  # (G, d_embed)
             # Use learnable gene embedding
             else:
                 E = self.gene_embedding  # already (G, d_embed)
+            # Center on embedding bias
+            E = E - E.mean(dim=0, keepdim=True)
+            # Normalize E so each gene contributes equally in direction
+            E = F.normalize(E, dim=-1)
 
             # Project gene expression into embedding space
-            x = x @ E  # (B, G) @ (G, d_embed) → (B, d_embed)
-            # Normalize output
+            x = x @ E  # (B, G) @ (G, d_embed) --> (B, d_embed)
+            
+            # Normalize output range
             if self.post_emb_ln is not None:
                 x = self.post_emb_ln(x)
+            # Stabilize output
+            else:
+                x = x / (x.norm(dim=-1, keepdim=True) + 1e-6) * np.sqrt(self.n_gene_emb)
+
+            # Add residual raw x on top as small correction to embedding
+            if self.residual_scale > 0:
+                x = x + self.residual(x_res) * self.residual_scale
+            # Noise in embedding space
+            if self.training and self.noise_sigma:
+                x = x + torch.randn_like(x) * self.noise_sigma
+        else:
+            # Noise for non-embedding path
+            if self.training and self.noise_sigma:
+                x = x * torch.exp(torch.randn_like(x) * self.noise_sigma)
+
+        # Feature dropout
+        if self.training and self.drop_prob > 0:
+            drop_mask = torch.bernoulli(torch.full((x.size(0), x.size(1)), 1 - self.drop_prob, device=x.device))
+            x = x * drop_mask / (1 - self.drop_prob)  # inverted dropout
         
         # Feed x to the encoder
         q = self.encoder(x, *cat_list)
         
         # Debug
-        self.c = self.c + 1
+        if self.training:
+            self.c = self.c + 1
         # Latent heads
         q_m = self.mean_encoder(q)
         q_v = self.var_activation(self.var_encoder(q)) + self.var_eps
@@ -1252,11 +1294,113 @@ class SplitEncoder(nn.Module):
             "zl": z_l,
             "qzl": qz_l,
         }
+        
+        
+class Decoder(nn.Module):
+    """Decoder for reconstructing preprocessed (non-count) data with Normal distribution."""
+
+    def __init__(
+        self,
+        n_input: int,
+        n_output: int,
+        n_hidden: int = 128,
+        n_cat_list: Iterable[int] = None,
+        n_layers: int = 1,
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = True,
+        use_funnel: bool = True,
+        inject_covariates: bool = False,
+        noise_std: float = 0.05,
+        linear_decoder: bool = False,
+        **kwargs,
+    ):
+        super().__init__()
+        self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in (n_cat_list or [])]
+        self.cat_dim = sum(self.n_cat_list)
+        self.noise_std = noise_std
+
+        if n_hidden is None or n_hidden < 0:
+            funnel_out_dim = n_output // 2
+        else:
+            funnel_out_dim = n_hidden
+
+        if linear_decoder:
+            self.decoder = FCLayers(
+                n_in=n_input,
+                n_out=funnel_out_dim,
+                n_cat_list=n_cat_list,
+                dropout_rate=0,
+                inject_covariates=inject_covariates,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                inverted=True,
+                linear=True,
+            )
+        else:
+            fc_class = FunnelFCLayers if use_funnel else FCLayers
+            self.decoder = fc_class(
+                n_in=n_input,
+                n_out=funnel_out_dim,
+                n_hidden=n_hidden,
+                n_layers=n_layers,
+                dropout_rate=0,
+                inject_covariates=inject_covariates,
+                use_batch_norm=use_batch_norm,
+                use_layer_norm=use_layer_norm,
+                inverted=True,
+                **kwargs,
+            )
+
+        # Output heads: mean and variance
+        self.px_mean_decoder = nn.Linear(funnel_out_dim, n_output)
+        self.px_var_decoder = nn.Sequential(
+            nn.Linear(funnel_out_dim, n_output),
+            nn.Softplus(),
+        )
+
+        # FiLM conditioning from covariates on output heads only
+        if self.cat_dim > 0:
+            self.film_scale = nn.Linear(self.cat_dim, funnel_out_dim)
+            self.film_shift = nn.Linear(self.cat_dim, funnel_out_dim)
+            nn.init.zeros_(self.film_scale.weight)
+            nn.init.zeros_(self.film_scale.bias)
+            nn.init.zeros_(self.film_shift.weight)
+            nn.init.zeros_(self.film_shift.bias)
+        else:
+            self.film_scale = None
+            self.film_shift = None
+
+    def _apply_film(self, px: torch.Tensor, *cat_list: int):
+        one_hot_cat_list = []
+        for n_cat, cat in zip(self.n_cat_list, cat_list, strict=False):
+            if n_cat > 1:
+                cat = cat.squeeze(-1) if cat.dim() == 2 and cat.size(-1) == 1 else cat
+                one_hot_cat_list.append(F.one_hot(cat, num_classes=n_cat).float())
+
+        if one_hot_cat_list and self.film_scale is not None:
+            cat_input = torch.cat(one_hot_cat_list, dim=-1)
+            cat_input = cat_input.expand(px.shape[0], -1)
+            gamma = self.film_scale(cat_input)
+            beta = self.film_shift(cat_input)
+            px = px * (1 + gamma) + beta
+        return px
+
+    def forward(self, z: torch.Tensor, *cat_list: int):
+        if self.training and self.noise_std > 0:
+            z = z + self.noise_std * torch.randn_like(z)
+        # Decode without covariates
+        px = self.decoder(z)
+        # FiLM modulation before output heads
+        px = self._apply_film(px, *cat_list)
+        # Mean and variance
+        px_mean = self.px_mean_decoder(px)
+        px_var = self.px_var_decoder(px) + 1e-6
+        return Normal(px_mean, px_var.sqrt())
 
 
 # Decoder
 class DecoderSCVI(nn.Module):
-    """Decodes latent variables, optionally conditioned on context via concatenation or FiLM."""
+    """Decodes latent space with covariate conditioning and zinb parameters."""
 
     def __init__(
         self,
@@ -1267,46 +1411,40 @@ class DecoderSCVI(nn.Module):
         n_layers: int = 1,
         inject_covariates: bool = True,
         use_batch_norm: bool = False,
-        use_layer_norm: bool = False,
+        use_layer_norm: bool = True,
         scale_activation: Literal["softmax", "softplus"] = "softmax",
         use_funnel: bool = False,
         linear_decoder: bool = False,
-        n_dim_context_emb: int | None = None,
-        n_ctx_frac: float | None = 0.5,
-        n_context_compression: int | None = None,
-        linear_ctx_compression: bool = True,
+        use_cat_emb: bool = True,
+        n_cat_dim: int | None = None,
+        n_cat_frac: float = 1.0,
         use_film: bool = False,
+        init_film_zero: bool = True,
         **kwargs,
     ):
         super().__init__()
-        self.n_dim_context_emb = n_dim_context_emb or 0
-        # Use fraction of latent dimension as target context dim
-        if n_ctx_frac is not None:
-            n_context_compression = int(n_input * n_ctx_frac)
         self.use_film = use_film
         # Get cat input dim
         self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in (n_cat_list or [])]
         self.cat_dim = sum(self.n_cat_list)
 
-        # Compress context embedding dimension to reduce its effect
-        if self.n_dim_context_emb > 0 and n_context_compression is not None and n_context_compression > 0:
-            n_hidden_ctx_compr = n_context_compression ** 2
-            if linear_ctx_compression:
-                self.ctx_compression = nn.Linear(self.n_dim_context_emb, n_context_compression)
-            else:
-                self.ctx_compression = nn.Sequential(
-                    nn.Linear(self.n_dim_context_emb, n_hidden_ctx_compr),
-                    nn.GELU(),
-                    nn.Linear(n_hidden_ctx_compr, n_context_compression)
-                )
-            self.n_dim_context_emb = n_context_compression
+        # Init a covariate embedding if enabled
+        self.use_cat_emb = use_cat_emb
+        if use_cat_emb:
+            # Either use provided size or fraction of z
+            n_cat_dim = n_cat_dim if n_cat_dim is not None else int(n_input * n_cat_frac)
+            # Create covariate embedding to use for conditional decoding
+            self.cat_bias = nn.Embedding(self.cat_dim, n_cat_dim)
+            # Scatter identity-like structure so each category starts distinct
+            nn.init.orthogonal_(self.cat_bias.weight, gain=1.0)
+            # Update decoder input dimension
+            decoder_input_dim = n_input + n_cat_dim
         else:
-            self.ctx_compression = None
+            decoder_input_dim = n_input
 
-        # Determine decoder input dimensions
-        decoder_input_dim = n_input if use_film else n_input + self.n_dim_context_emb
+        # Determine decoder funnel dimensions
         funnel_out_dim = n_output // 2
-
+        # Init decoder module
         if linear_decoder:
             self.px_decoder = FCLayers(
                 n_in=decoder_input_dim,
@@ -1339,10 +1477,6 @@ class DecoderSCVI(nn.Module):
                 **kwargs,
             )
         
-        # Initialize film modulation of z
-        if use_film and self.n_dim_context_emb > 0:
-            self.film = FiLM(feature_dim=decoder_input_dim, context_dim=self.n_dim_context_emb)
-
         if scale_activation == "softmax":
             px_scale_activation = nn.Softmax(dim=-1)
         elif scale_activation == "softplus":
@@ -1360,10 +1494,11 @@ class DecoderSCVI(nn.Module):
             self.film_scale = nn.Linear(self.cat_dim, funnel_out_dim)
             self.film_shift = nn.Linear(self.cat_dim, funnel_out_dim)
             # Init scale near zero so FiLM starts as identity
-            nn.init.zeros_(self.film_scale.weight)
-            nn.init.zeros_(self.film_scale.bias)
-            nn.init.zeros_(self.film_shift.weight)
-            nn.init.zeros_(self.film_shift.bias)
+            if init_film_zero:
+                nn.init.zeros_(self.film_scale.weight)
+                nn.init.zeros_(self.film_scale.bias)
+                nn.init.zeros_(self.film_shift.weight)
+                nn.init.zeros_(self.film_shift.bias)
         else:
             self.film_scale = None
             self.film_shift = None
@@ -1385,61 +1520,42 @@ class DecoderSCVI(nn.Module):
         
         return px
 
+    def _get_cat_embedding(self, *cat_list: int) -> torch.Tensor | None:
+        """Look up and concatenate embeddings for all categorical covariates."""
+        if not self.use_cat_emb:
+            return None
+        
+        emb_list = []
+        offset = 0
+        for n_cat, cat in zip(self.n_cat_list, cat_list, strict=False):
+            if n_cat > 1:
+                cat = cat.squeeze(-1) if cat.dim() == 2 and cat.size(-1) == 1 else cat
+                # Offset indices so each covariate uses its own region of the embedding table
+                emb = self.cat_bias(cat + offset)
+                emb_list.append(emb)
+                offset += n_cat
+        
+        if emb_list:
+            return torch.cat(emb_list, dim=-1)
+        return None
+
     def forward(self, dispersion: str, z: torch.Tensor, library: torch.Tensor, *cat_list: int, **kwargs):
+        # Add categorical bias to z for stronger conditional decoding
+        cat_emb = self._get_cat_embedding(*cat_list)
+        if cat_emb is not None:
+            z = torch.cat([z, cat_emb], dim=-1)
         # Decode z without covariates
-        px = self.px_decoder(z)
+        px = self.px_decoder(z, *cat_list)
         # FiLM modulation from covariates
-        px = self._apply_film(px, *cat_list)
+        if self.use_film:
+            px = self._apply_film(px, *cat_list)
         # Output heads
         px_scale = self.px_scale_decoder(px)
         px_dropout = self.px_dropout_decoder(px)
         px_rate = torch.exp(library) * px_scale
         px_r = self.px_r_decoder(px) if dispersion == "gene-cell" else None
         return px_scale, px_r, px_rate, px_dropout
-    
 
-class LatentProjection(nn.Module):
-    """
-    Flexible projection MLP for mapping z to h (e.g. VAE latent → shared embedding space).
-    Allows dynamic number of layers, hidden size, and activation choice.
-    """
-
-    def __init__(
-        self,
-        n_in: int,
-        n_out: int,
-        n_hidden: int = 128,
-        n_layers: int = 2,
-        dropout_rate: float = 0.1,
-        activation_fn: nn.Module = nn.GELU,
-        use_batch_norm: bool = False,
-        use_layer_norm: bool = True,
-    ):
-        super().__init__()
-
-        layers = []
-        in_dim = n_in
-
-        # Build hidden layers dynamically
-        for _ in range(n_layers - 1):
-            layers.append(nn.Linear(in_dim, n_hidden))
-            if use_batch_norm:
-                layers.append(nn.BatchNorm1d(n_hidden))
-            if use_layer_norm:
-                layers.append(nn.LayerNorm(n_hidden))
-            layers.append(activation_fn())
-            layers.append(nn.Dropout(dropout_rate))
-            in_dim = n_hidden
-
-        # Final layer to n_out
-        layers.append(nn.Linear(in_dim, n_out))
-        if use_layer_norm:
-            layers.append(nn.LayerNorm(n_out))
-
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.model(z)
 
 class ContextClassAligner(nn.Module):
     """
@@ -1878,7 +1994,9 @@ class ClassEmbedding(nn.Module):
         self.max_length = max_length
         self.batch_size = batch_size
         self.freeze = freeze
+        # TODO: remove for good or debug deeply
         self.use_null_proxy = use_null_proxy
+        self.use_prototypes = n_prototypes > 1
 
         # -----------------------------
         # Case 1: Transformer text encoder
@@ -1886,7 +2004,7 @@ class ClassEmbedding(nn.Module):
         if class_texts is not None and not ignore_texts:
             # Load tokenizer + encoder
             self.tokenizer = AutoTokenizer.from_pretrained(transformer_name)
-            self.encoder = AutoModel.from_pretrained(transformer_name)
+            self.encoder = AutoModel.from_pretrained(transformer_name).to(device)
 
             self.class_names = list(class_texts.keys())
             self._num_classes = len(self.class_names)
@@ -1896,7 +2014,6 @@ class ClassEmbedding(nn.Module):
             # --- Freeze encoder ---
             for p in self.encoder.parameters():
                 p.requires_grad = False
-            
             
             # Use LoRA to reduce trainable parameters
             if not freeze and use_lora:
@@ -1940,6 +2057,9 @@ class ClassEmbedding(nn.Module):
                 )
                 # Keep pretokenized CPU tensors for safety
                 self.pretokenized_inputs.append(tokens)
+            # Calculate embeddings and set as pre-trained
+            with torch.no_grad():
+                pretrained_emb = self._get_transformer_emb().detach()
 
         # -----------------------------
         # Case 2: Pre-trained embedding
@@ -1956,43 +2076,63 @@ class ClassEmbedding(nn.Module):
 
         # Add final output adapter if n output is not None
         if n_output is not None:
+            # Initialize on pca
+            _, _, Vt = torch.linalg.svd(pretrained_emb, full_matrices=False)
             self.adapter = nn.Linear(self._emb_dim, n_output, bias=False)
-            self.use_adapter = True
-            # Initialize small weights
-            with torch.no_grad():
-                nn.init.zeros_(self.adapter.weight)
-                nn.init.zeros_(self.adapter.bias)
+            self.adapter.weight.data = Vt[:n_output]
 
-                d = min(self._emb_dim, n_output)
-                self.adapter.weight[:d, :d].copy_(torch.eye(d))
+            # Verify structure is preserved
+            with torch.no_grad():
+                proj = self.adapter(pretrained_emb.to(device))
+                sim_orig = F.cosine_similarity(pretrained_emb[:10].unsqueeze(1), pretrained_emb[10:20].unsqueeze(0), dim=-1)
+                sim_proj = F.cosine_similarity(proj[:10].unsqueeze(1), proj[10:20].unsqueeze(0), dim=-1)
+                logging.info(f"[Setup] Class embedding similarity preserved: {np.corrcoef(sim_orig.detach().cpu().flatten().numpy(), sim_proj.detach().cpu().flatten().numpy())[0,1]:.4f}")
+            # Set class embedding output dimension to adapter output
             self._emb_dim = n_output
+            self.use_adapter = True
         else:
             self.adapter = nn.Identity()
             self.use_adapter = False
-
-        C, D = self._num_classes, self._emb_dim
-        # Use multi-prototypes (optional)
-        if n_prototypes > 1:
-            self.delta = nn.Parameter(torch.randn(C, n_prototypes, D) / math.sqrt(D))
-            self.use_prototypes = True
-            self.n_prototypes = n_prototypes
-        else:
-            self.use_prototypes = False
-            
-        # Add non-responder null proxy (optional)
-        self.use_null_proxy = use_null_proxy
-        if use_null_proxy:
-            if self.use_prototypes:
-                self.null_delta = nn.Parameter(
-                    torch.randn(n_ctrl, self.n_prototypes, D) / math.sqrt(D)
-                )
-            else:
-                self.null_delta = nn.Parameter(
-                    torch.randn(n_ctrl, D) / math.sqrt(D)
-                )
-            
         # Move module to device
         self.to(device)
+
+    def _get_transformer_emb(self, class_indices: torch.Tensor | list | None = None):
+        # If subset not provided → use all
+        if class_indices is None:
+            indices = list(range(self._num_classes))
+        else:
+            if isinstance(class_indices, torch.Tensor):
+                class_indices = class_indices.tolist()
+            indices = class_indices
+
+        # Select pre-tokenized inputs
+        selected_tokens = [self.pretokenized_inputs[i] for i in indices]
+
+        all_embeddings = []
+
+        # Process in small chunks (tokens already on CPU)
+        for i in range(0, len(indices), self.batch_size):
+            batch_tokens = selected_tokens[i : i + self.batch_size]
+
+            # Merge token dicts into a batch
+            merged = {
+                key: torch.cat([t[key] for t in batch_tokens], dim=0).to(self.device)
+                for key in batch_tokens[0]
+            }
+            # Forward pass through encoder
+            out = self.encoder(**merged)
+            cls = out.last_hidden_state[:, 0]
+
+            all_embeddings.append(cls)
+
+        # Collect batched text embeddings
+        embeddings = torch.cat(all_embeddings, dim=0)
+        # Add embeddings to cache if model is frozen and not already replaced with a pretrained embedding
+        if self.freeze and self.embedding is None:
+            logging.info('[Setup] Registered frozen text embeddings.')
+            self.embedding = nn.Embedding.from_pretrained(embeddings.clone().detach(), freeze=True)
+        
+        return embeddings   
         
     def orthogonal_reg(self):
         if not self.use_adapter:
@@ -2041,6 +2181,22 @@ class ClassEmbedding(nn.Module):
         return self.null_delta.pow(2).mean()
 
     # -------------------------------------------------------
+    def encode(self, class_indices: torch.Tensor | list | None = None) -> torch.Tensor:
+        """
+        Return raw encoder embeddings **before** the adapter projection.
+
+        Useful for caching: store the detached result once per epoch and
+        pass it through ``self.adapter`` fresh on every forward step so
+        that the adapter remains in the computation graph.
+        """
+        if self.embedding is not None:
+            embeddings = self.embedding.weight
+            if class_indices is not None:
+                embeddings = embeddings[class_indices]
+        else:
+            embeddings = self._get_transformer_emb(class_indices)
+        return embeddings
+
     def forward(self, class_indices: torch.Tensor | list | None = None):
         """
         Compute class embeddings.
@@ -2052,77 +2208,7 @@ class ClassEmbedding(nn.Module):
         Returns:
             Tensor of shape (K, emb_dim)
         """
-        # ---------------------------------------------------------
-        # Case 1: Pretrained embedding → trivial indexing
-        # ---------------------------------------------------------
-        if self.embedding is not None:
-            if class_indices is None:
-                embeddings = self.embedding.weight
-            else:
-                embeddings = self.embedding.weight[class_indices]
-            # Add adapter projection if given
-            embeddings = self.adapter(embeddings)
-            if self.use_prototypes:
-                embeddings = embeddings[:, None, :] + self.delta
-            # Append NULL proxy
-            if self.use_null_proxy:
-                null = self.null_delta
-                # expand dtype/device safety
-                null = null.to(embeddings.device)
-                embeddings = torch.cat([embeddings, null], dim=0)
-            return embeddings
-
-        # ---------------------------------------------------------
-        # Case 2: Transformer text embeddings (pretokenized)
-        # ---------------------------------------------------------
-
-        # If subset not provided → use all
-        if class_indices is None:
-            indices = list(range(self._num_classes))
-        else:
-            if isinstance(class_indices, torch.Tensor):
-                class_indices = class_indices.tolist()
-            indices = class_indices
-
-        # Select pre-tokenized inputs
-        selected_tokens = [self.pretokenized_inputs[i] for i in indices]
-
-        all_embeddings = []
-
-        # Process in small chunks (tokens already on CPU)
-        for i in range(0, len(indices), self.batch_size):
-            batch_tokens = selected_tokens[i : i + self.batch_size]
-
-            # Merge token dicts into a batch
-            merged = {
-                key: torch.cat([t[key] for t in batch_tokens], dim=0).to(self.device)
-                for key in batch_tokens[0]
-            }
-            # Forward pass through encoder
-            out = self.encoder(**merged)
-            cls = out.last_hidden_state[:, 0]
-
-            all_embeddings.append(cls)
-
-        # Collect batched text embeddings
-        embeddings = torch.cat(all_embeddings, dim=0)
-        # Add embeddings to cache if model is frozen and not already replaced with a pretrained embedding
-        if self.freeze and self.embedding is None:
-            logging.info('Registered frozen text embeddings.')
-            self.embedding = nn.Embedding.from_pretrained(embeddings, freeze=True)
-        # Pass through adapter (optional)
-        embeddings = self.adapter(embeddings)
-        # Create multi-prototypes (optional)
-        if self.use_prototypes:
-            embeddings = embeddings[:, None, :] + self.delta
-        # Append NULL proxy
-        if self.use_null_proxy:
-            null = self.null_delta
-            # expand dtype/device safety
-            null = null.to(embeddings.device)
-            embeddings = torch.cat([embeddings, null], dim=0)
-        return embeddings
-    
+        return self.adapter(self.encode(class_indices))
 
 class HierarchicalAligner(nn.Module):
     """
@@ -2417,25 +2503,28 @@ class EmbeddingAligner(nn.Module):
                 p.requires_grad = False
             self.cls_proj_frozen = True
     
-    def forward(self, x: torch.Tensor, cls_emb: torch.Tensor, return_logits: bool = False, T: float | None = None):
+    def forward(self, x: torch.Tensor, cls_emb: torch.Tensor = None, return_logits: bool = False, T: float | None = None, cls_proj: torch.Tensor | None = None):
         """
         Parameters
         ----------
         x : Tensor, shape (batch, input_dim)
         cls_emb : Optional[Tensor], shape (n_labels, embed_dim)
-        labels : Optional[Tensor], shape (batch,)
+        cls_proj : Optional[Tensor], shape (n_labels, shared_dim) — pre-projected class embeddings, skips class_projection if provided
         """
         # Check controller freeze
         if self.freeze_cls_proj and self.use_controller and self.controller.collapse:
             self._freeze_cls_proj()
-        # Get class embeddings
-        cls_emb = cls_emb.to(x.device)
 
-        # Apply projections
+        # Apply latent projection
         z = self.latent_projection(x)               # (batch, d)
-        c = self.class_projection(cls_emb)     # (n_labels, d)
+        # Use pre-projected class embeddings if provided, otherwise project now
+        if cls_proj is not None:
+            c = cls_proj.to(x.device)
+        else:
+            cls_emb = cls_emb.to(x.device)
+            c = self.class_projection(cls_emb)     # (n_labels, d)
         # Add some dropout to z
-        if self.dropout_rate > 0:
+        if self.training and self.dropout_rate > 0:
             z = self.dropout(z)
         
         if not return_logits:

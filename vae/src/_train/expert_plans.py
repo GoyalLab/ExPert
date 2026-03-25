@@ -103,10 +103,9 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         soft_freeze_lr: float | None = None,
         gene_emb: torch.Tensor | None = None,
         anneal_schedules: dict[str, dict[str | float]] | None = None,
-        multistage_kl_frac: float = 0.1,
-        multistage_kl_min: float = 1e-2,
-        use_local_stage_warmup: bool = False,
+        kl_stage_offset: int = 0,
         batch_labels: np.ndarray | None = None,
+        cov_labels: np.ndarray | None = None,
         # Full log options
         log_full: list[str] | None = ['val'],
         full_log_every_n_epoch: int = 1,
@@ -118,6 +117,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         plot_f1_dist: bool = True,
         plot_cm: bool = True,
         plot_clip_geom: bool = True,
+        plot_cat_emb: bool = True,
         plot_every_n_epochs: int = 10,
         # Caching options
         cache_n_epochs: int | None = 1,
@@ -167,12 +167,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.anneal_schedules.update(anneal_schedules)
         self.n_epochs_warmup = n_epochs_warmup
         self.n_steps_warmup = n_steps_warmup
-        self.multistage_kl_frac = multistage_kl_frac
-        self.multistage_kl_min = multistage_kl_min
+        self.kl_stage_offset = kl_stage_offset
         self.kl_reset_epochs = self._get_stall_epochs()
         self.reset_kl_at = np.array(sorted(self.kl_reset_epochs.values()))
         self.kl_kwargs = self.anneal_schedules.get('kl_weight')
-        self.use_local_stage_warmup = use_local_stage_warmup
         # CLS params
         self.n_classes = n_classes
         self.use_posterior_mean = use_posterior_mean if use_posterior_mean is not None else "none"
@@ -195,16 +193,19 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Misc
         self.average = average                                                      # How to reduce the classification metrics
         self.top_k = top_k                                                          # How many top predictions to consider for metrics
+        # Plotting options
         self.plot_umap = plot_umap
         self.plot_umap_key = plot_umap_key if isinstance(plot_umap_key, list) else [plot_umap_key]
         self.plot_f1_dist = plot_f1_dist
         self.plot_cm = plot_cm
         self.plot_clip_geom = plot_clip_geom
         self.plot_kl_distribution = plot_kl_distribution
+        self.plot_cat_emb = plot_cat_emb
         self.log_full = log_full
         self.full_log_every_n_epoch = full_log_every_n_epoch
         self.plot_every_n_epochs = plot_every_n_epochs
         self.batch_labels = batch_labels
+        self.cov_labels = cov_labels
         self.log_random_predictions = log_random_predictions
         # Save classes that have been seen during training
         self.train_class_counts = []
@@ -286,7 +287,6 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             param_groups = []
             for lr, params_group in lr_to_params.items():
                 param_groups.append({"params": params_group, "lr": lr})
-                logging.info(f"  LR {lr}: {len(params_group)} parameters")
 
             return self.optimizer_cls(
                 param_groups,
@@ -408,6 +408,21 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Handle extra outputs
         extra_outputs = loss_output.extra_metrics.get("extra_outputs", {})
 
+        # Pop logits and store as sparse (B, n_labels) with only in-batch classes filled
+        logits = extra_outputs.pop(MODULE_KEYS.CLS_LOGITS_KEY, None)
+        if logits is not None:
+            labels = inference_outputs[MODULE_KEYS.LABEL_KEY].detach().flatten()
+            n_labels = self.module.n_labels
+            full_logits = torch.zeros(logits.size(0), n_labels, device=logits.device)
+            # Map in-batch unique classes to columns
+            unique_cls = labels.unique()
+            # Logits may span all n_labels (full) or only unique classes (subset)
+            if logits.size(1) == n_labels:
+                full_logits = logits
+            else:
+                full_logits[:, unique_cls] = logits[:, :unique_cls.size(0)]
+            cache[MODULE_KEYS.CLS_LOGITS_KEY].append(full_logits.detach().cpu())
+
         # Automatically cache everything tensor-like
         for k, v in extra_outputs.items():
             if v is None:
@@ -485,6 +500,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         n_epochs_warmup: int | None,
         n_steps_warmup: int | None,
         n_epochs_stall: int | None = None,
+        epoch: int | None = None,
         max_weight: float | None = 0.0,
         min_weight: float | None = 0.0,
         post_min_weight: float | None = None,
@@ -492,10 +508,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         anneal_k: float = 10.0,
         hard_stall: bool = True,
         invert: bool = False,
+        weight: float | None = None,
         **kwargs
     ) -> float:
+        # Return weight if it is already fixed
+        if weight is not None:
+            return weight
         # Pull current epoch
-        epoch = self.current_epoch
+        if epoch is None:
+            epoch = self.current_epoch
         
         # Set undefined weights to
         if min_weight is None:
@@ -573,33 +594,22 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         return weight
 
     def get_kl_weight(self):
-        """KL weight for forward process. Resets every time a new loss objective activates."""
-        # Get extra kl args from 
+        """KL weight with epoch offset reset at each stage."""
         kwargs = self.kl_kwargs
-        # Determine reset params
         reset_at = self.reset_kl_at
-        n_epochs_stall = 0
-        n_epochs_warmup = self.n_epochs_warmup
-        # Handle stall schedules
-        if reset_at.shape[0] > 1 and self.use_local_stage_warmup:
-            # Check in which state we currently are
-            idx = (self.current_epoch > reset_at).sum() - 1
-            # Get next stage starting epoch
-            n_epochs_stall = reset_at[idx]
-            
-            # KL goes from min to max within each stage
-            n_epochs_warmup = reset_at[idx+1] if idx+1 < len(reset_at) else self.n_epochs_warmup
-            min_weight = kwargs['min_weight'] if n_epochs_stall < 1 else kwargs['max_weight'] * self.multistage_kl_frac
-            n_epochs_warmup = n_epochs_warmup - n_epochs_stall                
-            # Update min weight
-            kwargs['min_weight'] = min_weight
-
-        # Update warmup and stall epochs
-        kwargs['n_epochs_warmup'] = n_epochs_warmup
-        kwargs['n_steps_warmup'] = None
-        kwargs['n_epochs_stall'] = n_epochs_stall
         
-        # Calculate final KL weight
+        # Compute cumulative offset from stages
+        kl_epoch_offset = 0
+        if reset_at.shape[0] > 1 and self.kl_stage_offset > 0:
+            n_stages_passed = max((self.current_epoch > reset_at).sum() - 1, 0)
+            kl_epoch_offset = n_stages_passed * self.kl_stage_offset
+        
+        # Shift effective epoch back
+        kwargs['epoch'] = max(self.current_epoch - kl_epoch_offset, 10)
+        kwargs['n_epochs_warmup'] = self.n_epochs_warmup
+        kwargs['n_steps_warmup'] = None
+        kwargs['n_epochs_stall'] = 0
+
         klw = self._compute_weight(**kwargs)
         
         return klw if type(self).__name__ == "JaxTrainingPlan" else torch.tensor(klw).to(self.device)
@@ -709,6 +719,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 continue
             # Convert tensors to numpy
             if isinstance(v, torch.Tensor):
+                if v.ndim > 1:
+                    continue
                 v = v.detach().cpu().numpy()
             # Convert lists to numpy
             if isinstance(v, list):
@@ -1108,6 +1120,24 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.logger.experiment.add_figure("pseudo_argmax_cls", fig, self.current_epoch)
         plt.close(fig)
 
+    def _plt_cat_emb(self):
+        """Plot categorical embedding weights in decoder."""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        # Get embedding weights and plot them
+        cat_bias_emb = self.module.decoder.cat_bias.weight.detach().cpu().numpy()
+        colnames = 'd' + pd.Series(np.arange(cat_bias_emb.shape[-1]), dtype=str)
+        cat_bias_emb = pd.DataFrame(cat_bias_emb, index=self.cov_labels, columns=colnames)
+        # Plot embeddings
+        g = sns.clustermap(
+            cat_bias_emb, 
+            row_cluster=True,
+            col_cluster=True, 
+            figsize=(8,6),
+        )
+        self.logger.experiment.add_figure("cat_cov_emb", g.figure, self.current_epoch)
+        plt.close(g.figure)
+
     def on_train_epoch_end(self):
         # Plot class distribution in batches
         if self.log_class_distribution:
@@ -1120,57 +1150,78 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             self.logger.experiment.add_histogram(
                 "epoch/samples_per_dataset", ds_counts, self.current_epoch
             )
+        # Plot heatmap of categorical covariate embedding in decoder
+        if self.plot_cat_emb and hasattr(self.module.decoder, 'cat_bias'):
+            # Plot and save in tensorboard logger
+            self._plt_cat_emb()
 
     def _full_log_on_epoch_end(self):
-        """Plot umap of mode on epoch end"""
+        """Calculate metrics synchronously, then offload heavy plotting to a background thread."""
+        from concurrent.futures import ThreadPoolExecutor
         # Get modes to do a full log on
         modes = self.log_full
         if isinstance(modes, str):
             modes = [modes]
-        # Do a full log for given modes
         if len(self.log_full) == 0:
             return
         # Get cached steps from all modes
         data = {}
         _modes = []
+        should_plot = self.plot_every_n_epochs > 0 and self.current_epoch % self.plot_every_n_epochs == 0
         for mode in modes:
-            # Get cached mode data
             mode_data = self._process_epoch_cache(mode)
             if mode_data is None or len(mode_data.keys()) == 0:
                 continue
-            # Calculate performance metrics over entire set
+            # Metrics must stay synchronous — they call self.log()
             self._log_full_metrics(mode, mode_data)
-            if self.plot_every_n_epochs > 0 and self.current_epoch % self.plot_every_n_epochs == 0:
-                # Plot f1-score distributions
-                if self.plot_f1_dist:
-                    self._plt_f1_per_ctx_boxplots(mode_data)
-                # Plot confusion matrices
-                if self.plot_cm:
-                    self._plt_confusion(mode, mode_data)
-                if self.plot_clip_geom:
-                    self._plt_clip_geometry(mode, mode_data)
-                    self._plt_eff_weight_corr(mode, mode_data)
-            # Save used mode
-            _modes.extend([mode])
+            _modes.append(mode)
             # Combine modes only if we plot
             if len(data) == 0 or not self.plot_umap:
                 data = mode_data
                 continue
-            # Concatenate existing data
             for k, v in data.items():
                 new_v = mode_data.get(k)
                 if new_v is not None:
                     data[k] = np.concatenate((v, new_v), axis=0)
-            
-        # If data is not empty and we want to plot
-        if self.plot_every_n_epochs > 0 and self.current_epoch % self.plot_every_n_epochs == 0:
-            if len(_modes) > 0 and self.plot_umap:
-                # Plot UMAP for all splits TODO: fix full name label
-                full_name = '-'.join(_modes) if len(_modes) > 1 else _modes[0]
-                # Plot all specified latent spaces
-                for z_key in self.plot_umap_key:
-                    if z_key in data:
-                        self._plt_umap(full_name, data, z_key=z_key)
+
+        # Offload all plotting to a background thread so training continues immediately
+        if should_plot and _modes:
+            # Snapshot everything the plotting functions need (all numpy/CPU at this point)
+            plot_data = {k: v.copy() if hasattr(v, 'copy') else v for k, v in data.items()}
+            plot_modes = list(_modes)
+            epoch = self.current_epoch
+
+            def _plot_async():
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                try:
+                    for mode in plot_modes:
+                        self._compute_disentanglement_metrics(mode, plot_data)
+                        if self.plot_f1_dist:
+                            self._plt_f1_per_ctx_boxplots(plot_data)
+                        if self.plot_cm:
+                            self._plt_confusion(mode, plot_data)
+                        if self.plot_clip_geom:
+                            self._plt_clip_geometry(mode, plot_data)
+                            self._plt_eff_weight_corr(mode, plot_data)
+                    if self.plot_umap:
+                        full_name = '-'.join(plot_modes) if len(plot_modes) > 1 else plot_modes[0]
+                        for z_key in self.plot_umap_key:
+                            if z_key in plot_data:
+                                self._plt_umap(full_name, plot_data, current_epoch=epoch, z_key=z_key)
+                except Exception as e:
+                    logging.warning(f'[Plot] Background plotting failed at epoch {epoch}: {e}')
+                finally:
+                    plt.close('all')
+
+            # Wait for any previous plot job to finish before starting a new one
+            if hasattr(self, '_plot_future') and self._plot_future is not None:
+                self._plot_future.result()
+            if not hasattr(self, '_plot_executor'):
+                from concurrent.futures import ThreadPoolExecutor
+                self._plot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='plot')
+            self._plot_future = self._plot_executor.submit(_plot_async)
 
     # Calculate accuracy & f1 for entire validation set, not just per batch
     def on_validation_epoch_end(self):
@@ -1256,6 +1307,148 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                 on_epoch=True,
                 prog_bar=False,
             )
+
+    def _compute_disentanglement_metrics(self, mode: str, mode_data: dict):
+        """
+        Compute and log dataset disentanglement metrics on latent space.
+        Logs scalars + a dataset similarity heatmap.
+        """
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        from sklearn.metrics import silhouette_score
+        from sklearn.neighbors import KNeighborsClassifier
+        from sklearn.model_selection import cross_val_score
+        
+        z = mode_data.get(MODULE_KEYS.Z_SHARED_KEY)
+        if z is None:
+            z = mode_data.get(MODULE_KEYS.Z_KEY)
+        if z is None:
+            return
+        
+        if isinstance(z, torch.Tensor):
+            z = z.detach().cpu().numpy()
+        
+        ds_labels = mode_data[REGISTRY_KEYS.BATCH_KEY]
+        if isinstance(ds_labels, torch.Tensor):
+            ds_labels = ds_labels.cpu().numpy()
+        ds_labels = ds_labels.flatten()
+        
+        cls_labels = mode_data[REGISTRY_KEYS.LABELS_KEY]
+        if isinstance(cls_labels, torch.Tensor):
+            cls_labels = cls_labels.cpu().numpy()
+        cls_labels = cls_labels.flatten()
+        
+        # Subsample for speed
+        max_samples = 5000
+        if len(z) > max_samples:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(len(z), max_samples, replace=False)
+            z = z[idx]
+            ds_labels = ds_labels[idx]
+            cls_labels = cls_labels[idx]
+        
+        # ---- Scalar metrics ----
+        
+        # Dataset silhouette (lower = better mixing)
+        if len(np.unique(ds_labels)) >= 2:
+            sil_ds = silhouette_score(z, ds_labels, sample_size=min(2000, len(z)), random_state=42)
+            self.logger.experiment.add_scalar(f"disentangle/{mode}_silhouette_dataset", sil_ds, self.current_epoch)
+        
+        # Class silhouette (higher = better separation)
+        if len(np.unique(cls_labels)) >= 2:
+            sil_cls = silhouette_score(z, cls_labels, sample_size=min(2000, len(z)), random_state=42)
+            self.logger.experiment.add_scalar(f"disentangle/{mode}_silhouette_class", sil_cls, self.current_epoch)
+        
+        # Invariance score
+        self.logger.experiment.add_scalar(
+            f"disentangle/{mode}_invariance_score", sil_cls - sil_ds, self.current_epoch
+        )
+        
+        # KNN dataset prediction (lower = better invariance)
+        if len(np.unique(ds_labels)) >= 2:
+            knn_ds = KNeighborsClassifier(n_neighbors=min(15, len(z) // 4))
+            ds_acc = cross_val_score(knn_ds, z, ds_labels, cv=3, scoring='accuracy').mean()
+            self.logger.experiment.add_scalar(f"disentangle/{mode}_knn_dataset_acc", ds_acc, self.current_epoch)
+        
+        # Within-class dataset mixing
+        mixing_scores = []
+        for cls in np.unique(cls_labels):
+            cls_mask = cls_labels == cls
+            cls_z = z[cls_mask]
+            cls_ds = ds_labels[cls_mask]
+            if len(cls_z) >= 10 and len(np.unique(cls_ds)) >= 2:
+                mixing_scores.append(silhouette_score(cls_z, cls_ds, random_state=42))
+        if mixing_scores:
+            self.logger.experiment.add_scalar(
+                f"disentangle/{mode}_within_class_ds_silhouette", np.mean(mixing_scores), self.current_epoch
+            )
+        
+        # ---- Dataset centroid similarity heatmap ----
+        unique_ds = np.unique(ds_labels)
+        if len(unique_ds) < 2:
+            return
+        
+        centroids = np.stack([z[ds_labels == ds].mean(axis=0) for ds in unique_ds])
+        centroids_norm = centroids / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-8)
+        sim_matrix = centroids_norm @ centroids_norm.T
+        
+        # Map to labels if available
+        if self.batch_labels is not None:
+            ds_names = [self.batch_labels[int(ds)] if int(ds) < len(self.batch_labels) else str(ds) 
+                        for ds in unique_ds]
+        else:
+            ds_names = [str(ds) for ds in unique_ds]
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Left: dataset centroid similarity
+        sns.heatmap(
+            sim_matrix,
+            xticklabels=ds_names,
+            yticklabels=ds_names,
+            annot=True, fmt='.2f',
+            cmap='RdYlBu_r',
+            vmin=-1, vmax=1,
+            ax=ax1,
+        )
+        ax1.set_title(f'{mode} | Dataset centroid cosine similarity\n(uniform = good disentanglement)')
+        ax1.tick_params(axis='x', rotation=45)
+        
+        # Right: per-class dataset mixing scores
+        if mixing_scores:
+            cls_names = []
+            cls_mixing = []
+            cls_ds_counts = []
+            for cls in np.unique(cls_labels):
+                cls_mask = cls_labels == cls
+                cls_z = z[cls_mask]
+                cls_ds = ds_labels[cls_mask]
+                if len(cls_z) >= 10 and len(np.unique(cls_ds)) >= 2:
+                    sil = silhouette_score(cls_z, cls_ds, random_state=42)
+                    cls_names.append(str(cls))
+                    cls_mixing.append(sil)
+                    cls_ds_counts.append(len(np.unique(cls_ds)))
+            
+            if cls_names:
+                sort_idx = np.argsort(cls_mixing)[::-1]
+                colors = ['#e74c3c' if m > 0.3 else '#f39c12' if m > 0.1 else '#2ecc71' 
+                        for m in np.array(cls_mixing)[sort_idx]]
+                
+                ax2.barh(
+                    range(min(30, len(cls_names))),
+                    np.array(cls_mixing)[sort_idx[:30]],
+                    color=colors[:30],
+                    alpha=0.8,
+                )
+                ax2.set_yticks(range(min(30, len(cls_names))))
+                ax2.set_yticklabels(np.array(cls_names)[sort_idx[:30]], fontsize=7)
+                ax2.set_xlabel('Dataset silhouette within class\n(lower = better mixing)')
+                ax2.set_title(f'{mode} | Per-class dataset mixing\n(red = dataset-dominated, green = well-mixed)')
+                ax2.axvline(0, color='gray', linewidth=0.5)
+        
+        plt.tight_layout()
+        self.logger.experiment.add_figure(f"disentangle/{mode}_overview", fig, self.current_epoch)
+        plt.close(fig)
     
     def _plt_confusion(self, mode: str, mode_data: dict[str, np.ndarray]):
         """
@@ -1698,7 +1891,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             plt.close(fig)
 
 
-    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray], z_key: str = MODULE_KEYS.Z_KEY):
+    def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray], current_epoch: int, z_key: str = MODULE_KEYS.Z_KEY):
         """Plot UMAP of latent space (with proxies) into TensorBoard."""
         import os
         import umap
@@ -1723,7 +1916,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             embeddings, labels, covs, modes = embeddings[mask], labels[mask], covs[mask], modes[mask]
         # Add batch annotation
         if self.batch_labels is not None:
-            covs = self.batch_labels[covs]
+            cov_idx = self.batch_labels
+            covs = cov_idx[covs]
+        else:
+            cov_idx = sorted(np.unique(covs))
         # --- Add class proxies if they exist
         if MODULE_KEYS.CLS_PROJ_KEY in mode_data and z_key != MODULE_KEYS.Z_KEY:
             cls_proxies = mode_data[MODULE_KEYS.CLS_PROJ_KEY]
@@ -1803,6 +1999,8 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
 
         # Add umap coordinates to dataframe
         df["UMAP1"], df["UMAP2"] = emb_2d[:, 0], emb_2d[:, 1]
+        # Add covariate ordering
+        df["cov"] = pd.Categorical(df["cov"], cov_idx, ordered=True)
         
         # Create pathway-level UMAP if given
         if has_pathways:
@@ -1883,36 +2081,36 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         fig, axes = plt.subplots(N, 2, figsize=(12, D), dpi=150)
 
         # 1. by modes (splits)
-        _scatter_base(axes[0, 0], df, "mode", f"Splits @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False)
+        _scatter_base(axes[0, 0], df, "mode", f"Splits @ Epoch {current_epoch}", plot_proxy=False, proxy_legend=False)
 
         # 2. by class (overlay proxies)
-        _scatter_base(axes[0, 1], df, "label", f"Classes @ Epoch {self.current_epoch}", legend=False, plot_proxy=False, proxy_legend=False)
+        _scatter_base(axes[0, 1], df, "label", f"Classes @ Epoch {current_epoch}", legend=False, plot_proxy=False, proxy_legend=False)
 
         # 3. by observed vs unseen
         df_obs = df.copy()
         df_obs["obs_label"] = np.where(df_obs.is_observed, "Observed proxy", "Unseen proxy")
         # Ensure observed are plotted last
         df_obs["obs_label"] = pd.Categorical(df_obs["obs_label"], ["Unseen proxy", "Observed proxy"], ordered=True)
-        _scatter_base(axes[1, 0], df_obs, "obs_label", f"Observed vs Unseen @ Epoch {self.current_epoch}")
+        _scatter_base(axes[1, 0], df_obs, "obs_label", f"Observed vs Unseen @ Epoch {current_epoch}")
 
         # 4. by covariates (contexts)
-        _scatter_base(axes[1, 1], df, "cov", f"Contexts @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False)
+        _scatter_base(axes[1, 1], df, "cov", f"Contexts @ Epoch {current_epoch}", plot_proxy=False, proxy_legend=False)
 
         # 5. by pathways (if they exist)
         if has_pathways:
-            _scatter_base(axes[2, 0], df_pw, "label_id", f"Pathways @ Epoch {self.current_epoch}", legend=False, proxy_legend=False)
+            _scatter_base(axes[2, 0], df_pw, "label_id", f"Pathways @ Epoch {current_epoch}", legend=False, proxy_legend=False)
         # 6. by modules (if they exist)
         if has_modules:
             df["module"] = self.module.cls2module[df.label_id].cpu().numpy().astype(str)
-            _scatter_base(axes[2, 1], df, "module", f"Modules @ Epoch {self.current_epoch}", plot_proxy=False, proxy_legend=False, legend=False)
+            _scatter_base(axes[2, 1], df, "module", f"Modules @ Epoch {current_epoch}", plot_proxy=False, proxy_legend=False, legend=False)
         plt.tight_layout()
-        self.logger.experiment.add_figure(f"{mode}_{z_key}_umap", fig, self.current_epoch)
+        self.logger.experiment.add_figure(f"{mode}_{z_key}_umap", fig, current_epoch)
         plt.close(fig)
 
         # Save data to file
         if self.save_cache:
-            umap_dir = os.path.join(self.logger.log_dir, 'data')
+            umap_dir = os.path.join(self.logger.log_dir, 'data', 'umap')
             os.makedirs(umap_dir, exist_ok=True)
-            csv_path = os.path.join(umap_dir, f"{mode}_umap_data_epoch{self.current_epoch}.csv")
+            csv_path = os.path.join(umap_dir, f"umap_data_epoch{current_epoch}.csv")
             df.to_csv(csv_path, index=False)
 

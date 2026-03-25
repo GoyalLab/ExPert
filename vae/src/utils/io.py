@@ -20,8 +20,69 @@ log = logging.getLogger(__name__)
 
 
 mutually_excl_keys: dict[str, list[tuple[str]]] = {
-    CONF_KEYS.MODEL: [('use_batch_norm', 'use_layer_norm')]
+    CONF_KEYS.MODEL: [
+        ('use_batch_norm', 'use_layer_norm'),
+        ('use_ds_anchors', 'scale')
+    ]
 }
+
+def load_backed(
+        paths: str | list[str],
+        backed: str = 'r',
+    ) -> ad.AnnData:
+        """Load one or more h5ad files in backed (out-of-core) mode for large-scale training.
+
+        Data stays on disk and is read lazily per batch — only the current
+        minibatch is loaded into RAM/GPU memory.  This enables training on
+        datasets that exceed available system memory.
+
+        When multiple paths are provided, returns an ``AnnCollection`` that
+        lazily concatenates the files.
+
+        Parameters
+        ----------
+        paths
+            Path to a single h5ad file, or list of paths.
+        backed
+            Backed mode for anndata (``'r'`` for read-only).
+
+        Returns
+        -------
+        A single backed ``AnnData`` or an ``AnnCollection``.
+
+        Notes
+        -----
+        - ``adata.X`` must be stored as a sparse CSR matrix in the h5ad file.
+        - Metadata (obs, var, uns, varm) is loaded into memory (usually small).
+        - The expression matrix ``X`` stays on disk.
+        - For best performance, ensure h5ad files are stored on fast I/O (SSD/NVMe or
+          parallel filesystem with good sequential read throughput).
+
+        Example
+        -------
+        >>> adata = ExPert.load_backed(['/data/part1.h5ad', '/data/part2.h5ad'])
+        >>> ExPert.setup_anndata(adata, batch_key='dataset', labels_key='perturbation')
+        >>> model = ExPert(adata, checkpoint_dir='/checkpoints/my_run')
+        >>> model.train(config)
+        """
+        import anndata as _ad
+        if isinstance(paths, str):
+            paths = [paths]
+        if len(paths) == 1:
+            adata = _ad.read_h5ad(paths[0], backed=backed)
+            log.info(f'[Data] Loaded backed AnnData: {adata.n_obs:,} cells from {paths[0]}')
+            return adata
+        # Multiple files — use AnnCollection for lazy concatenation
+        from anndata.experimental import AnnCollection
+        adatas = []
+        for p in paths:
+            a = _ad.read_h5ad(p, backed=backed)
+            log.info(f'[Data] Loaded backed AnnData: {a.n_obs:,} cells from {p}')
+            adatas.append(a)
+        collection = AnnCollection(adatas, join_obs='inner', join_obsm=None, join_vars='inner')
+        total = sum(a.n_obs for a in adatas)
+        log.info(f'[Data] Created AnnCollection: {total:,} total cells from {len(adatas)} files')
+        return collection
 
 def sanitize_for_logging(obj, max_list_len=20):
     """
@@ -34,7 +95,7 @@ def sanitize_for_logging(obj, max_list_len=20):
         return obj
 
     # Small lists/tuples
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, (list, np.ndarray, tuple)):
         if len(obj) <= max_list_len:
             return [sanitize_for_logging(x) for x in obj]
         else:
@@ -42,17 +103,27 @@ def sanitize_for_logging(obj, max_list_len=20):
 
     # Dicts
     if isinstance(obj, Mapping):
-        return {
+        o = {
             str(k): sanitize_for_logging(v)
             for k, v in obj.items()
         }
+        # Remove None values
+        return {k: v for k, v in o.items() if v is not None}
 
     # Torch tensors
     if isinstance(obj, torch.Tensor):
         return f"<Tensor shape={tuple(obj.shape)}>"
 
-    # Everything else
-    return str(obj)
+    # Class types, return repr
+    if isinstance(obj, type):
+        return str(obj)
+    
+    # Object instances, remove instance information
+    if isinstance(obj, object):
+        return f"{obj.__class__}"
+
+    # Everything else gets removed
+    return None
 
 def load_json(p: str, mode: str = 'r', **kwargs):
     import json
@@ -60,7 +131,6 @@ def load_json(p: str, mode: str = 'r', **kwargs):
         return None
     with open(p, mode) as f:
         return json.load(f, **kwargs)
-
 
 def to_tensor(m: sp.csr_matrix | torch.Tensor | np.ndarray | pd.DataFrame | None) -> torch.Tensor:
     if m is None:
