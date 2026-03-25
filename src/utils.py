@@ -7,8 +7,21 @@ import numpy as np
 import os
 import anndata as ad
 import scipy.sparse as sp
-import functools
 
+
+def read_embedding(emb_p: str) -> pd.DataFrame:
+    # Convert to str
+    emb_p = str(emb_p)
+    if emb_p.endswith('.pickle'):
+        import pickle
+        with open(emb_p, 'rb') as file:
+            return pd.DataFrame(pickle.load(file)).T
+    elif emb_p.endswith('.csv'):
+        return pd.read_csv(emb_p, index_col=0)
+    elif emb_p.endswith('.tsv'):
+        return pd.read_csv(emb_p, sep='\t', index_col=0)
+    else:
+        raise ValueError(f'Unsupported embedding file format provided.')
 
 def setup_logger(log_file):
     logging.basicConfig(

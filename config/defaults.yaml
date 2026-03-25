@@ -21,8 +21,8 @@ n_ctrl: 10000                               # Maximum number of control cells, r
 single_perturbations_only: true             # Exclude multiple perturbations from dataset
 z_score_filter: false                        # Filter cells based on euclidian distance to mean control expression in dataset
 control_neighbor_threshold: 0.0               # Filter cells based on percentage of neighbors that are from the same class, set to 0.0 to ignore
-min_cells_per_perturbation: 50                # Filter perturbations for a minimum number of cells WITHIN a dataset
-min_cells_per_class: 50                    # Minimum number of cells per class (perturbation) ACROSS datasets
+min_cells_per_perturbation: 20                # Filter perturbations for a minimum number of cells WITHIN a dataset
+min_cells_per_class: 20                    # Minimum number of cells per class (perturbation) ACROSS datasets
 min_dataset_frac: 0.6                       # Fraction of datasets a perturbation has to be shared across to be included in the pool
 
 ## Efficiency filter:
@@ -34,7 +34,7 @@ ctrl_dev: 0.0                               # Minimum standart deviation of pert
 ## Merge & Harmonize:
 zero_padding: true                          # Keep genes that are not overlapping with genes from other experiments (assign 0 to them)
 correction_method: 'skip'                   # How to harmonize the data over the different experiments, can be one of: 'scANVI', 'scanorama', 'harmonypy', 'skip'
-merge_method: 'dask'                        # Whether to merge on-disk (dask) or in memory (memory)
+merge_method: 'concat_on_disk'              # How to merge datasets: 'concat_on_disk' (memory-efficient) or 'in_memory'
 var_merge: 'union'                   # Choose intersection or union of genes for merged dataset
 ## Pre-computed embeddings
 gene_embedding: ''                          # Set path to gene embedding to add to meta-set, will be used to describe perturbations

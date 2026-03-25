@@ -62,13 +62,13 @@ def get_default_resources(resource_config: dict, default_key: str = 'default') -
     return o
 
 # With optional job name to lookup local configs
-def estimate_resources(file_p: str, resource_config: dict, factor: int = 2, job_name: str | None = None) -> str:
+def estimate_resources(file_p: str, resource_config: dict, factor: int = 2, job_name: str | None = None, step: int = 50) -> str:
     # Get default memory options
     max_mem = resource_config['memory']['max_mem']
     min_mem = resource_config['memory']['min_mem']
     # Get jobs-specific resources
     job_mem_str = resource_config.get('jobs', {}).get(job_name, {}).get('mem')
-    if job_mem_str is not None and job_mem_str is not None:
+    if job_mem_str is not None:
         # Set minimum memory to job-specific memory if given
         job_mem_str = job_mem_str.lower().rstrip('gb')
         min_mem = int(job_mem_str)
@@ -80,10 +80,12 @@ def estimate_resources(file_p: str, resource_config: dict, factor: int = 2, job_
     # Get partitions
     default_partition = resource_config['partitions']['default']
     highmem_partition = resource_config['partitions']['high_mem']
-    # Assign partition
-    partition = default_partition if gb_mem < max_mem else highmem_partition
     # Fall back to minimum memory if its below that
     gb_mem = min_mem if gb_mem < min_mem else gb_mem
+    # Set ram in steps
+    gb_mem = int(step - gb_mem % step + gb_mem)
+    # Assign partition
+    partition = default_partition if gb_mem < max_mem else highmem_partition
     # Add gb string
     mem_str = f'{gb_mem}GB'
     # Return estimated resources

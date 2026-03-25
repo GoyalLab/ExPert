@@ -378,13 +378,13 @@ def create_meta_summary(
     # Add dataset meta information to observations
     obs = obs.merge(dataset_sheet, left_on=OBS_KEYS.DATASET_KEY, right_index=True, how='left')
     # Filter obs by minimum number of cells per perturbation within a context
-    cpp = obs.groupby(OBS_KEYS.CONTEXT_KEY)[OBS_KEYS.PERTURBATION_KEY].value_counts()
+    cpp = obs.groupby(OBS_KEYS.DATASET_KEY)[OBS_KEYS.PERTURBATION_KEY].value_counts()
     # Filter each context-specific perturbation for minimum number of cells
     valid_classes = cpp[cpp >= min_cells_per_class].reset_index()
     # Get valid combinations of dataset name and perturbation
-    valid_combinations = (valid_classes[OBS_KEYS.CONTEXT_KEY].astype(str) + '-' + valid_classes[OBS_KEYS.PERTURBATION_KEY].astype(str)).unique()
+    valid_combinations = (valid_classes[OBS_KEYS.DATASET_KEY].astype(str) + '-' + valid_classes[OBS_KEYS.PERTURBATION_KEY].astype(str)).unique()
     # Filter all cells for valid combinations
-    all_combinations = obs[OBS_KEYS.CONTEXT_KEY].astype(str) + '-' + obs[OBS_KEYS.PERTURBATION_KEY].astype(str)
+    all_combinations = obs[OBS_KEYS.DATASET_KEY].astype(str) + '-' + obs[OBS_KEYS.PERTURBATION_KEY].astype(str)
     obs_mask = all_combinations.isin(valid_combinations)
     obs = obs[obs_mask].copy()
     

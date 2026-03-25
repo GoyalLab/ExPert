@@ -18,6 +18,7 @@ import pandas as pd
 import scipy.sparse as sp
 import scipy.stats as stats
 from anndata import AnnData
+import scanpy as sc
 from tqdm import tqdm
 
 
@@ -27,10 +28,23 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 
 _WORKER_EXPR: Optional[np.ndarray] = None
+
+
+def _is_raw_counts(adata: AnnData, n_sample: int = 200) -> bool:
+    """Check whether adata.X looks like raw (integer) counts."""
+    X = adata.X
+    if sp.issparse(X):
+        data = X[:n_sample].data if X.shape[0] >= n_sample else X.data
+    else:
+        data = X[:n_sample].ravel()
+    if len(data) == 0:
+        return False
+    return np.allclose(data, np.round(data)) and np.all(data >= 0)
 _WORKER_CTRL_IDX: Optional[np.ndarray] = None
 
 
 def _init_worker(expr: np.ndarray, ctrl_idx: np.ndarray) -> None:
+    """Initializer for worker processes — stores shared data as module globals."""
     global _WORKER_EXPR, _WORKER_CTRL_IDX
     _WORKER_EXPR = expr
     _WORKER_CTRL_IDX = ctrl_idx
@@ -47,7 +61,7 @@ def _local_ctrl_adjustment(
     n_neighbors: int = 20,
 ) -> np.ndarray:
     """
-    Subtract local NT neighborhood mean from every cell's expression.
+    Subtract local NT neighborhood mean from every cell's expression (in-place).
 
     For each cell (perturbed and control alike), find its n_neighbors nearest
     NT cells in embedding space and subtract their mean expression.  This
@@ -56,14 +70,14 @@ def _local_ctrl_adjustment(
 
     Parameters
     ----------
-    expr : (n_cells, n_genes)
+    expr : (n_cells, n_genes) — modified in-place and returned
     ctrl_idx : indices of NT control cells
     embed : (n_cells, n_dims)  embedding used for neighbor search (e.g. PCA)
     n_neighbors : number of NT neighbors per cell
 
     Returns
     -------
-    Adjusted expression array of the same shape as expr.
+    The same expr array, adjusted in-place.
     """
     from sklearn.neighbors import NearestNeighbors
 
@@ -72,32 +86,28 @@ def _local_ctrl_adjustment(
 
     # Only query non-control cells — control cells don't need adjustment
     pert_cell_idx = np.setdiff1d(np.arange(len(embed)), ctrl_idx)
-    _, indices = nn.kneighbors(embed[pert_cell_idx])  # (n_pert, k)
-    global_nn_idx = ctrl_idx[indices]                  # (n_pert, k)
+    _, indices = nn.kneighbors(embed[pert_cell_idx])  # (n_pert, k) — local ctrl indices
 
     # Compute local means in batches to avoid materialising (n_pert, k, n_genes)
-    adjusted = expr.copy()
+    ctrl_expr = expr[ctrl_idx]  # view into ctrl rows, reused across batches
     batch_size = 512
     for start in range(0, len(pert_cell_idx), batch_size):
         end = min(start + batch_size, len(pert_cell_idx))
         batch_global = pert_cell_idx[start:end]
-        batch_nn     = global_nn_idx[start:end]        # (b, k)
-        adjusted[batch_global] -= expr[batch_nn].mean(axis=1)  # (b, n_genes)
+        batch_nn_local = indices[start:end]             # (b, k) — local ctrl indices
+        expr[batch_global] -= ctrl_expr[batch_nn_local].mean(axis=1)  # (b, n_genes)
 
-    return adjusted
-
-
-def _to_dense(X) -> np.ndarray:
-    if sp.issparse(X):
-        return np.asarray(X.todense())
-    return np.asarray(X)
+    return expr
 
 
-def _get_expr(adata: AnnData, layer: Optional[str]) -> np.ndarray:
-    """Return expression matrix as a dense (cells × genes) array."""
-    if layer is not None:
-        return _to_dense(adata.layers[layer])
-    return _to_dense(adata.X)
+def _get_expr_sparse(adata: AnnData, layer: Optional[str]) -> sp.csr_matrix:
+    """Return expression matrix as a CSR sparse matrix in float32."""
+    X = adata.layers[layer] if layer is not None else adata.X
+    if not sp.issparse(X):
+        X = sp.csr_matrix(X)
+    if X.dtype != np.float32:
+        X = X.astype(np.float32)
+    return X.copy()
 
 
 def _wilcoxon_ranksum(a: np.ndarray, b: np.ndarray):
@@ -375,16 +385,17 @@ def compute_perturbation_scores(
     min_pct: float = 0.05,
     use_rep: Optional[str] = "X_pca",
     n_neighbors: int = 20,
-    n_hvg: Optional[int] = 2000,
+    n_hvg: Optional[int] = 3000,
     n_pcs: int = 40,
     loo: bool = True,
     n_jobs: int = 4,
     output_key: str = "efficiency",
     output_loo_key: str = "efficiency_loo",
     output_deg_key: str = "efficiency_degs",
-    inplace: bool = True,
+    inplace: bool = False,
+    copy: bool = False,
     verbose: bool = True,
-) -> Optional[pd.DataFrame]:
+) -> np.ndarray:
     """
     Compute Mixscale per-cell perturbation efficiency scores.
 
@@ -449,44 +460,52 @@ def compute_perturbation_scores(
     verbose
         If True, show a tqdm progress bar.
     """
-    expr_all = _get_expr(adata, layer)  # (n_cells, n_genes)
-    # Standard preprocessing on raw data
-    if preprocess:
-        counts_per_cell = expr_all.sum(axis=1, keepdims=True)
-        counts_per_cell[counts_per_cell == 0] = 1.0
-        expr_all = np.log1p(expr_all / counts_per_cell * 1e4)
-        gene_mean = expr_all.mean(axis=0)
-        gene_std = expr_all.std(axis=0)
-        gene_std[gene_std == 0] = 1.0
-        expr_all = (expr_all - gene_mean) / gene_std
-
+    # Avoid overwriting original adata
+    if not inplace and copy:
+        adata = adata.copy()
+    logging.info('Extracting gene expression layer.')
+    is_raw = _is_raw_counts(adata)
+    logging.info(f'Raw counts detected: {is_raw}')
     labels = adata.obs[perturbation_key].values
     ctrl_idx = np.where(labels == ctrl_key)[0]
-    # KNN correction on PCA if enabled
-    if use_rep is not None:
-        logging.info(f'Applying KNN control adjustment.')
-        if use_rep in adata.obsm:
-            embed = np.asarray(adata.obsm[use_rep])
-        elif preprocess:
-            # Compute PCA internally on the scaled expression (Seurat-style pipeline)
-            from sklearn.decomposition import PCA
-            k = min(n_pcs, expr_all.shape[0] - 1, expr_all.shape[1] - 1)
-            if n_hvg is not None and n_hvg < expr_all.shape[1]:
-                # Select top HVGs by variance for PCA (FindVariableFeatures equivalent)
-                gene_var = expr_all.var(axis=0)
-                hvg_idx = np.argpartition(gene_var, -n_hvg)[-n_hvg:]
-                pca_input = expr_all[:, hvg_idx]
-            else:
-                pca_input = expr_all
-            embed = PCA(n_components=k, random_state=0).fit_transform(pca_input)
-            adata.obsm[use_rep] = embed
+
+    # Subset to highly variable genes
+    if "highly_variable" in adata.var.columns:
+        hvg_mask = adata.var["highly_variable"].values
+        logging.info(f"Using {hvg_mask.sum()} pre-computed HVGs.")
+        adata._inplace_subset_var(hvg_mask)
+    elif n_hvg is not None and n_hvg < adata.n_vars:
+        if is_raw:
+            logging.info(f"Calculating {n_hvg} HVGs with seurat_v3.")
+            sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, flavor='seurat_v3', subset=True, check_values=True)
         else:
-            raise ValueError(
-                f"use_rep '{use_rep}' not found in adata.obsm. "
-                f"Either run sc.pp.pca first, set preprocess=True to compute it "
-                f"internally, or set use_rep=None to skip."
-            )
-        expr_all = _local_ctrl_adjustment(expr_all, ctrl_idx, embed, n_neighbors)
+            logging.info(f"Calculating {n_hvg} HVGs with default flavor.")
+            sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, subset=True)
+    # Apply further preprocessing to adata.X if option is toggled
+    if preprocess and is_raw:
+        logging.info('Preprocessing raw gene expression layer.')
+        sc.pp.normalize_total(adata)
+        sc.pp.log1p(adata)
+        sc.pp.scale(adata)
+    # Get adata.X
+    X = adata.layers[layer] if layer is not None else adata.X
+    # Convert to dense if not already
+    if sp.issparse(X):
+        X = np.asarray(X.todense(), dtype=np.float32)
+    else:
+        X = np.asarray(X, dtype=np.float32)
+
+    # PCA + KNN control adjustment (computed on z-scored data when preprocessed)
+    if use_rep is not None:
+        if use_rep not in adata.obsm:
+            logging.info('Computing PCA for KNN control adjustment.')
+            sc.pp.pca(adata, n_comps=n_pcs)
+        # Get PCA embedding from adata
+        embed = np.asarray(adata.obsm[use_rep], dtype=np.float32)
+        # Do control cell KNN adjustments
+        logging.info('Applying KNN control adjustment.')
+        X = _local_ctrl_adjustment(X, ctrl_idx, embed, n_neighbors)
+    # Get obs and var names
     var_names = np.asarray(adata.var_names)
     obs_names = adata.obs_names
     # Calculate scores for every non-control perturbation
@@ -501,7 +520,7 @@ def compute_perturbation_scores(
     with ProcessPoolExecutor(
         max_workers=n_jobs,
         initializer=_init_worker,
-        initargs=(expr_all, ctrl_idx),
+        initargs=(X, ctrl_idx),
     ) as pool:
         # Create futures
         for pert in perturbations:
@@ -532,12 +551,17 @@ def compute_perturbation_scores(
             if loo and loo_df is not None:
                 loo_df.index = obs_names[pert_idx]
                 loo_dict[pert] = loo_df
+    # Set NaNs to 0s
+    scores.fillna(0, inplace=True)
+
     # Save values to adata object
     if inplace:
-        adata.obs[output_key] = np.nan_to_num(scores.values, 0.0)
+        logging.info(f'Setting adata.obs["{output_key}"].')
+        adata.obs[output_key] = scores.values
         adata.uns[output_deg_key] = deg_dict
         if loo:
             adata.uns[output_loo_key] = loo_dict
         return None
-    # Return scores
-    return scores.to_frame()
+    logging.info(f'Returning scores series.')
+    # Return scores series to preserve barcodes
+    return scores

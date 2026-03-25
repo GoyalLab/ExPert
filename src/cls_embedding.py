@@ -8,6 +8,7 @@ from typing import Literal
 import logging
 
 from src.statics import OBS_KEYS
+from src import utils
 
 
 class EmbeddingProcessor:
@@ -59,15 +60,9 @@ class EmbeddingProcessor:
         self.filter_adata = filter_adata
 
     def _read_embedding(self, inplace: bool = False) -> pd.DataFrame:
-        if self.emb_p.endswith('.pickle'):
-            with open(self.emb_p, 'rb') as file:
-                emb = pd.DataFrame(pickle.load(file)).T
-        elif self.emb_p.endswith('.csv'):
-            emb = pd.read_csv(self.emb_p, index_col=0)
-        elif self.emb_p.endswith('.tsv'):
-            emb = pd.read_csv(self.emb_p, sep='\t', index_col=0)
-        else:
-            raise ValueError(f'Unsupported embedding file format provided.')
+        # Read embedding
+        emb = utils.read_embedding(self.emb_p)
+        # Assign inplace or return
         if inplace:
             self.emb = emb
             return
@@ -264,8 +259,9 @@ class EmbeddingProcessor:
         # Annotate adata features with embedding
         if self.add_emb_for_features:
             self._add_emb_to_varm(adata, raw_emb=self.emb)
-        logging.info(f'Removing classes without embeddings.')
-        self._remove_classes_without_emb(adata)
+        if self.filter_adata:
+            logging.info(f'Removing classes without embeddings.')
+            self._remove_classes_without_emb(adata)
         # Filter embedding for observed genes
         if self.filter_embedding:
             observed_genes = adata.obs[self.p_col].unique().tolist()
@@ -279,8 +275,9 @@ class EmbeddingProcessor:
             self.emb *= self.scaling_factor
         # Add directionality to embeddings 
         self._add_direction_to_emb(adata)
-        logging.info(f'Adding embedding to adata.')
-        self._add_emb_to_uns(adata)
+        if self.cls_emb_uns_key is not None:
+            logging.info(f'Adding embedding to adata.')
+            self._add_emb_to_uns(adata)
         # Remove genes with no counts (zero-padded)
         if self.filter_adata:
             logging.info(f'Removing empty cells or genes from adata.')

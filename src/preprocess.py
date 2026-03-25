@@ -371,22 +371,13 @@ def get_adata_meta(adata: ad.AnnData, p_col: str = 'perturbation', ctrl_key: str
         sp_mask = single_perturbation_mask(obs, p_col=p_col)
         if sp_mask is not None:
             obs = obs[sp_mask].copy()
-    obs[p_col] = clean_perturbation_labels(obs[p_col], keep_versions=False)
+    obs[p_col] = clean_perturbation_labels(obs[p_col], keep_versions=False).values
     # Extract .var
     var = adata.var.copy()
     if adata.var_names.str.lower().str.startswith('ens').sum() / adata.n_vars > 0.9:
         logging.info(f'Dataset .var indices are ensembl ids, attempting transfer to gene symbols using internal adata.var.')
         var = ens_to_symbol(adata).var.copy()
     return obs, var
-
-def _filter_perturbation_pool(adata: ad.AnnData, perturbation_pool_file: str | None, p_col: str = OBS_KEYS.PERTURBATION_KEY) -> None:
-    if perturbation_pool_file is None:
-        return None
-    # Load pool and filter for hits in adata
-    perturbation_pool = pd.read_csv(perturbation_pool_file, index_col=0)[OBS_KEYS.POOL_PERTURBATION_KEY]
-    mask = adata.obs[p_col].isin(perturbation_pool)
-    adata._inplace_subset_obs(mask)
-    logging.info(f'Found {adata.obs[p_col].nunique()} perturbations from pool ({perturbation_pool.shape[0]}) in adata.')
 
 def _remove_invalid_labels(adata: ad.AnnData, p_col: str) -> None:
     # Collect all unique labels
@@ -398,13 +389,6 @@ def _remove_invalid_labels(adata: ad.AnnData, p_col: str) -> None:
         logging.info(f'Removing {invalid_mask.sum()} cells with invalid labels: {invalid_labels.astype(str)}')
         # Remove invalid labels
         adata._inplace_subset_obs(~invalid_mask)
-
-def _filter_feature_pool(adata: ad.AnnData, feature_pool_file: str) -> None:
-    """Filter adata features according to pre-calculated pool of features."""
-    feature_pool = pd.read_csv(feature_pool_file, index_col=0)[OBS_KEYS.POOL_FEATURE_KEY]
-    feature_mask = adata.var.index.isin(feature_pool)
-    logging.info(f'Subsetting to features in pre-calculated pool: {feature_mask.sum()}/{adata.n_vars}')
-    adata._inplace_subset_var(feature_mask)
 
 def read_adata(
         adata_p: str,
@@ -425,7 +409,7 @@ def read_adata(
     # Check control key
     check_ctrl_col(adata, p_col=p_col, ctrl_key=ctrl_key)
     # Clean up perturbation label
-    adata.obs[p_col] = clean_perturbation_labels(adata.obs[p_col], keep_versions=keep_versions)
+    adata.obs[p_col] = clean_perturbation_labels(adata.obs[p_col], keep_versions=keep_versions).values
     # Remove unknown or NaN labels
     if remove_invalid_labels:
         _remove_invalid_labels(adata, p_col=p_col)
@@ -436,6 +420,45 @@ def read_adata(
         if sp_mask is not None:
             adata._inplace_subset_obs(sp_mask)
     return adata
+
+def _ensure_csr(adata: ad.AnnData) -> ad.AnnData:
+    """
+    Ensure adata.X is CSR. If the adata is backed and X is dense, reload the
+    full object, convert X to CSR, overwrite the source file, and re-open
+    backed. If not backed, convert X to CSR in-place.
+    """
+    # Check if adata.X is sparse
+    try:
+        from anndata._core.sparse_dataset import _CSRDataset, _CSCDataset
+        is_sparse = isinstance(adata.X, (_CSRDataset, _CSCDataset)) or sp.issparse(adata.X)
+    except ImportError:
+        is_sparse = sp.issparse(adata.X)
+    # Return unchanged if it is regardless of backed status
+    if is_sparse:
+        return adata
+    # If not backed but dense, just change it inplace
+    if not adata.isbacked:
+        logging.info(f'Converting dense X ({type(adata.X).__name__}) to CSR in-place.')
+        adata.X = sp.csr_matrix(adata.X)
+        return adata
+    # If backed but dense, load it into memory, change inplace, and update on disk
+    file_path = str(adata.filename)
+    logging.info(
+        f'Backed X is dense ({type(adata.X).__name__}, shape {adata.X.shape}). '
+        f'Converting to CSR and rewriting {file_path} for faster backed access.'
+    )
+    # Close backed connection
+    adata.file.close()
+    # Read full dataset and update .X to CSR matrix
+    full = sc.read(file_path)
+    full.X = sp.csr_matrix(full.X)
+    full.write(file_path)
+    logging.info('Rewrote file with CSR X. Re-opening in backed mode.')
+    del full
+    gc.collect()
+
+    return sc.read(file_path, backed='r')
+
 
 def read_subset(
     adata_p: str,
@@ -460,13 +483,15 @@ def read_subset(
 
     All cell-level filters (perturbation pool, control sampling, label
     cleaning, QC) are evaluated while the file is still backed so that
-    ``to_memory()`` loads only the final set of cells × genes.  This avoids
+    ``to_memory()`` loads only the final set of cells x genes.  This avoids
     the repeated in-memory copies that ``_inplace_subset_obs`` causes on
     large datasets.
     """
-    
+    # Set random seed
+    np.random.seed(seed)
     try:
-        adata = sc.read(adata_p, backed='r')
+        # Ensure adata is backed as CSR matrix for major speedups
+        adata = _ensure_csr(sc.read(adata_p, backed='r'))
         logging.info(f'Dataset shape: {adata.shape} (cells x genes)')
 
         # --- Identify perturbation column ---
@@ -576,13 +601,18 @@ def read_subset(
             var_mask = fp_mask if var_mask is None else (var_mask & fp_mask)
             logging.info(f'Feature pool filter: {var_mask.sum()} / {adata.n_vars} genes retained')
         
-        # --- Single to_memory() with the fully-combined mask ---
-        # Sort mask indices for faster slicing
+        # --- Single to_memory() with sorted obs indices ---
+        # AnnData backed mode doesn't support fancy indexing on both axes at
+        # once ("Only one indexing vector allowed"), so we slice obs only here
+        # and apply the var mask after loading via _inplace_subset_var.
+        # Peak RAM is (1 + selected_gene_fraction) x size — well under 2x.
         mask = np.sort(np.where(mask)[0])
-        # Slice view
-        view = adata[mask, var_mask] if (var_mask is not None and var_mask.sum() > 0) else adata[mask]
-        logging.info(f'Loading {view.shape[0]} cells x {view.shape[1]} genes into memory')
-        subset = view.to_memory()
+        n_vars_out = var_mask.sum() if var_mask is not None else adata.n_vars
+        logging.info(f'Loading {len(mask)} cells x {adata.n_vars} genes into memory '
+                     f'(will trim to {n_vars_out} genes post-load)')
+        subset = adata[mask].to_memory()
+        if var_mask is not None and var_mask.sum() > 0:
+            subset._inplace_subset_var(var_mask)
 
     except Exception as e:
         raise e
@@ -641,7 +671,7 @@ def preprocess_dataset(
     ) -> ad.AnnData:
     # All cell-level filters (labels, single-pert, QC) and the gene filter are
     # pushed into read_subset so they run in backed mode.  to_memory() is called
-    # exactly once on the minimal (cells × genes) slice — no in-memory copies.
+    # exactly once on the minimal (cells x genes) slice — no in-memory copies.
     logging.info(f'Reading: {dataset_file}')
     adata = read_subset(
         adata_p=dataset_file,
@@ -1015,6 +1045,7 @@ def sample_max_dataset_idx(
     min_eff: float = 0.0,
     norm_by_context_support: bool = True,
     sample_by_eff: bool = False,
+    n_classes: int | None = None,
 ):
     """
     Light subsampling: keep all data except extreme outlier groups.
@@ -1054,6 +1085,9 @@ def sample_max_dataset_idx(
     # Filter valid groups for minimum amount of contexts per perturbation
     ctxpp = valid_groups.reset_index().groupby(perturbation_col)[context_col].nunique()
     valid_perturbations = ctxpp[ctxpp >= min_contexts].index.values
+    if n_classes is not None and n_classes > 0:
+        logging.info(f'Subsampling to {n_classes} classes.')
+        valid_perturbations = rng.choice(valid_perturbations, n_classes, replace=False)
     valid_group_idx = valid_groups[valid_perturbations].index
 
     # Compute cap from quantile of valid group sizes
@@ -1147,8 +1181,10 @@ def process(
     logging.info(f'Found {mask.sum()} cells matching the target genes.')
     if mask.sum() == 0:
         return None
+    # Subset by sorted index for faster slicing
+    idx = sorted(np.where(mask)[0])
     # Subset adata view
-    subset = adata[mask]
+    subset = adata[idx]
     # Load only subset into memory
     subset = subset.to_memory()
     # Rename perturbation column
@@ -1187,7 +1223,19 @@ def process(
         logging.info(f'Applied normalizations: {norms}')
     return subset
 
-def prepare(adata, ds: str, pool_genes: list[str]):
+def prepare(adata, ds: str, pool_genes: list[str], scores_file: str | None = None):
+    # add per-cell efficicency scores if not None and is csv
+    if scores_file is not None and str(scores_file).endswith('.csv'):
+        # Read named series as dataframe
+        efficiency_scores_df = pd.read_csv(scores_file, index_col=0)
+        # Get valid indices
+        idx = adata.obs_names.intersection(efficiency_scores_df.index)
+        # Add scores per cell if barcodes match up
+        assert idx.shape[0] == adata.shape[0], "Score indices and adata barcodes don't match."
+        # Subset to valid indices if needed
+        scores = efficiency_scores_df.loc[idx]
+        # Update adata.obs with new column
+        adata.obs = pd.concat([adata.obs, scores], axis=1)
     # Make cell names unique per dataset
     adata.obs_names = adata.obs_names + ';' + ds
     # Add dataset marker to adata

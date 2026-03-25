@@ -25,6 +25,7 @@ class _OBS_KEYS_NT(NamedTuple):
     POOL_FEATURE_KEY: str = 'pool_feature'
     CTRL_KEY: str = 'control'
     CONTEXT_KEY: str = 'context'
+    EFFICIENCY_KEY: str = 'efficiency'
 
 class _SETTINGS(NamedTuple):
     MT_PERCENT_CANCER: int = 20
