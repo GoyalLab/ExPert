@@ -1,167 +1,206 @@
+# Dataloader parameters
 data:
   train_size: 0.9
-  batch_size: null
-  loader_type: balanced       # Use either 
-  use_balanced_weights: true      # Use balanced weights for class frequencies when using balanced loader
-  use_contrastive_loader: false    # Use a contrastive loader
-  n_samples: 100                # Number of samples per class to draw (w. replacement)
-  num_workers: 1
-  pin_memory: false
-  # Contrastive loader params
-  n_classes_per_batch: 16
-  n_samples_per_class: 32
-  min_contexts_per_class: 2
-  ctrl_frac: 1
+  batch_size: 1024
+  loader_type: balanced
+  weights_mode: both
+  use_balanced_weights: true
+  use_balanced_epochs: false
+  use_contrastive_loader: false
+  n_samples: 100
+  num_workers: 4
+  pin_memory: true
+  n_classes_per_batch: 32
+  n_samples_per_class: 24
+  min_contexts_per_class: 6
+  cap_per_group: null
+  min_dataset_fraction: 0.5
   use_special_for_split: train
   shuffle: true
-  use_copy: False
-  # Specify test contexts, will be excluded from training
+  extra_ctx_col: dataset
   test_context_labels:
-    - "CD4-positive, alpha-beta T cell"
+    - 'ReplogleWeissman2025_Jurkat'
+    - 'Marson2025_D1_Stim48hr'
+# Training parameters
 train:
-  max_epochs: 400
+  # TODO: Change for grid runs
+  max_epochs: 1200
   early_stopping: true
   early_stopping_monitor: clip_f1_score_validation
   early_stopping_mode: max
   early_stopping_patience: 40
   early_stopping_start_epoch: 0
-  checkpoint: false
+  checkpoint: true
   checkpoint_monitor: clip_f1_score_validation
   checkpoint_mode: max
   check_val_every_n_epoch: 1
-  check_test_every_n_epoch: null
   gradient_clip_val: null
-  # Plan args
+  # Training plan parameters
   plan_kwargs:
-    lr: 0.001
+    lr: 0.0005
+    use_cosine_restart: false
     lr_patience: 20
+    lr_factor: 0.9
+    reduce_lr_on_plateau: false
     weight_decay: 1.0e-05
     n_epochs_warmup: 400
-    freeze_encoder_epoch: null
-    freeze_decoder_epoch: null
-    multistage_kl_frac: 0.5
-    use_local_stage_warmup: false
-    scale_by_temp: false
-    observed_only: false
+    kl_stage_offset: 30
     use_posterior_mean: val
-    lr_scheduler_metric: validation_loss
-    log_class_distribution: false
+    lr_scheduler_metric: clip_f1_score_validation
     log_full:
+      - train
       - val
     full_log_every_n_epoch: 10
-    plot_umap: true
-    plot_umap_key: z_shared
-    plot_kl_distribution: false
+    plot_umap: false
+    plot_cm: false
+    plot_cat_emb: true
+    save_cache: true
+    plot_umap_key:
+      - z_shared
     average: macro
     top_k: 1
-    # Weight schedules
+    # Training weight schedules
     anneal_schedules:
-      # Reconstruction loss weight (1-1)
+      # RL weight
       rl_weight:
-        schedule: sigmoid
-        anneal_k: 10
-        n_epochs_stall: 0
+        schedule: linear
+        n_epochs_stall: 50
         min_weight: 1.0
-        max_weight: 1.0
-      # KL-divergence loss weight (0-1)
+        max_weight: 0.1
+      # Anneal KL like in standard vae
       kl_weight:
         schedule: sigmoid
         anneal_k: 10
         n_epochs_stall: 0
         min_weight: 0.0
         max_weight: 1.0
-      # Optional classification weight
-      cls_weight:
-        schedule: sigmoid
-        anneal_k: 10
+      # Cross-dataset contrastive loss
+      contrastive_weight:
+        schedule: linear
         n_epochs_stall: 0
-        min_weight: 0.01
-        max_weight: 0.01
-      # Align to a combined embedding, can only do one or the other
-      cls_align_weight:
-        schedule: sigmoid
-        anneal_k: 10
+        n_epochs_warmup: 200
+        min_weight: 10
+        max_weight: 10
+      # CLIP loss
+      clip_grad_scale:
+        schedule: linear
         n_epochs_stall: 0
+        n_epochs_warmup: 100
         min_weight: 1.0
         max_weight: 1.0
-
+      cls_align_weight:
+        schedule: linear
+        n_epochs_stall: 0
+        n_epochs_warmup: 100
+        min_weight: 50.0
+        max_weight: 50.0
+      # Efficiency modelling loss
+      lambda_eff:
+        weight: 1.0
+      # Gate modulation (0-1), 0=off
+      gate_eff:
+        weight: 1.0
+      # T gamma based on eff hat (0=off)
+      T_gamma:
+        weight: 0.0
 # Model parameters
 model:
-  n_latent: 128             # Number of latent dimensions (reconstruction bottleneck)
-  n_shared: 128             # Number of shared dimensions for clip (can be same as latent, will use latent as shared in that case)
-  n_hidden: -1              # Number of hidden neurons to use, if funnel encoder is used, this is the output of the first layer (-1 will start with all features and funnel down)
-  dropout_rate: 0.2
+  n_latent: 50          # Similar to a pca
+  n_shared: 256           # Shared projection space for clip alignment
+  n_hidden: -1             # Fixed shared hidden dimension for encoding and decoding
+  link_latents: false       # Whether to automatically set n_shared==transformer_dim
+  dropout_rate: 0.3           # Overall dropout rate
+  encoder_type: default
   dispersion: gene
+  gene_likelihood: zinb
   use_batch_norm: none
   use_layer_norm: both
-  gene_likelihood: zinb
-  decode_covariates: true             # Whether to decode using covariates (dataset, cell type, etc.)
-  deeply_inject_covariates: false       # Inject covariate information into every layer of the decoder
-  use_full_cls_emb: true
-  use_semantic_target_weights: false         # Base CE on class similarities instead of raw one-hot for label
-  log_variational: true
-  use_cpm: false
-  l1_lambda: 0.001
-  l2_lambda: 0.0
-  l_mask:
-  - attn
-  align_ext_emb_loss_strategy: clip
+  use_adapter: true           # Use an adapter projection from embedding to shared layer
   min_kl: 0.01
-  reduction: batchmean
-  non_elbo_reduction: batchmean
-  use_feature_mask: false
-  drop_prob: 0.001
+  reduction: batchmean              # ELBO reduction method
+  non_elbo_reduction: mean            # Secondary losses reduction method
+  automatic_loss_scaling: false          # Adjust secondary loss weights based on gradients
+  # Normalizations & Transformations
+  use_cpm: false               # Apply counts per million
+  log_variational: true       # Apply log1p
+  use_ds_anchors: false        # Apply dataset-wise scaling (required dataset anchor calculation in core)
+  scale: false                # Apply global scaling
+  impute_missing: false       # Impute missing genes via gene embedding
+  # Use batch dataset mixup augmentation (increases runtime)
+  use_augmentation: false
+  # Use raw x for reconstruction loss (default zinb) or normalized x
+  reconstruct_raw_x: true
+  # Model perturbation efficiency and use it to modulate clip
+  model_efficiency: true
+  # Decode covariates
+  decode_covariates: true
+  decode_ctx_emb: false
+  deeply_inject_covariates: false
+  use_full_cls_emb: false                 # Only pass observable embeddings to loss
+  # Use pre-trained gene embedding for projection layer if enabled
+  use_gene_emb: true
+  # Use dataset similarity weights for clip and contrastive loss
+  use_ds_sim_weights: false
+  # Weight reconstruction loss by dataset support size
+  use_ctx_weights: false
+  # Extra options TODO: check if required
   batch_representation: embedding
-  # Control options
-  ctrl_class: null            # Define a control class that will be treated differently during training
-  use_reconstruction_control: false
-  use_kl_control: false
-  # Encoder parameters
+  # Encoder-specific settings
   extra_encoder_kwargs:
-    encoder_type: transformer
-    linear_encoder: false
-    n_layers: 2
-    use_attention: false
-    context_integration_method: null
-    n_head: 4
-    n_attn_layers: 2
-    ff_mult: 4
-    activation_fn: nn.GELU
-    noise_std: 0.001
+    encoder_type: funnel          # Type of encoder projection
+    linear_encoder: false           # TODO: implement
+    n_layers: 3                     # Number of layers in encoder
+    activation_fn: nn.GELU            # Activation function
+    drop_prob: 0.2                  # Feature drop probability
+    noise_sigma: 0.05
+    # Use feature mask normalization
+    normalize_x: true
+    # Use gene embedding as first layer
+    use_emb: false
+    # How much the residual connection should influence z
+    residual_scale: 0.1
+    n_gene_emb: 256
+    linear_gene_proj: true
+    init_emb_pca: true
+    post_emb_ln: false
+  # Decoder-specific settings
   extra_decoder_kwargs:
     linear_decoder: false
-    use_funnel: true
-    n_layers: 2
-    n_context_compression: 6              # Compress context embedding dimensions before adding it to decoder input
-    use_film: false
-    activation_fn: nn.GELU
-  # Classifier init params
-  extra_cls_kwargs:
-    dropout_rate: 0.2
-    n_layers: 1
-    n_hidden: 256
-    temperature: 1.0
-    use_learnable_temperature: false
-  # Aligner params
-  extra_aligner_kwargs:
-    dropout_rate: 0.2
-    temperature: 1.0
-    min_temperature: 0.05
-    max_temperature: 1.0
     n_hidden: -1
-    n_layers: 2
-    linear_ctx_proj: true             # Context embedding is much simpler, linear projection is usually fine
-    linear_cls_proj: true              # Class embedding is complex >3k dimensions --> non-linear layer should help
-    use_learnable_temperature: false    # True allows for learnable logit scaling, mostly leads to v. fast convergence & overfitting
-    noise_sigma: 0.001
-    use_learnable_sigma: false        # Mostly just collapses to 0 in the first couple of epochs
-  
+    use_funnel: true
+    n_layers: 1
+    injection_from_layer: 1
+    n_cat_frac: 1.0
+    activation_fn: nn.GELU
+  # Alignment options
+  extra_aligner_kwargs:
+    mode: shared                  # Align in a shared space
+    linear_z_proj: false            # Linear projection from z to shared space
+    linear_c_proj: true               # Linear projection from c to shared space
+    n_layers: 2                     # Number of layers for projections if non-linear
+    dropout_rate: 0.3                 # Dropout rate on z before alignment
+    temperature: 0.2                  # Alignment temperature (lower = sharper alignment, higher = more semantic)
+  # Class embedding settings
+  extra_cls_emb_kwargs:
+    freeze: true                  # Freeze text transformer model or allow fine-tuning
+    use_null_proxy: false           # Add a control proxy
+    n_prototypes: 1                   # Number of prototypes per class
+  # CLIP-style alignment settings
+  extra_clip_kwargs:
+    use_reverse: true               # Enable text to z alignment
+    alpha: 0.7                      # Ratio between z to txt
+    use_global: true                # Enable global z2c loss
+    n_global: 512                       # Number of random global observable classes to draw each step
+    label_smoothing: 0.05             # Label smoothing for CE losses
+    use_cls_prototypes: false        # Add cls prototypes on supcon
+    momentum: 0.01                   # Update momentum of supcon z class means
 model_setup:
-  batch_key: context
-  labels_key: cls_label
-  class_emb_uns_key: cls_embedding
-  gene_emb_varm_key: null
-  context_emb_uns_key: ctx_embedding
-  # Add dataset label as categorical co-variate
-  categorical_covariate_keys:
+  batch_key: dataset              # Main covariate key to model
+  labels_key: perturbation          # Perturbation label
+  efficiency_key: efficiency             # Perturbation efficiency label
+  class_emb_uns_key: cls_embedding        # Slot for precalculated gene embeddings used for classification
+  gene_emb_varm_key: null                     # .varm slot for gene embeddings (optional)
+  context_emb_uns_key: null                     # .uns slot for context embeddings (optional)
+  feature_mask_varm_key: feature_mask_per_dataset       # Masks of active features per batch_key (optional)
+  categorical_covariate_keys:             # Other categorical covariates to model in decoder (or encoder)
     - dataset

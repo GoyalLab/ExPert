@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -30,6 +31,28 @@ class _MutableBatchSampler(Sampler):
     def swap(self, new_inner):
         self.inner = new_inner
         self.batch_size = getattr(new_inner, 'batch_size', None)
+
+
+class _IOSortedBatchSampler(Sampler):
+    """Wraps a BatchSampler to reorder batches by disk locality.
+
+    Pre-generates all batches for the epoch, then sorts them by median
+    index so consecutive batches read from nearby file regions. This
+    turns random I/O into roughly sequential I/O on backed AnnData.
+    """
+
+    def __init__(self, inner: BatchSampler):
+        self.inner = inner
+        self.batch_size = getattr(inner, 'batch_size', None)
+
+    def __iter__(self):
+        # Materialize all batches, sort by median index for disk locality
+        batches = list(self.inner)
+        batches.sort(key=lambda b: np.median(b))
+        yield from batches
+
+    def __len__(self):
+        return len(self.inner)
 
 
 class BalancedEpochSampler(Sampler):
@@ -169,10 +192,22 @@ class BalancedAnnDataLoader(DataLoader):
         # set number of samples
         self.n_samples = n_samples * batch_size
 
-        if "num_workers" not in kwargs:
-            kwargs["num_workers"] = settings.dl_num_workers
-        if "persistent_workers" not in kwargs:
-            kwargs["persistent_workers"] = settings.dl_persistent_workers
+        # Use fast dataloader defaults when dense cache is active (mmap, multi-worker safe)
+        has_dense_cache = getattr(adata_manager, '_dense_cache', None) is not None
+        if has_dense_cache:
+            if "num_workers" not in kwargs:
+                kwargs["num_workers"] = min(4, os.cpu_count() or 1)
+            if "persistent_workers" not in kwargs:
+                kwargs["persistent_workers"] = kwargs.get("num_workers", 0) > 0
+            if "pin_memory" not in kwargs:
+                kwargs["pin_memory"] = torch.cuda.is_available()
+            if "prefetch_factor" not in kwargs and kwargs.get("num_workers", 0) > 0:
+                kwargs["prefetch_factor"] = 3
+        else:
+            if "num_workers" not in kwargs:
+                kwargs["num_workers"] = settings.dl_num_workers
+            if "persistent_workers" not in kwargs:
+                kwargs["persistent_workers"] = settings.dl_persistent_workers
 
         self.kwargs = deepcopy(kwargs)
 
@@ -221,7 +256,12 @@ class BalancedAnnDataLoader(DataLoader):
                         num_samples=self.n_samples,
                         replacement=True,
                     )
-                    self._sampler = BatchSampler(sampler, batch_size=batch_size, drop_last=drop_last)
+                    batch_sampler = BatchSampler(sampler, batch_size=batch_size, drop_last=drop_last)
+                    # Sort batches by disk location for sequential I/O on backed data
+                    if adata_manager.adata.isbacked:
+                        self._sampler = _IOSortedBatchSampler(batch_sampler)
+                    else:
+                        self._sampler = batch_sampler
 
                 self.kwargs.update({"sampler": self._sampler, "batch_size": None, "shuffle": False})
             else:

@@ -111,9 +111,9 @@ class XPert(VAE):
         align_ext_emb_loss_strategy: Literal['kl', 'clip'] | list[str] = 'clip',            # Secondary classifier module (links external embedding)
         reduction: Literal['mean', 'sum', 'batchmean'] = 'mean',
         non_elbo_reduction: Literal['mean', 'sum', 'batchmean'] = 'mean',
-        use_hierarchical_labels: bool = True,
         encoder_type: Literal['default', 'split', 'gene'] = 'default',
-        hierarchy_inference: Literal['embedding', 'library'] = 'embedding',
+        hierarchy_inference: Literal['embedding', 'library'] = 'library',
+        use_hierarchical_labels: bool = False,
         use_hierarchical_clip: bool = False,
         use_learnable_hierarchy_temperatures: bool = False,
         module_quantile: float = 0.9,
@@ -122,8 +122,6 @@ class XPert(VAE):
         use_ctx_weights: bool = True,
         use_ds_sim_weights: bool = True,
         use_augmentation: bool = False,
-        use_decoded_augmentation: bool = False,
-        shuffle_context: bool = True,
         link_latents: bool = False,
         automatic_loss_scaling: bool = False,
         model_efficiency: bool = True,
@@ -225,9 +223,6 @@ class XPert(VAE):
         # Setup data augmentation module
         self.use_augmentation = use_augmentation
         self.augmentation = CrossDatasetMixup(**extra_aug_kwargs) if use_augmentation else None
-        # Additional batch augmentation via decoded sample
-        self.use_decoded_augmentation = use_decoded_augmentation
-        self.shuffle_context = shuffle_context
         # Setup class weights (optional)
         if use_cls_weights and cls_weights is not None:
             self.register_buffer('cls_weights', cls_weights)
@@ -259,6 +254,7 @@ class XPert(VAE):
             self.n_cls = self.cls_emb.shape[0]
             self.n_cls_dim = self.cls_emb.shape[-1]
         else:
+            raise ValueError(f'Provide either pre-trained gene embeddings or text descriptions.')
             self.cls_emb = None
             self.n_cls, self.n_cls_dim = 0, 0
         self.cls_sim = torch.nn.Embedding.from_pretrained(cls_sim, freeze=True) if cls_sim is not None  else None
@@ -286,8 +282,6 @@ class XPert(VAE):
         self.use_hierarchical_clip = use_hierarchical_clip
         self.hierarchy_inference = hierarchy_inference
         self.gene_names = np.array(list(cls_text_dict.keys())) if cls_text_dict is not None else None
-        # Set unseen indices for all layers
-        self.unseen_gene_indices = torch.arange(self.n_labels, self.n_cls)
 
         # Setup learnable temperatures
         self.use_learnable_hierarchy_temperatures = use_learnable_hierarchy_temperatures
@@ -1565,6 +1559,8 @@ class XPert(VAE):
             gate_eff = gate_eff.clamp(min=0.0, max=1.0)
             # Modulate clip weights by gate efficiency
             clip_weights = (1 - gate_eff) + gate * gate_eff
+            # Zero out cells with no measurable perturbation effect
+            clip_weights = clip_weights * (weights > 0).float()
             # Add mixup weights if given
             if mixup_weights is not None:
                 clip_weights = clip_weights * mixup_weights

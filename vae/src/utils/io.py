@@ -84,6 +84,10 @@ def load_backed(
         log.info(f'[Data] Created AnnCollection: {total:,} total cells from {len(adatas)} files')
         return collection
 
+def check_adata_cat_cols(adata: ad.AnnData):
+    for col in adata.obs.select_dtypes(include="category").columns:
+        adata.obs[col] = adata.obs[col].cat.remove_unused_categories()
+
 def sanitize_for_logging(obj, max_list_len=20):
     """
     Recursively sanitize hyperparams for logging.

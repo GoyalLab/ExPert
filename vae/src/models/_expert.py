@@ -199,6 +199,7 @@ class ExPert(
         self.n_unseen_labels = self.adata.uns[REGISTRY_KEYS.CLS_EMB_INIT]['n_unseen_labels'] if REGISTRY_KEYS.CLS_EMB_INIT in adata.uns else None
         self._model_summary_string = (
             f"{self.__class__} Model with the following params: \n"
+            f"adata shape: {self.adata.shape}, "
             f"n_classes: {self.n_labels}, "
             f"n_unseen_classes: {self.n_unseen_labels}, \n"
             f"n_contexts: {n_batch}, \n"
@@ -422,7 +423,7 @@ class ExPert(
 
         if len(shared) != len(label_series):
             missing = label_series[~label_series.isin(shared)]
-            raise ValueError(f"Missing labels in embedding: {missing}")
+            raise ValueError(f"[Setup] Missing {len(missing)} class embeddings for observed labels.")
 
         ordered_df = pd.concat(
             [cls_emb_df.loc[shared], cls_emb_df.loc[unseen]], axis=0
@@ -449,12 +450,13 @@ class ExPert(
         
         # Remove empty text entries
         self.cls_text_dict = {k: v for k, v in self.cls_text_dict.items() if isinstance(v, str) and len(v) > 0}
-
+        # Split into observed and unseen texts
         observed = [k for k in self.cls_text_dict if k in self._label_mapping]
         unseen = [k for k in self.cls_text_dict if k not in self._label_mapping]
-
+        # Check if we have texts for all perturbation labels
         if len(observed) != self.n_labels:
-            raise ValueError("[Setup] Missing class texts for observed labels.")
+            raise ValueError(f"[Setup] Missing {np.abs(len(observed) - self.n_labels)} class texts for observed labels.")
+
         # Inlcude all or just observable keys in texts
         if self.use_full_cls_emb:
             ordered_keys = sorted(observed) + sorted(unseen)
@@ -630,7 +632,7 @@ class ExPert(
             # There is no in-batch option for that so it doesn't need to be toggled off
             sc.pp.scale(self.adata)
             self.transformations.append('scale')
-        
+
     def _setup(self):
         """Setup adata for training. Prepare embeddings."""
         # Initialize both embeddings as None
@@ -1321,14 +1323,14 @@ class ExPert(
         train_params: dict[str, Any] = config.get(CONF_KEYS.TRAIN, {})
         # Get max epochs specified in params
         epochs = train_params.get('max_epochs')
-        # Determine number of epochs needed for complete training
-        max_epochs = get_max_epochs_heuristic(self.adata.n_obs)
         # Train for suggested number of epochs if no specification is give
         if epochs is None:
+            # Determine number of epochs needed for complete training
+            max_epochs = get_max_epochs_heuristic(self.adata.n_obs)
             if self.was_pretrained:
                 max_epochs = int(np.min([10, np.max([2, round(max_epochs / 3.0)])]))
             epochs = max_epochs
-        log.info(f'Epochs suggested: {max_epochs}, training for {epochs} epochs.')
+            log.info(f'Epochs suggested: {max_epochs}, training for {epochs} epochs.')
         # Get training split fraction
         train_size: int = data_params.pop('train_size', 0.9)
         if not train_size < 1.0 and train_size > 0:
@@ -1405,7 +1407,7 @@ class ExPert(
             )
             # Add to callbacks
             callbacks.append(early_stopping_callback)
-  
+        # TODO: add SWA callback?
         # Manage checkpoint callback
         use_checkpoint = train_params.pop('checkpoint', False)
         checkpoint_monitor = train_params.pop('checkpoint_monitor', 'validation_loss')
@@ -1453,6 +1455,7 @@ class ExPert(
             devices='auto',
             enable_checkpointing=use_checkpoint,
             default_root_dir=checkpoint_dir,
+            simple_progress_bar=False,              # Show per-batch progress
             **train_params
         )
         # Save hyperparameters to model output dir
@@ -2273,6 +2276,7 @@ class ExPert(
         efficiency_key: str | None = None,
         cast_to_csr: bool = True,
         raw_counts: bool = True,
+        check_cat_cols: bool = True,
         layer: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
@@ -2284,6 +2288,8 @@ class ExPert(
         if not isinstance(adata.X, sp.csr_matrix) and cast_to_csr and not adata.isbacked:
             log.info('[Registry] Converting adata.X to csr matrix to boost training efficiency.')
             adata.X = sp.csr_matrix(adata.X)
+        if check_cat_cols:
+            io.check_adata_cat_cols(adata)
         setup_method_args = cls._get_setup_method_args(**locals())
         
         anndata_fields = [

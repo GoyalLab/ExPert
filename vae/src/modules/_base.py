@@ -659,7 +659,6 @@ class Encoder(nn.Module):
         use_feature_mask: bool = False,
         drop_prob: float = 0.0,
         noise_sigma: float = 0.01,
-        noise_sigma_add: float = 0.01,
         encoder_type: Literal["funnel", "fc", "transformer"] = "funnel",
         context_integration_method : Literal["concat", "film", "attention"] | None = None,
         normalize_x: bool = False,
@@ -692,7 +691,6 @@ class Encoder(nn.Module):
         self.use_feature_mask = use_feature_mask
         self.drop_prob = drop_prob
         self.noise_sigma = noise_sigma
-        self.noise_sigma_add = noise_sigma_add
         self.context_integration_method = context_integration_method
         self.normalize_x = normalize_x
         # Add residual x on top x @ E
@@ -887,8 +885,14 @@ class Encoder(nn.Module):
 
         # Feature dropout
         if self.training and self.drop_prob > 0:
-            drop_mask = torch.bernoulli(torch.full((x.size(0), x.size(1)), 1 - self.drop_prob, device=x.device))
-            x = x * drop_mask / (1 - self.drop_prob)  # inverted dropout
+            if feature_masks is not None and not self.use_emb:
+                # Only drop active features so effective drop rate matches drop_prob
+                keep_prob = torch.where(feature_masks.bool(), 1 - self.drop_prob, 1.0)
+                drop_mask = torch.bernoulli(keep_prob)
+                x = x * drop_mask / (1 - self.drop_prob)  # inverted dropout
+            else:
+                drop_mask = torch.bernoulli(torch.full((x.size(0), x.size(1)), 1 - self.drop_prob, device=x.device))
+                x = x * drop_mask / (1 - self.drop_prob)  # inverted dropout
         
         # Feed x to the encoder
         q = self.encoder(x, *cat_list)
@@ -1985,7 +1989,6 @@ class ClassEmbedding(nn.Module):
         ignore_texts: bool = False,
         n_prototypes: int = 1,
         use_null_proxy: bool = False,
-        n_ctrl: int = 3,
     ):
         super().__init__()
 
@@ -2076,14 +2079,15 @@ class ClassEmbedding(nn.Module):
 
         # Add final output adapter if n output is not None
         if n_output is not None:
+            emb = pretrained_emb.to(device)
             # Initialize on pca
-            _, _, Vt = torch.linalg.svd(pretrained_emb, full_matrices=False)
+            _, _, Vt = torch.linalg.svd(emb, full_matrices=False)
             self.adapter = nn.Linear(self._emb_dim, n_output, bias=False)
             self.adapter.weight.data = Vt[:n_output]
 
             # Verify structure is preserved
             with torch.no_grad():
-                proj = self.adapter(pretrained_emb.to(device))
+                proj = self.adapter(emb)
                 sim_orig = F.cosine_similarity(pretrained_emb[:10].unsqueeze(1), pretrained_emb[10:20].unsqueeze(0), dim=-1)
                 sim_proj = F.cosine_similarity(proj[:10].unsqueeze(1), proj[10:20].unsqueeze(0), dim=-1)
                 logging.info(f"[Setup] Class embedding similarity preserved: {np.corrcoef(sim_orig.detach().cpu().flatten().numpy(), sim_proj.detach().cpu().flatten().numpy())[0,1]:.4f}")

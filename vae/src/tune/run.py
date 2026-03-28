@@ -19,6 +19,7 @@ from src.utils.constants import PREDICTION_KEYS
 import src.utils.io as io
 from src.tune._statics import CONF_KEYS
 from src.models._expert import ExPert
+from src.data._cache import cleanup_ssd_cache
 
 from typing import Literal
 
@@ -88,45 +89,55 @@ def get_ouptut_dir(config_p: str, output_base_dir: str | None = None) -> str:
 
 def _train(
         adata_p: str, 
-        step_model_dir: str, 
+        model_dir: str, 
         config: dict, 
-        cls_label: str = 'perturbation',
-        batch_key: str = 'dataset',
         verbose: bool = True,
-        context_filter: list[str] | None = None,
+        blacklist: list[str] | None = None,
         cls_texts_p: str | None = None,
+        max_gb_in_core: int = 100,
         **train_kwargs
     ) -> ExPert:
     """Train wrapper for ExPert.train()"""
-    log.info(f'Reading training data from: {adata_p}')
-    model_set = sc.read(adata_p)
+    # Load training dataset
+    if os.path.getsize(adata_p) / 1024 ** 3 > max_gb_in_core:
+        logging.info(f'Reading backed training data from: {adata_p}')
+        model_set = sc.read(adata_p, backed='r')
+    else:
+        logging.info(f'Reading training data from: {adata_p}')
+        model_set = sc.read(adata_p)
     
     # Subset model to only the include specified datasets
-    if context_filter is not None:
-        log.info(f'Subsetting to context keys: {context_filter}')
-        model_set._inplace_subset_obs(model_set.obs[batch_key].isin(context_filter))
+    if blacklist is not None and len(blacklist) > 0 and not model_set.isbacked:
+        bk = config['model_setup']['batch_key']
+        logging.info(f"Removing contexts matching keys: {blacklist}")
+        pattern = "|".join(blacklist)
+        mask = ~model_set.obs[bk].astype(str).str.contains(pattern, regex=True)
+        model_set._inplace_subset_obs(mask)
+        sc.pp.filter_genes(model_set, min_counts=1)
     # Set precision
     torch.set_float32_matmul_precision('medium')
 
     # Setup model
     log.info('Setting up model.')
     # Setup anndata with model
-    setup_kwargs = {'batch_key': batch_key, 'labels_key': cls_label}
-    setup_kwargs.update(config.get(CONF_KEYS.MODEL_SETUP, {}))
+    setup_kwargs = config.get(CONF_KEYS.MODEL_SETUP, {})
     # Load class texts if path is given
     cls_texts = io.load_json(cls_texts_p)
+    # Setup adata for model
     ExPert.setup_anndata(
         model_set,
         **setup_kwargs
     )
-    # Initialize main model
-    model = ExPert(model_set, cls_text_dict=cls_texts, **config[CONF_KEYS.MODEL].copy())
+    model = ExPert(
+        model_set, 
+        model_log_dir=model_dir,
+        cls_text_dict=cls_texts, 
+        **config[CONF_KEYS.MODEL].copy()
+    )
     if verbose:
-        print(model.module)
-    # Set training logger
-    config[CONF_KEYS.TRAIN]['logger'] = pl.loggers.TensorBoardLogger(step_model_dir)
+        logging.info(model.module)
     # Train the model
-    log.info(f'Running at: {step_model_dir}')
+    log.info(f'Running at: {model_dir}')
     model.train(config, **train_kwargs)
     return model
 
@@ -135,11 +146,11 @@ def train(adata_p: str, config_p: str, out_dir: str, **kwargs) -> dict[str: nn.M
     # Load run config
     config = io.read_config(config_p, do_setup=False, check_schema=False)
     # Init run output dir
-    step_model_dir = get_ouptut_dir(config_p, output_base_dir=out_dir)
+    model_dir = get_ouptut_dir(config_p, output_base_dir=out_dir)
     # Train the model
     model: ExPert = _train(
         adata_p=adata_p, 
-        step_model_dir=step_model_dir, 
+        model_dir=model_dir, 
         config=config,
         **kwargs
     )
@@ -156,7 +167,7 @@ def full_run(
         batch_label: str = 'context',
         ctrl_key: str | None = 'control',
         results_mode: Literal['return', 'save'] | None | list[str] = 'save',
-        save_anndata: bool = False,
+        save_anndata: bool = True,
         fine_tune_config_p: str | None = None,
         **kwargs
     ) -> pd.DataFrame:
@@ -268,6 +279,8 @@ def main():
         raise e
 
     finally:
+        # Remove SSD cache copies (if any)
+        cleanup_ssd_cache()
         # Close all dataloaders, etc.
         clean_up()
 

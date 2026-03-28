@@ -40,6 +40,7 @@ class DataSplitter(pl.LightningDataModule):
         use_special_for_split: list[str] = ['train'],
         extra_ctx_col: str | None = None,
         test_context_labels: np.ndarray | str | None = None,
+        available_classes: np.ndarray | None = None,
         external_indexing: list[np.ndarray, np.ndarray, np.ndarray] | None = None,
         cache_indices: dict[str, np.ndarray] | None = None,
         drop_last: bool = False,
@@ -88,6 +89,7 @@ class DataSplitter(pl.LightningDataModule):
         self.external_indexing = external_indexing
         self.cache_indices = cache_indices
         self.use_special_for_split = use_special_for_split
+        self.available_classes = available_classes
 
         # === Label and context extraction ===
         self.indices = np.arange(adata_manager.adata.n_obs)
@@ -127,6 +129,12 @@ class DataSplitter(pl.LightningDataModule):
             else:
                 base_idx = self.indices
                 ood_test_idx = []
+
+            # Filter indices for available labels only if given
+            if self.available_classes is not None:
+                log.info(f'[Setup] Subsetting indices to {len(self.available_classes)}/{len(np.unique(self.labels[base_idx]))} available classes.')
+                avail_mask = np.isin(self.labels[base_idx], self.available_classes)
+                base_idx = base_idx[avail_mask]
 
             # Create joint stratification labels
             strat_labels = np.array([

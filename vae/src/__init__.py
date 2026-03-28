@@ -1,6 +1,3 @@
-import os
-os.environ.setdefault('NUMBA_THREADING_LAYER', 'workqueue')
-
 import logging
 from rich.logging import RichHandler
 import warnings

@@ -119,9 +119,10 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         plot_clip_geom: bool = True,
         plot_cat_emb: bool = True,
         plot_every_n_epochs: int = 10,
+        async_logging: bool = False,
         # Caching options
         cache_n_epochs: int | None = 1,
-        n_train_cache: int = 10_000,
+        n_max_cache: int = 20_000,
         save_cache: bool = False,
         use_cosine_restart: bool = False,
         **loss_kwargs,
@@ -204,6 +205,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.log_full = log_full
         self.full_log_every_n_epoch = full_log_every_n_epoch
         self.plot_every_n_epochs = plot_every_n_epochs
+        self.async_logging = async_logging
         self.batch_labels = batch_labels
         self.cov_labels = cov_labels
         self.log_random_predictions = log_random_predictions
@@ -213,7 +215,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         self.observed_classes = set()
         # ----- Cache -----
         self.cache = {}
-        self.n_train_cache = n_train_cache
+        self.n_max_cache = n_max_cache
         self.save_cache = save_cache
         # Cache for embeddings and metadata within epoch
         self.epoch_cache = {
@@ -391,11 +393,15 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         # Only cache every n epoch
         if self.full_log_every_n_epoch <= 0 or self.current_epoch % self.full_log_every_n_epoch != 0:
             return
-        # Stop caching training steps after limit is reached
-        if mode == "train" and len(self.epoch_cache[mode][MODULE_KEYS.Z_KEY]) > self.n_train_cache:
-            return
-        # Create cache
+        # Get size of new entry
+        N = inference_outputs[MODULE_KEYS.Z_KEY].size(0)
+        # Get mode cache
         cache = self.epoch_cache[mode]
+        # Stop caching steps before limit is reached
+        if cache.get('n', 0) + N > self.n_max_cache:
+            return
+        # Increment cache size
+        cache['n'] = cache.get('n', 0) + N
         # Core fields
         cache[MODULE_KEYS.Z_KEY].append(inference_outputs[MODULE_KEYS.Z_KEY].detach().cpu())
         cache[REGISTRY_KEYS.LABELS_KEY].append(inference_outputs[MODULE_KEYS.LABEL_KEY].detach().cpu())
@@ -448,7 +454,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
         }
         # Collect each cache item
         for k, tensors in cache.items():
-            if len(tensors) == 0:
+            if not isinstance(tensors, list) or len(tensors) == 0:
                 continue
             # Mean aggregation
             if k in mean_keys:
@@ -1191,15 +1197,14 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             plot_modes = list(_modes)
             epoch = self.current_epoch
 
-            def _plot_async():
-                import matplotlib
-                matplotlib.use('Agg')
+            def _plot():
                 import matplotlib.pyplot as plt
                 try:
                     for mode in plot_modes:
                         self._compute_disentanglement_metrics(mode, plot_data)
                         if self.plot_f1_dist:
                             self._plt_f1_per_ctx_boxplots(plot_data)
+                            self._plt_f1_support_coverage(mode, plot_data)
                         if self.plot_cm:
                             self._plt_confusion(mode, plot_data)
                         if self.plot_clip_geom:
@@ -1211,17 +1216,22 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
                             if z_key in plot_data:
                                 self._plt_umap(full_name, plot_data, current_epoch=epoch, z_key=z_key)
                 except Exception as e:
-                    logging.warning(f'[Plot] Background plotting failed at epoch {epoch}: {e}')
+                    logging.warning(f'[Plot] Plotting failed at epoch {epoch}: {e}')
                 finally:
                     plt.close('all')
 
-            # Wait for any previous plot job to finish before starting a new one
-            if hasattr(self, '_plot_future') and self._plot_future is not None:
-                self._plot_future.result()
-            if not hasattr(self, '_plot_executor'):
-                from concurrent.futures import ThreadPoolExecutor
-                self._plot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='plot')
-            self._plot_future = self._plot_executor.submit(_plot_async)
+            # Create background progress for plotting
+            if self.async_logging:
+                # Wait for any previous plot job to finish before starting a new one
+                if hasattr(self, '_plot_future') and self._plot_future is not None:
+                    self._plot_future.result()
+                if not hasattr(self, '_plot_executor'):
+                    from concurrent.futures import ThreadPoolExecutor
+                    self._plot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='plot')
+                self._plot_future = self._plot_executor.submit(_plot)
+            # Just do synchronous plotting
+            else:
+                _plot()
 
     # Calculate accuracy & f1 for entire validation set, not just per batch
     def on_validation_epoch_end(self):
@@ -1875,7 +1885,7 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             )
             cbar.set_label("Class support within context", rotation=90)
 
-            ax.set_title(f"{split} | per-context F1 (colored by class support)")
+            ax.set_title(f"{split} | per-context F1 (colored by class support) | N={support.sum()}")
             ax.set_xlabel("Context")
             ax.set_ylabel("F1")
             ax.set_ylim(0, 1)
@@ -1891,14 +1901,119 @@ class ContrastiveSupervisedTrainingPlan(TrainingPlan):
             plt.close(fig)
 
 
+    def _plt_f1_support_coverage(self, mode: str, mode_data: dict[str, np.ndarray]):
+        """Scatter of per-class F1 vs support, colored by dataset coverage (n_contexts)."""
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from matplotlib.colors import Normalize
+        from matplotlib.cm import ScalarMappable
+        from torchmetrics.functional.classification import multiclass_f1_score
+
+        preds = mode_data.get(PREDICTION_KEYS.PREDICTION_KEY)
+        if preds is None:
+            return
+
+        labels = mode_data[REGISTRY_KEYS.LABELS_KEY]
+        contexts = mode_data[REGISTRY_KEYS.BATCH_KEY]
+
+        df = pd.DataFrame({"label": labels, "pred": preds, "context": contexts})
+
+        n_classes = self.n_classes
+
+        # Per-class F1
+        labels_t = torch.tensor(df["label"].values)
+        preds_t = torch.tensor(df["pred"].values).squeeze(-1)
+        unknown_mask = preds_t >= n_classes
+        clip_n_cls = n_classes
+        if unknown_mask.any():
+            preds_t = preds_t.masked_fill(unknown_mask, n_classes)
+            clip_n_cls += 1
+
+        f1_per_class = multiclass_f1_score(
+            preds_t, labels_t, num_classes=clip_n_cls,
+            ignore_index=n_classes, average="none",
+        ).cpu().numpy()[:n_classes]
+
+        # Per-class support
+        support = df["label"].value_counts().reindex(range(n_classes), fill_value=0).values
+
+        # Per-class dataset coverage = number of distinct contexts the class appears in
+        coverage = df.groupby("label")["context"].nunique().reindex(range(n_classes), fill_value=0).values
+
+        # Filter to classes that actually appear
+        mask = support > 0
+        f1_vals = f1_per_class[mask]
+        sup_vals = support[mask]
+        cov_vals = coverage[mask]
+        cls_ids = np.where(mask)[0]
+
+        if len(f1_vals) == 0:
+            return
+
+        # --- Main scatter: F1 vs support, colored by coverage ---
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # Panel 1: F1 vs Support (colored by coverage)
+        ax = axes[0]
+        norm = Normalize(vmin=cov_vals.min(), vmax=cov_vals.max())
+        cmap = plt.cm.plasma
+        sc = ax.scatter(
+            sup_vals, f1_vals, c=cov_vals, s=20,
+            cmap=cmap, norm=norm, alpha=0.7, linewidths=0,
+        )
+        fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, pad=0.01).set_label("Dataset coverage")
+        ax.set_xlabel("Support (n cells)")
+        ax.set_ylabel("F1")
+        ax.set_xscale("log")
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_title(f"{mode} | F1 vs Support (color = coverage)")
+
+        # Panel 2: F1 vs Coverage
+        ax = axes[1]
+        ax.scatter(
+            cov_vals + np.random.uniform(-0.15, 0.15, size=len(cov_vals)),
+            f1_vals, c=np.log1p(sup_vals), s=20,
+            cmap="viridis", alpha=0.7, linewidths=0,
+        )
+        fig.colorbar(
+            ScalarMappable(norm=Normalize(vmin=np.log1p(sup_vals).min(), vmax=np.log1p(sup_vals).max()), cmap="viridis"),
+            ax=ax, pad=0.01,
+        ).set_label("log(support)")
+        ax.set_xlabel("Dataset coverage (n contexts)")
+        ax.set_ylabel("F1")
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_title(f"{mode} | F1 vs Coverage (color = support)")
+
+        # Panel 3: Coverage vs Support (colored by F1)
+        ax = axes[2]
+        f1_norm = Normalize(vmin=0, vmax=1)
+        sc3 = ax.scatter(
+            sup_vals, cov_vals + np.random.uniform(-0.15, 0.15, size=len(cov_vals)),
+            c=f1_vals, s=20, cmap="RdYlGn", norm=f1_norm, alpha=0.7, linewidths=0,
+        )
+        fig.colorbar(ScalarMappable(norm=f1_norm, cmap="RdYlGn"), ax=ax, pad=0.01).set_label("F1")
+        ax.set_xlabel("Support (n cells)")
+        ax.set_ylabel("Dataset coverage (n contexts)")
+        ax.set_xscale("log")
+        ax.set_title(f"{mode} | Coverage vs Support (color = F1)")
+
+        plt.tight_layout()
+        self.logger.experiment.add_figure(
+            tag=f"f1_support_coverage/{mode}",
+            figure=fig,
+            global_step=self.current_epoch,
+        )
+        plt.close(fig)
+
     def _plt_umap(self, mode: str, mode_data: dict[str, np.ndarray], current_epoch: int, z_key: str = MODULE_KEYS.Z_KEY):
         """Plot UMAP of latent space (with proxies) into TensorBoard."""
         import os
         import umap
         import numpy as np
         import pandas as pd
-        import seaborn as sns
         import matplotlib.pyplot as plt
+        import seaborn as sns
 
         # Get shared latent embedding and annotation data, fall back to z if not in cached data
         embeddings = mode_data[z_key]
