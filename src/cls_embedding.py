@@ -25,6 +25,7 @@ class EmbeddingProcessor:
             misc_method: Literal['mean', 'gaussian', 'zeros'] = 'mean',
             std: float = 1e-3,
             filter_embedding: bool = True,
+            add_emb_misc_rows: bool = False,
             add_emb_for_features: bool = False,
             cls_emb_uns_key: str = 'cls_embedding',
             gene_embedding_varm_key: str = 'gene_embedding',
@@ -33,8 +34,8 @@ class EmbeddingProcessor:
             pos_type: str = 'crispra',
             additional_targets: np.ndarray | None = None,
             cls_label: str = 'cls_label',
-            sim_cutoff: float = 0.8,
-            filter_adata: bool = True,
+            sim_cutoff: float = 0.0,
+            filter_adata: bool = False,
         ):
         # Init class settings
         self.emb_p = emb_p
@@ -46,6 +47,7 @@ class EmbeddingProcessor:
         self.emb = None
         self.misc_method = misc_method
         self.std = std
+        self.add_emb_misc_rows = add_emb_misc_rows
         self.filter_embedding = filter_embedding
         self.add_emb_for_features = add_emb_for_features
         self.cls_emb_uns_key = cls_emb_uns_key
@@ -166,7 +168,9 @@ class EmbeddingProcessor:
         self.assert_not_directional()
         """Add embedding to .varm for feature annotation"""
         # Filter genes for embedding genes
-        adata._inplace_subset_var(adata.var_names.intersection(raw_emb.index))
+        var_mask = adata.var_names.intersection(raw_emb.index)
+        if var_mask.shape[0] < adata.n_vars:
+            adata._inplace_subset_var(var_mask)
         # Add gene embedding to .obsm
         adata.varm[self.gene_embedding_varm_key] = raw_emb.loc[adata.var_names,:]
         # Add names to dimensions
@@ -255,7 +259,8 @@ class EmbeddingProcessor:
         logging.info('Reading embedding.')
         self.emb = self._read_embedding()
         # Add control and unknown embeddings
-        self.emb = self._add_misc_rows()
+        if self.add_emb_misc_rows:
+            self.emb = self._add_misc_rows()
         # Annotate adata features with embedding
         if self.add_emb_for_features:
             self._add_emb_to_varm(adata, raw_emb=self.emb)
@@ -267,7 +272,7 @@ class EmbeddingProcessor:
             observed_genes = adata.obs[self.p_col].unique().tolist()
             logging.info(f'Filtering embedding for perturbed genes ({len(observed_genes)}).')
             self._filter_emb(observed_genes)
-            if self.sim_cutoff > 0:
+            if self.sim_cutoff > 0 and self.filter_adata:
                 logging.info('Filtering adata for low interclass similarities.')
                 self._filter_classes_by_similarity(adata, sim_cutoff=self.sim_cutoff)
         # Scale embedding values

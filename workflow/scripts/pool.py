@@ -28,7 +28,12 @@ def get_pool(files: Iterable[str], method: Literal['intersection', 'union'] = 'i
     # For union, combine all annotations 
     else:
         shared_cols = list(set.intersection(*[set(v.columns) for v in pool]))
-        pool = pd.concat([v.loc[:,shared_cols] for v in pool], axis=1)
+        _pool = []
+        for v in pool:
+            _idx = v.index.intersection(union_genes)
+            _p = v.loc[sorted(list(_idx)),shared_cols]
+            _pool.append(_p)
+        pool = pd.concat(_pool, axis=1)
     logging.info(f'HVG pool shape: {pool.shape[0]} genes, {pool.shape[1]} var columns')
     return pool
 

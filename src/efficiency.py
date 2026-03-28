@@ -368,6 +368,13 @@ def _score_one(
     return (pert, pert_idx, z_scores, loo_df, final_de_names)
 
 
+def _scale_scores(scores: np.ndarray, q: float = 0.99):
+    """Scale efficiency scores within this dataset to smooth extreme outliers."""
+    scores = np.abs(scores)
+    M = scores.max()
+    return M * np.tanh(scores / M)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -392,6 +399,7 @@ def compute_perturbation_scores(
     output_key: str = "efficiency",
     output_loo_key: str = "efficiency_loo",
     output_deg_key: str = "efficiency_degs",
+    scale_scores: bool = True,
     inplace: bool = False,
     copy: bool = False,
     verbose: bool = True,
@@ -563,5 +571,8 @@ def compute_perturbation_scores(
             adata.uns[output_loo_key] = loo_dict
         return None
     logging.info(f'Returning scores series.')
+    # Scale scores to prevent extreme values if toggled
+    if scale_scores:
+        scores = _scale_scores(scores)
     # Return scores series to preserve barcodes
     return scores

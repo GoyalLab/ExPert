@@ -748,7 +748,7 @@ def compute_responder_threshold(scores, dataset_ids, min_threshold=1.5, quantile
 
 def scale_scores(
         adata: ad.AnnData, 
-        score_col: str = 'mixscale_score', 
+        score_col: str = 'efficiency', 
         dataset_col: str = 'dataset', 
         q: float = 0.99,
         max_scaling: bool = False,

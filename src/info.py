@@ -361,11 +361,19 @@ def _calc_feature_pool(vars: dict[str, pd.DataFrame]) -> None:
     logging.info(f'Found {len(feature_pool)} shared features across all datasets.')
     return feature_pool
 
+def _get_emb_intersection(perturbations: np.ndarray, gene_embedding_file: str):
+    """Read external gene embeddings and return perturbations that are shared."""
+    from src.utils import read_embedding
+    emb_keys = read_embedding(gene_embedding_file).index
+    return list(set(perturbations).intersection(set(emb_keys)))
+
+
 def create_meta_summary(
         input_files: list[str],
         perturbation_pool_file: str,
         feature_pool_file: str,
         dataset_sheet: pd.DataFrame,
+        gene_embedding_file: str | None = None,
         min_cells_per_class: int = 50,
         min_dataset_frac: float = 0.4,
         plt_dir: str | None = None,
@@ -377,6 +385,14 @@ def create_meta_summary(
     dataset_sheet[OBS_KEYS.BROAD_DATASET_KEY] = dataset_sheet[DATA_SHEET_KEYS.P_INDEX] + '_' + dataset_sheet[DATA_SHEET_KEYS.D_INDEX].str.split('_').str[-1]
     # Add dataset meta information to observations
     obs = obs.merge(dataset_sheet, left_on=OBS_KEYS.DATASET_KEY, right_index=True, how='left')
+    # Subset by available classes in embedding if given
+    if gene_embedding_file is not None:
+        all_perturbations = obs[OBS_KEYS.PERTURBATION_KEY].unique()
+        perturbations = _get_emb_intersection(all_perturbations, gene_embedding_file)
+        # Subset .obs to valid perturbations only
+        logging.info(f'Found {len(perturbations)}/{len(all_perturbations)} perturbations in gene embedding.')
+        if len(perturbations) != len(all_perturbations):
+            obs = obs[obs[OBS_KEYS.PERTURBATION_KEY].isin(perturbations)].copy()
     # Filter obs by minimum number of cells per perturbation within a context
     cpp = obs.groupby(OBS_KEYS.DATASET_KEY)[OBS_KEYS.PERTURBATION_KEY].value_counts()
     # Filter each context-specific perturbation for minimum number of cells

@@ -12,7 +12,7 @@ import scipy.sparse as sp
 def read_embedding(emb_p: str) -> pd.DataFrame:
     # Convert to str
     emb_p = str(emb_p)
-    if emb_p.endswith('.pickle'):
+    if emb_p.endswith('.pkl') or emb_p.endswith('.pickle'):
         import pickle
         with open(emb_p, 'rb') as file:
             return pd.DataFrame(pickle.load(file)).T
@@ -38,6 +38,174 @@ def log_decorator(func):
         return result
     return wrapper
 
+
+def stream_subset_csr_backed(
+    adata: ad.AnnData,
+    mask_or_idx,
+    out_path: str | None = None,
+    chunk_size: int = 5000,
+    sort_indices: bool = True,
+    verbose: bool = True,
+    compression: str | None = None,
+):
+    import numpy as np
+    import h5py
+    import logging
+    from tqdm import tqdm
+    from anndata.experimental import write_elem
+    from anndata._core.sparse_dataset import _CSRDataset
+
+    assert adata.isbacked, "AnnData must be in backed mode"
+    X = adata.X
+
+    if not isinstance(X, _CSRDataset):
+        raise ValueError("adata.X must be backed _CSRDataset")
+
+    # --- indices ---
+    mask_or_idx = np.asarray(mask_or_idx)
+    if mask_or_idx.dtype == bool:
+        idx = np.where(mask_or_idx)[0]
+    else:
+        idx = mask_or_idx
+
+    if sort_indices:
+        idx = np.sort(idx)
+
+    n_obs_out = len(idx)
+    n_vars = adata.shape[1]
+
+    if verbose:
+        logging.info(f"[INFO] Subsetting {n_obs_out} / {adata.n_obs} cells")
+
+    # --- output path ---
+    if out_path is None:
+        if adata.filename is None:
+            raise ValueError("No filename provided and adata has no backing file")
+        out_path = str(adata.filename).replace(".h5ad", "_subset.h5ad")
+
+    # --- get source adata x attributes ---
+    with h5py.File(adata.filename, "r") as f_in:
+        X_attrs = dict(f_in["X"].attrs)
+
+    # --- FIRST PASS: compute nnz ---
+    if verbose:
+        logging.info("[INFO] First pass: counting nnz")
+
+    nnz = 0
+    loop = range(0, n_obs_out, chunk_size)
+    if verbose:
+        loop = tqdm(loop)
+
+    for i in loop:
+        batch = idx[i:i + chunk_size]
+        chunk = X[batch]              # small CSR matrix
+        nnz += chunk.nnz
+
+    if verbose:
+        logging.info(f"[INFO] nnz in subset: {nnz:,}")
+
+    # --- write file ---
+    if verbose:
+        logging.info(f"[INFO] Writing to {out_path}")
+
+    with h5py.File(out_path, "w") as f:
+        X_group = f.create_group("X")
+
+        data_ds = X_group.create_dataset(
+            "data",
+            shape=(0,),
+            maxshape=(None,),
+            dtype=np.float32,
+            compression=compression,
+            chunks=True,
+        )
+
+        indices_ds = X_group.create_dataset(
+            "indices",
+            shape=(0,),
+            maxshape=(None,),
+            dtype=np.int32,
+            compression=compression,
+            chunks=True,
+        )
+
+        indptr_out = np.zeros(n_obs_out + 1, dtype=np.int64)
+
+        write_ptr = 0
+        out_row = 0
+        loop = range(0, n_obs_out, chunk_size)
+        if verbose:
+            loop = tqdm(loop)
+        for i in loop:
+            batch = idx[i:i + chunk_size]
+            chunk = X[batch]  # CSR
+
+            data = chunk.data
+            indices = chunk.indices
+            indptr = chunk.indptr
+
+            # --- append data ---
+            old_size = data_ds.shape[0]
+            new_size = old_size + len(data)
+
+            data_ds.resize((new_size,))
+            indices_ds.resize((new_size,))
+
+            data_ds[old_size:new_size] = data
+            indices_ds[old_size:new_size] = indices
+
+            # --- update indptr ---
+            for r in range(chunk.shape[0]):
+                start = indptr[r]
+                end = indptr[r + 1]
+                length = end - start
+
+                write_ptr += length
+                indptr_out[out_row + 1] = write_ptr
+                out_row += 1
+
+        # --- write indptr ---
+        X_group.create_dataset("indptr", data=indptr_out, compression=compression)
+
+        # --- attrs ---
+        X_group.attrs.update(X_attrs)
+        X_group.attrs["shape"] = (n_obs_out, n_vars)
+        # --- obs ---
+        obs = adata.obs.iloc[idx].copy()
+        cat_cols = obs.select_dtypes(include="category").columns
+        for col in cat_cols:
+            obs[col] = obs[col].cat.remove_unused_categories()
+
+        write_elem(f, "obs", obs)
+        # --- var ---
+        write_elem(f, "var", adata.var)
+        # --- obsm ---
+        if len(adata.obsm) > 0:
+            obsm = {}
+            for k, v in adata.obsm.items():
+                try:
+                    obsm[k] = v[idx]
+                except Exception as e:
+                    logging.info(f"[WARN] Skipping obsm['{k}']: {e}")
+            write_elem(f, "obsm", obsm)
+
+        # --- varm ---
+        if len(adata.varm) > 0:
+            write_elem(f, "varm", dict(adata.varm))
+
+        # --- uns ---
+        if len(adata.uns) > 0:
+            uns_group = f.create_group("uns")
+            for k, v in dict(adata.uns).items():
+                try:
+                    write_elem(uns_group, k, v)
+                except Exception as e:
+                    logging.info(f"[WARN] Skipping uns['{k}']: {e}")
+
+    if verbose:
+        logging.info("[DONE]")
+
+    return out_path
 
 def convert_size(size_bytes: int) -> str:
     if size_bytes == -1:

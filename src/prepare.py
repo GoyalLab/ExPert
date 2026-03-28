@@ -3,7 +3,6 @@ import logging
 import pandas as pd
 import scipy.sparse as sp
 import anndata as ad
-import scanpy as sc
 from pathlib import Path
 import numpy as np
 from typing import Iterable

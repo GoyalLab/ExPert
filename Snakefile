@@ -106,6 +106,7 @@ rule meta_info:
         min_cells_per_class = config['min_cells_per_class'],
         min_dataset_frac = config['min_dataset_frac'],
         dataset_sheet = DATASET_SHEET,
+        gene_embedding_file = config['gene_embedding'],
         plt_dir = PLT_DIR
     resources:
         **get_job_resources(config['resources'], job_name='meta_info', output=os.path.join(LOG, 'meta_info.slurm.log'))
@@ -284,7 +285,7 @@ rule build_gene_pool:
     log:
         os.path.join(LOG, 'pool.log')
     params:
-        var_merge = config['var_merge']
+        var_merge = config['var_merge'],
     resources:
         **get_job_resources(config['resources'], job_name='build_gene_pool', output=os.path.join(LOG, 'pool.slurm.log'))
     script:
