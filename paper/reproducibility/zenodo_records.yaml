@@ -1,0 +1,204 @@
+# SPDX-License-Identifier: MIT
+#
+# ExPert: a contrastive perturbation-prediction model for single-cell data.
+#
+# Copyright (c) 2024-2026 Leon Schwartz
+# Northwestern University, Goyal Lab
+#
+# This file is part of the ExPert package and is released under the MIT
+# License. See the LICENSE file in the project root for the full text.
+
+# Zenodo records for the ExPert paper (read by zenodo_upload.py; decisions in zenodo_plan.md).
+# Uploads go to PRIVATE DRAFTS only. Sequencing reads (fastq) are NOT here: they go to GEO.
+
+defaults:
+  creators:
+    - {name: "Schwartz, Leon", affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Center for Synthetic Biology, McCormick School of Engineering, Northwestern University, Evanston, IL, USA; Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; NSF-Simons National Institute for Theory and Mathematics in Biology, Chicago, IL, USA; Data Science of Systems Biology, Technical University of Munich, Freising, Germany", orcid: "0000-0001-8621-4146"}
+    - {name: "Schlamowitz, Jacob L.", affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Center for Synthetic Biology, McCormick School of Engineering, Northwestern University, Evanston, IL, USA; Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; NSF-Simons National Institute for Theory and Mathematics in Biology, Chicago, IL, USA", orcid: "0009-0002-3309-2928"}
+    - {name: "Kuznets-Speck, Benjamin", affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Center for Synthetic Biology, McCormick School of Engineering, Northwestern University, Evanston, IL, USA; Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; NSF-Simons National Institute for Theory and Mathematics in Biology, Chicago, IL, USA", orcid: "0000-0001-9859-8749"}
+    - {name: "Johnson, Conor W.", affiliation: "Section of Neurology, Ann and Robert H. Lurie Children’s Hospital of Chicago, Chicago, IL, USA; Department of Pediatrics, Northwestern University Feinberg School of Medicine, Chicago, IL, USA", orcid: "0000-0002-0915-6496"}
+    - {name: "Das, Diptatanu", affiliation: "Department of Biochemistry, University of Illinois Urbana-Champaign, Urbana, IL, USA", orcid: "0000-0003-0048-1724"}
+    - {name: "Grody, Emanuelle I.", affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Center for Synthetic Biology, McCormick School of Engineering, Northwestern University, Evanston, IL, USA; Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; NSF-Simons National Institute for Theory and Mathematics in Biology, Chicago, IL, USA", orcid: "0000-0002-7177-3268"}
+    - {name: "Bai, Tao", affiliation: "Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Department of Obstetrics and Gynecology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA", orcid: ""}
+    - {name: "Sun, Hanxiao", affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Center for Synthetic Biology, McCormick School of Engineering, Northwestern University, Evanston, IL, USA; Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; NSF-Simons National Institute for Theory and Mathematics in Biology, Chicago, IL, USA", orcid: ""}
+    - {name: "Senthilkumar, Irish", affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Center for Synthetic Biology, McCormick School of Engineering, Northwestern University, Evanston, IL, USA; Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; NSF-Simons National Institute for Theory and Mathematics in Biology, Chicago, IL, USA", orcid: "0000-0002-7194-3685"}
+    - {name: "Primavera, Gillian", affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Center for Synthetic Biology, McCormick School of Engineering, Northwestern University, Evanston, IL, USA; Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; NSF-Simons National Institute for Theory and Mathematics in Biology, Chicago, IL, USA", orcid: "0009-0008-7705-9824"}
+    - {name: "Jung, Jaekwon", affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Center for Synthetic Biology, McCormick School of Engineering, Northwestern University, Evanston, IL, USA; Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; NSF-Simons National Institute for Theory and Mathematics in Biology, Chicago, IL, USA", orcid: "0009-0002-8931-1595"}
+    - {name: "Kuusik, Britta", affiliation: "Section of Neurology, Ann and Robert H. Lurie Children’s Hospital of Chicago, Chicago, IL, USA", orcid: "0009-0000-9661-4135"}
+    - {name: "Grant, Rogan A.", affiliation: "Division of Pulmonary and Critical Care Medicine, Department of Medicine, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA", orcid: "0000-0003-0655-0882"}
+    - {name: "Rojas, Enrique", affiliation: "Section of Neurology, Ann and Robert H. Lurie Children’s Hospital of Chicago, Chicago, IL, USA", orcid: ""}
+    - {name: "Abdrabou, Abdalla M.", affiliation: "Biohub, Chicago, IL, USA", orcid: "0009-0003-2514-0173"}
+    - {name: "Peiffer, Brandon", affiliation: "Department of Surgery, Johns Hopkins School of Medicine, Baltimore, MD, USA", orcid: "0000-0002-6783-2923"}
+    - {name: "Sun, Zhaoli", affiliation: "Department of Surgery, Johns Hopkins School of Medicine, Baltimore, MD, USA", orcid: "0000-0002-4272-8046"}
+    - {name: "Diehl, Anna Mae", affiliation: "Department of Medicine, Duke University School of Medicine, Durham, NC, USA", orcid: ""}
+    - {name: "Marr, Carsten", affiliation: "Computational Health Center & Helmholtz AI, Helmholtz Munich, Neuherberg, Germany; Munich Center for Machine Learning (MCML), Munich, Germany; Department of Medicine III, LMU University Hospital, LMU Medizin, LMU Munich, Germany; Department of Physics, Ludwig-Maximilians-Universität München, Munich, Germany; German Cancer Consortium (DKTK), partner site Munich, Germany", orcid: "0000-0003-2154-4552"}
+    - {name: "Chandel, Navdeep S.", affiliation: "Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Division of Pulmonary and Critical Care Medicine, Department of Medicine, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Department of Biochemistry and Molecular Genetics, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Biohub, Chicago, IL, USA", orcid: "0000-0001-7208-3886"}
+    - {name: "Mithal, Divakar S.", affiliation: "Section of Neurology, Ann and Robert H. Lurie Children’s Hospital of Chicago, Chicago, IL, USA; Department of Pediatrics, Northwestern University Feinberg School of Medicine, Chicago, IL, USA", orcid: "0000-0002-8122-1766"}
+    - {name: "Weinberg, Samuel E.", affiliation: "Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Department of Pathology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA", orcid: "0000-0002-9532-7051"}
+    - {name: "Adli, Mazhar", affiliation: "Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Department of Obstetrics and Gynecology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Department of Molecular Biology and Genetics, Koç University, Istanbul, Turkey", orcid: "0000-0003-4740-9594"}
+    - {name: "Kalsotra, Auinash", affiliation: "Data Science of Systems Biology, Technical University of Munich, Freising, Germany; Biohub, Chicago, IL, USA; Carl R. Woese Institute for Genomic Biology, University of Illinois Urbana-Champaign, Urbana, IL, USA; Division of Nutritional Sciences, University of Illinois Urbana-Champaign, Urbana, IL, USA; Cancer Center at Illinois, University of Illinois Urbana-Champaign, Urbana, IL, USA", orcid: "0000-0002-1011-0006"}
+    - {name: "Prashnani, Ekta", affiliation: "NVIDIA, Santa Clara, CA, USA", orcid: "0009-0000-5086-2416"}
+    - {name: "Goyal, Yogesh", affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; Center for Synthetic Biology, McCormick School of Engineering, Northwestern University, Evanston, IL, USA; Robert H. Lurie Comprehensive Cancer Center, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA; NSF-Simons National Institute for Theory and Mathematics in Biology, Chicago, IL, USA; Biohub, Chicago, IL, USA", orcid: "0000-0003-3502-6465"}
+  contributors:
+    - {name: "Goyal, Yogesh", type: ContactPerson, affiliation: "Department of Cell and Developmental Biology, Feinberg School of Medicine, Northwestern University, Chicago, IL, USA"}
+  notes: "Accompanies: Schwartz L, et al. ExPert. Correspondence: yogesh.goyal@northwestern.edu"
+  access_right: open
+  license: cc-by-4.0
+  upload_type: dataset
+  version: v0.1.0
+  keywords: [Perturb-seq, single-cell, perturbation, ExPert]
+  related_identifiers:
+    # the code; Zenodo's own GitHub integration uses the same relation
+    - {identifier: "https://github.com/GoyalLab/ExPert", relation: isSupplementTo, resource_type: software, scheme: url}
+    # the preprint: uncomment once bioRxiv assigns the DOI, then rerun upload (drafts update in place)
+    # - {identifier: "10.1101/XXXX.XX.XX.XXXXXX", relation: isSupplementTo, resource_type: publication-preprint, scheme: doi}
+
+records:
+  - key: figure_data
+    related:   # the plot caches are computed from the other three records
+      - {record: source_data, relation: isDerivedFrom}
+      - {record: derived, relation: isDerivedFrom}
+      - {record: gene_embeddings, relation: isDerivedFrom}
+    metadata:
+      title: "ExPert - figure data"
+      description: >-
+        Plot caches read by the figure notebooks of the ExPert paper: one zip per main and supplementary figure,
+        unpacking to figures/&lt;fig&gt;/{data,inputs}/. CONTENTS.tsv lists every file.
+    items:
+      - kind: figures
+        tsv: paper/reproducibility/plot_time_inputs.tsv
+
+  - key: source_data
+    metadata:
+      title: "ExPert - source data"
+      description: >-
+        Data generated for the ExPert paper (count matrices and processed tables; sequencing reads are deposited in GEO):
+        the degron (AID) screen; alcohol-associated liver disease bulk RNA-seq (DESeq2, rMATS, normalized counts),
+        imaging and RT-PCR (gel images and quantification); primary mitochondrial disease PBMC and in vitro scRNA-seq,
+        sorted-cell bulk RNA-seq (salmon counts) and flow cytometry; sci-Plex3 drug and target annotations, and curated gene lists.
+    items:
+      - {kind: file, path: $EXPERT_ROOT/data/inference/degron/data/degron_labeled.h5ad}
+      - kind: zip
+        name: ald_imaging_rtpcr.zip
+        members:
+          - {path: $EXPERT_ROOT/paper/figures/fig5/data/experiment_raw/Microscopy, arc: Microscopy}
+          - {path: $EXPERT_ROOT/paper/figures/fig5/data/experiment_raw/Gel, arc: RT-PCR}   # gel images + Qty.prism quantification
+      - kind: zip
+        name: ald_bulk_rnaseq.zip
+        # DESeq2 / rMATS results and normalized counts (fastqs go to GEO)
+        members:
+          - {path: $EXPERT_ROOT/paper/figures/fig5/data/experiment_raw/BulkRNASeqAnalysis, arc: ald_bulk_rnaseq, exclude: ['plots/*']}
+      - {kind: file, path: $EXPERT_ROOT/data/inference/metabolic_weinberg/converted_data/s_pbmc_collab.h5ad, name: pmd_pbmc_scrna.h5ad}
+      - {kind: file, path: $EXPERT_ROOT/data/inference/metabolic_weinberg/converted_data/s_invitro_collab.h5ad, name: pmd_invitro_scrna.h5ad}
+      - kind: zip
+        name: pmd_sorted_bulk_rnaseq.zip
+        # salmon gene counts + lengths + SummarizedExperiment + sample metadata (fastqs go to GEO)
+        members:
+          - {path: $EXPERT_ROOT/paper/figures/fig6/data/mito_bulk/salmon, arc: pmd_sorted_bulk_rnaseq}
+      - {kind: file, path: $EXPERT_ROOT/paper/figures/fig6/data/flow/mito_flow_combined_raw.xlsx, name: pmd_flow_cytometry.xlsx}
+      - kind: zip
+        name: sciplex3_annotations.zip
+        # curated family genes + HDAC complexes, and what fig4.sbatch STEP=sciplex_annot builds from them (candidate
+        # panel, drug -> family, CORUM-core partners, ChEMBL targets + the raw API responses for an exact offline rerun)
+        members:
+          - {path: $EXPERT_ROOT/paper/figures/fig4/data/sciplex_annot_curated, arc: curated}
+          - {path: $EXPERT_ROOT/paper/figures/fig4/data/v0.1.0/sciplex_annot, arc: sciplex_annot}
+      - {kind: file, path: $EXPERT_ROOT/paper/figures/fig4/data/sciplex3_drug_targets.tsv}
+      - {kind: file, path: $EXPERT_ROOT/paper/figures/fig6/data/PMD_gene_list.csv}
+      - {kind: file, path: $EXPERT_ROOT/paper/figures/fig4/data/leigh_pmd_repro_2026-10-15/leigh_v010/config/modules.tsv, name: leigh_modules.tsv}
+
+  - key: gene_embeddings
+    metadata:
+      title: "ExPert - gene embeddings"
+      description: >-
+        Gene embeddings used by ExPert: LLM-written gene descriptions embedded with 11-13 text encoders per writer,
+        gene priors built from DepMap, STRING, LINCS L1000, JUMP Cell Painting, ProteinTalks, GENCODE positions,
+        co-expression and response, their shuffled controls, the random-init control, and the description texts
+        with the retrieved source records (gene_source_database.json). Each bank is an .npz with arrays
+        'embeddings' (genes x dims) and 'genes'.
+    items:
+      - kind: zip
+        name: text_opus-4.8.zip
+        members: [{path: resources/embeddings/opus-4.8}]
+      - kind: zip
+        name: text_opus-4.7.zip
+        members: [{path: resources/embeddings/opus-4.7}]
+      - kind: zip
+        name: text_sonnet-4.5.zip
+        members: [{path: resources/embeddings/sonnet-4.5}]
+      - kind: zip
+        name: priors.zip
+        members: [{path: resources/embeddings/priors}]
+      - kind: zip
+        name: random_init.zip
+        members: [{path: resources/embeddings/random_init}]
+      - kind: zip
+        name: descriptions.zip
+        members: [{path: resources/gene_embeddings/claude_sonnet_4.5/descriptions, arc: descriptions}]
+      - {kind: file, path: resources/embeddings/eval.csv}
+      - {kind: file, path: resources/embeddings/eval.svg}
+
+  - key: derived
+    metadata:
+      title: "ExPert - derived data"
+      description: >-
+        Intermediates of the ExPert paper that are costly to regenerate: the Tahoe-100M pseudobulk
+        (plate x cell line x drug x dose), ExPert encodings of the double-perturbation screens (ProPer-seq as
+        latents and ranks only), RNA-fingerprinting outputs, benchmark score tables, analysis tables, the CRISPR
+        signature reference and control pools.
+    items:
+      - {kind: file, path: $EXPERT_ROOT/data/inference/tahoe100m/pseudobulk/tahoe100m_pseudobulk_plate_line_drug_dose.h5ad}
+      - {kind: file, path: $EXPERT_ROOT/data/inference/sciplex/results/fig5_v0.1.0/crispr_signature_ref.npz}
+      - {kind: file, path: $EXPERT_ROOT/paper/figures/fig5/data/hubness/v0.1.0_ctrl_pools_ds.npz}
+      - kind: zip
+        name: doubles_encodings_v0.1.0.zip
+        members:
+          - path: $EXPERT_ROOT/paper/figures/fig4/data/pb/ExPert_v0.1.0
+            arc: doubles_encodings_v0.1.0
+            exclude: ['properseq/logpb.npy', 'properseq/noise.npy', 'properseq/_m25_backup/*', 'properseq/_m5ratio96/*']
+      - kind: zip
+        name: fingerprint_sciplex_perline.zip
+        members: [{path: $EXPERT_ROOT/paper/figures/fig4/data/v0.1.0/fingerprint_sciplex_perline}]
+      - kind: zip
+        name: fingerprint_doubles_singles_flexplex.zip
+        members:
+          - {path: $EXPERT_ROOT/paper/figures/fig4/data/fingerprint_doubles}
+          - {path: $EXPERT_ROOT/paper/figures/fig4/data/fingerprint_doubles_gwps}
+          - {path: $EXPERT_ROOT/paper/figures/fig4/data/fingerprint_doubles_ourgwps}
+          - {path: $EXPERT_ROOT/paper/figures/fig4/data/fingerprint_singles_ourgwps}
+          - {path: $EXPERT_ROOT/data/inference/flexplex/fingerprint_flexplex}
+      - kind: zip
+        name: benchmark_tables.zip
+        members:
+          - {path: $EXPERT_PROJECT/ExPert-benchmarks/metrics/ctx7, arc: ctx7, include: ['*.csv', '*.parquet', 'selective', 'pbulk_groups'], exclude: ['*.bak*']}
+          - {path: $EXPERT_ROOT/benchmarks/metrics_small_rescored, arc: small, include: ['*.csv', '*.parquet']}
+          - {path: $EXPERT_PROJECT/ExPert-benchmarks/metrics/small/extra_metrics.v2.csv, arc: small/extra_metrics.v2.csv}
+          - {path: $EXPERT_PROJECT/ExPert-benchmarks/metrics/slurm_costs.rebuilt.csv}
+          - {path: $EXPERT_PROJECT/ExPert-benchmarks/config/cost_overrides.yaml}
+          - {path: $EXPERT_ROOT/benchmarks, arc: mask_ablation, include: ['abl_mask_target_fold_*/metrics/mask_ablation.csv']}
+      - kind: zip
+        name: analysis_tables.zip
+        members:
+          - {path: analysis_out/prior_screen, arc: prior_screen}
+          - {path: analysis_out/effgate_decomp, arc: effgate_decomp}
+          - {path: analysis_out/v017_readout/ranks, arc: v017_readout/ranks}
+          - {path: analysis_out/effect_conf/stack_val_cells.parquet, arc: effect_conf/stack_val_cells.parquet}
+          - {path: analysis_out/fill_fix, arc: fill_fix, include: ['wk12_summary.csv', 'w12_summary.csv', 'w_fold4/k.json', 'wk_fold4/k.json']}
+          - {path: analysis_out/mapcache, arc: mapcache, include: ['scores_nqxnds_*.tsv']}
+
+  - key: software
+    opt_in: true   # final publication only, not the preprint: needs --opt-in (OPT_IN=1)
+    metadata:
+      title: "ExPert - code"
+      upload_type: software
+      license: mit
+      description: >-
+        Snapshot of the ExPert code repository used for the paper (model, training, analysis and figure scripts).
+        Gene-embedding banks are in the "ExPert paper - gene embeddings" record; models are on Hugging Face.
+    items:
+      - kind: git
+        repo: .
+        ref: paper-v0.1.0   # replace with the paper tag before the real upload
+        name: ExPert-paper-code.tar.gz
+        prefix: ExPert-paper-code
+        exclude: [resources/embeddings, resources/gene_embeddings, notebooks/.archive]
