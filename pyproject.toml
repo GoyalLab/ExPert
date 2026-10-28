@@ -9,17 +9,24 @@
 # License. See the LICENSE file in the project root for the full text.
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "expert-model"
-version = "0.1.0"
+dynamic = ["version"]
 description = "ExPert: a contrastive perturbation-prediction model for single-cell data."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Leon Schwartz" }]
+keywords = ["perturb-seq", "single-cell", "perturbation", "scRNA-seq", "genomics"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 # Core: train, load, predict(), get_prototypes(). Lower bounds = the versions the release was validated with
 # (environment.yaml); matplotlib / seaborn are imported by the model module itself.
 dependencies = [
@@ -60,6 +67,13 @@ all = [
   "tensorboard",
   "umap-learn",
 ]
+
+[project.urls]
+Homepage = "https://github.com/GoyalLab/ExPert"
+Models = "https://huggingface.co/GoyalLab/ExPert"
+
+[tool.setuptools.dynamic]
+version = { attr = "expert.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["expert*"]

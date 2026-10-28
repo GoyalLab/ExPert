@@ -22,9 +22,15 @@ Paper: _link to the preprint_ · Training data: [ExPert-data](https://github.com
 ## Installation
 
 ```bash
+pip install expert-model            # core: load a model, predict, train
+pip install "expert-model[all]"     # + plotting/enrichment extras, paper figure scripts, tests
+```
+
+From source (needed for the paper's figure scripts):
+
+```bash
 git clone https://github.com/GoyalLab/ExPert.git && cd ExPert
-pip install -e .            # core: load a model, predict, train
-pip install -e ".[all]"     # + figure scripts, plotting/enrichment extras, tests
+pip install -e ".[all]"
 ```
 
 Python ≥ 3.10. Install the PyTorch build that matches your GPU first if you need CUDA; CPU is enough for prediction.
@@ -75,14 +81,23 @@ See `help(ExPert.predict)` for all options.
 
 ## Reproducing the paper
 
-`paper/` holds everything behind the figures and tables. It is not part of the installed package; it needs
-`pip install -e ".[all]"`.
+`paper/` in the [GitHub repo](https://github.com/GoyalLab/ExPert) holds everything behind the figures and tables. It is
+not part of the PyPI package; clone the repo and install it with `pip install -e ".[all]"`.
 
 - `paper/figures/<fig>/<fig>.ipynb`: one notebook per figure (main 1–6, SI S1–S14). Each one redraws exactly the
-  panels in the paper from that figure's plotting data. See [paper/figures/README.md](paper/figures/README.md).
-- Plotting data: _Zenodo DOI_. Unpack it into `paper/figures/` so every figure folder has its `data/`.
-- `paper/scripts/`: the scripts that compute that plotting data from the model and the screens.
+  panels in the paper from that figure's plotting data. See [paper/figures/README.md](https://github.com/GoyalLab/ExPert/blob/main/paper/figures/README.md).
+- Plotting data: [doi:10.5281/zenodo.23740198](https://doi.org/10.5281/zenodo.23740198).
+  `python paper/figures/fetch_figure_data.py` downloads it and unpacks every figure's `data/` and `inputs/` in place.
+- `paper/scripts/` and `paper/slurm/`: the scripts that compute that plotting data from the model and the screens,
+  and the SLURM recipes with their exact arguments (set your paths in `paper/slurm/paths.sh`).
+- Checkpoints: the production model is [GoyalLab/ExPert](https://huggingface.co/GoyalLab/ExPert); the 12
+  cross-validation folds and the ablation arm are in
+  [GoyalLab/ExPert-paper-models](https://huggingface.co/GoyalLab/ExPert-paper-models).
 - `paper/reproducibility/`: which inputs each figure reads, and where every source comes from.
+- Other data on Zenodo: [source data](https://doi.org/10.5281/zenodo.23740344) (new datasets from this study),
+  [gene embeddings](https://doi.org/10.5281/zenodo.23741208) (text and prior banks) and
+  [derived data](https://doi.org/10.5281/zenodo.23742338) (Tahoe-100M pseudobulks, baseline outputs, benchmark
+  tables). Table S1A lists every dataset with its accession.
 
 ## Tests
 
@@ -93,4 +108,4 @@ pytest -m "not e2e"      # unit tests only, seconds
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](https://github.com/GoyalLab/ExPert/blob/main/LICENSE).

@@ -1,0 +1,8 @@
+# The PyPI package ships only the `expert` library (+ LICENSE, README, pyproject). The paper's figure
+# scripts, notebooks and SLURM recipes, and the tests, live in the GitHub repo only.
+prune paper
+prune tests
+prune validation
+exclude environment.yaml
+global-exclude *.h5ad *.h5 *.npy *.npz *.pt *.pkl *.ipynb
+global-exclude __pycache__ *.py[cod]

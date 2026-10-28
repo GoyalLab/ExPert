@@ -1,0 +1,172 @@
+{
+ "store": "$DL_ROOT/perturb-seq/store/27dab279946b4ea6",
+ "datasets": 22,
+ "raw_cells": 49555490,
+ "removed": {
+  "unassigned_guide": {
+   "cells": 11517431,
+   "pct_of_raw": 23.2,
+   "note": "no perturbation label (guide calling failed); multiplets: 0"
+  },
+  "controls_beyond_10000_cap": {
+   "cells": 1499680,
+   "pct_of_raw": 3.0
+  },
+  "quality_control": {
+   "cells": 4749307,
+   "pct_of_raw": 9.6,
+   "pct_of_qc_candidates": 13.0,
+   "note": "MAD outliers (depth, genes, top-50 share) + mitochondrial fraction"
+  }
+ },
+ "retained_cells": {
+  "total": 31789072,
+  "pct_of_raw": 64.1,
+  "perturbed": 31599707,
+  "controls": 189365
+ },
+ "perturbations": {
+  "with_any_cells": 19209,
+  "with_at_least_10_cells_in_a_context": 19191
+ },
+ "gene_vocabulary_ensembl": 38638,
+ "effect_size": {
+  "perturbed_cells_scored": 28234027,
+  "pct_scored": 89.3,
+  "note": "Mixscale z; perturbations with < 5 DE genes are not scored"
+ },
+ "per_dataset": {
+  "Mali2026": {
+   "raw": 2659209,
+   "retained": 2367139,
+   "pct_retained": 89.0,
+   "controls_retained": 9212
+  },
+  "Marson2025_D1_Rest": {
+   "raw": 3074496,
+   "retained": 1494155,
+   "pct_retained": 48.6,
+   "controls_retained": 8976
+  },
+  "Marson2025_D1_Stim48hr": {
+   "raw": 2805354,
+   "retained": 1280289,
+   "pct_retained": 45.6,
+   "controls_retained": 8099
+  },
+  "Marson2025_D1_Stim8hr": {
+   "raw": 2789727,
+   "retained": 1251011,
+   "pct_retained": 44.8,
+   "controls_retained": 8124
+  },
+  "Marson2025_D2_Rest": {
+   "raw": 2940194,
+   "retained": 1726713,
+   "pct_retained": 58.7,
+   "controls_retained": 9137
+  },
+  "Marson2025_D2_Stim48hr": {
+   "raw": 2863571,
+   "retained": 1743680,
+   "pct_retained": 60.9,
+   "controls_retained": 8800
+  },
+  "Marson2025_D2_Stim8hr": {
+   "raw": 3032848,
+   "retained": 1754689,
+   "pct_retained": 57.9,
+   "controls_retained": 8810
+  },
+  "Marson2025_D3_Rest": {
+   "raw": 2778524,
+   "retained": 1570888,
+   "pct_retained": 56.5,
+   "controls_retained": 8526
+  },
+  "Marson2025_D3_Stim48hr": {
+   "raw": 2607532,
+   "retained": 1440963,
+   "pct_retained": 55.3,
+   "controls_retained": 7914
+  },
+  "Marson2025_D3_Stim8hr": {
+   "raw": 2481284,
+   "retained": 1330085,
+   "pct_retained": 53.6,
+   "controls_retained": 8076
+  },
+  "Marson2025_D4_Rest": {
+   "raw": 2693903,
+   "retained": 1502791,
+   "pct_retained": 55.8,
+   "controls_retained": 8967
+  },
+  "Marson2025_D4_Stim48hr": {
+   "raw": 2815784,
+   "retained": 1584767,
+   "pct_retained": 56.3,
+   "controls_retained": 8794
+  },
+  "Marson2025_D4_Stim8hr": {
+   "raw": 2727254,
+   "retained": 1333258,
+   "pct_retained": 48.9,
+   "controls_retained": 7866
+  },
+  "ReplogleWeissman2022_K562_essential": {
+   "raw": 310385,
+   "retained": 278640,
+   "pct_retained": 89.8,
+   "controls_retained": 9646
+  },
+  "ReplogleWeissman2022_K562_gwps": {
+   "raw": 1989578,
+   "retained": 1746148,
+   "pct_retained": 87.8,
+   "controls_retained": 9203
+  },
+  "ReplogleWeissman2022_rpe1": {
+   "raw": 247914,
+   "retained": 212178,
+   "pct_retained": 85.6,
+   "controls_retained": 9492
+  },
+  "ReplogleWeissman2025_HepG2": {
+   "raw": 145473,
+   "retained": 129925,
+   "pct_retained": 89.3,
+   "controls_retained": 4758
+  },
+  "ReplogleWeissman2025_Jurkat": {
+   "raw": 262956,
+   "retained": 230246,
+   "pct_retained": 87.6,
+   "controls_retained": 9430
+  },
+  "Wong2026": {
+   "raw": 864115,
+   "retained": 759512,
+   "pct_retained": 87.9,
+   "controls_retained": 8979
+  },
+  "XAtlas2025_HCT116": {
+   "raw": 3409169,
+   "retained": 2910086,
+   "pct_retained": 85.4,
+   "controls_retained": 8962
+  },
+  "XAtlas2025_HEK293T": {
+   "raw": 4534299,
+   "retained": 3950851,
+   "pct_retained": 87.1,
+   "controls_retained": 9132
+  },
+  "Zhuang2026": {
+   "raw": 1521921,
+   "retained": 1191058,
+   "pct_retained": 78.3,
+   "controls_retained": 8462
+  }
+ }
+}

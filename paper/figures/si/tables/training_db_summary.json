@@ -1,0 +1,202 @@
+{
+ "database": "$DL_ROOT/data/store_out/1e6bafc04836e06a",
+ "datasets": 22,
+ "contexts": 12,
+ "contexts_list": [
+  "CD4+ T, Rest",
+  "CD4+ T, Stim48hr",
+  "CD4+ T, Stim8hr",
+  "HCT116",
+  "HEK293T",
+  "HepG2",
+  "Jurkat",
+  "K562",
+  "KOLF2.1J",
+  "RPE1",
+  "TeloHAEC",
+  "hESC"
+ ],
+ "cells": {
+  "perturbed": 19513869,
+  "control": 189365,
+  "total": 19703234,
+  "train_production_split": 18538178,
+  "validation_production_split": 975691,
+  "zero_shot_eval_file": 683651
+ },
+ "perturbations": {
+  "selected": 8964,
+  "perturbation_context_pairs": 61445,
+  "perturbation_dataset_pairs": 108039,
+  "prior_pulled": 1004,
+  "prior_pulled_pct": 11.2
+ },
+ "selection_rule": {
+  "min_cells_per_context": 10,
+  "min_fraction_of_voting_contexts": 0.6,
+  "voting_contexts": 10,
+  "min_cells_after_pooling": 50
+ },
+ "input_genes": {
+  "n": 3096,
+  "selection": "fstat",
+  "per_dataset": 500,
+  "combination": "union"
+ },
+ "per_dataset": {
+  "ReplogleWeissman2022_K562_gwps": {
+   "context": "K562",
+   "cells": 1569709,
+   "controls": 9203,
+   "perturbations": 8347,
+   "train_cells": 1491224
+  },
+  "ReplogleWeissman2022_K562_essential": {
+   "context": "K562",
+   "cells": 251815,
+   "controls": 9646,
+   "perturbations": 1714,
+   "train_cells": 239224
+  },
+  "ReplogleWeissman2022_rpe1": {
+   "context": "RPE1",
+   "cells": 171611,
+   "controls": 9492,
+   "perturbations": 1344,
+   "train_cells": 163030
+  },
+  "ReplogleWeissman2025_HepG2": {
+   "context": "HepG2",
+   "cells": 79343,
+   "controls": 4758,
+   "perturbations": 883,
+   "train_cells": 75376
+  },
+  "ReplogleWeissman2025_Jurkat": {
+   "context": "Jurkat",
+   "cells": 195544,
+   "controls": 9430,
+   "perturbations": 1606,
+   "train_cells": 185767
+  },
+  "XAtlas2025_HCT116": {
+   "context": "HCT116",
+   "cells": 1310904,
+   "controls": 8962,
+   "perturbations": 7651,
+   "train_cells": 1245359
+  },
+  "XAtlas2025_HEK293T": {
+   "context": "HEK293T",
+   "cells": 1815857,
+   "controls": 9132,
+   "perturbations": 8142,
+   "train_cells": 1725064
+  },
+  "Marson2025_D2_Stim8hr": {
+   "context": "CD4+ T, Stim8hr",
+   "cells": 1087674,
+   "controls": 8810,
+   "perturbations": 5534,
+   "train_cells": 1033290
+  },
+  "Marson2025_D3_Rest": {
+   "context": "CD4+ T, Rest",
+   "cells": 961807,
+   "controls": 8526,
+   "perturbations": 5025,
+   "train_cells": 913717
+  },
+  "Marson2025_D4_Rest": {
+   "context": "CD4+ T, Rest",
+   "cells": 931530,
+   "controls": 8967,
+   "perturbations": 6636,
+   "train_cells": 884954
+  },
+  "Marson2025_D4_Stim48hr": {
+   "context": "CD4+ T, Stim48hr",
+   "cells": 981627,
+   "controls": 8794,
+   "perturbations": 6651,
+   "train_cells": 932546
+  },
+  "Marson2025_D3_Stim48hr": {
+   "context": "CD4+ T, Stim48hr",
+   "cells": 871366,
+   "controls": 7914,
+   "perturbations": 4755,
+   "train_cells": 827798
+  },
+  "Marson2025_D2_Rest": {
+   "context": "CD4+ T, Rest",
+   "cells": 1061589,
+   "controls": 9137,
+   "perturbations": 5138,
+   "train_cells": 1008510
+  },
+  "Marson2025_D3_Stim8hr": {
+   "context": "CD4+ T, Stim8hr",
+   "cells": 802524,
+   "controls": 8076,
+   "perturbations": 4880,
+   "train_cells": 762398
+  },
+  "Marson2025_D4_Stim8hr": {
+   "context": "CD4+ T, Stim8hr",
+   "cells": 817247,
+   "controls": 7866,
+   "perturbations": 6508,
+   "train_cells": 776385
+  },
+  "Marson2025_D1_Stim8hr": {
+   "context": "CD4+ T, Stim8hr",
+   "cells": 750576,
+   "controls": 8124,
+   "perturbations": 5636,
+   "train_cells": 713047
+  },
+  "Marson2025_D1_Stim48hr": {
+   "context": "CD4+ T, Stim48hr",
+   "cells": 767574,
+   "controls": 8099,
+   "perturbations": 5653,
+   "train_cells": 729195
+  },
+  "Marson2025_D1_Rest": {
+   "context": "CD4+ T, Rest",
+   "cells": 913435,
+   "controls": 8976,
+   "perturbations": 5757,
+   "train_cells": 867763
+  },
+  "Marson2025_D2_Stim48hr": {
+   "context": "CD4+ T, Stim48hr",
+   "cells": 1071167,
+   "controls": 8800,
+   "perturbations": 5300,
+   "train_cells": 1017609
+  },
+  "Zhuang2026": {
+   "context": "hESC",
+   "cells": 970319,
+   "controls": 8462,
+   "perturbations": 2416,
+   "train_cells": 921803
+  },
+  "Wong2026": {
+   "context": "TeloHAEC",
+   "cells": 551907,
+   "controls": 8979,
+   "perturbations": 1095,
+   "train_cells": 524312
+  },
+  "Mali2026": {
+   "context": "KOLF2.1J",
+   "cells": 1578744,
+   "controls": 9212,
+   "perturbations": 7368,
+   "train_cells": 1499807
+  }
+ }
+}

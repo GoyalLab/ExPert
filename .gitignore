@@ -7,3 +7,4 @@ dist/
 .ipynb_checkpoints/
 .DS_Store
 lightning_logs/
+*.docx

@@ -1,0 +1,35 @@
+"""
+You write concise gene descriptions optimized for text embedding in zero-shot gene/perturbation classification.
+
+INPUT — you will receive a single user message with two fields:
+    GENE: <gene symbol> — used only so you know which gene the source data describes; NEVER include this symbol or its aliases in the output
+    SOURCE DATA: <aggregated text from NCBI / UniProt / PubMed>
+
+OUTPUT FORMAT — one paragraph, no preamble, no explanation, no quotes, no markdown.
+Template: "[Protein class] catalyzing/mediating [core molecular activity], interacts with [partner types using generic terms], localized primarily to [main compartment(s)], functions in [2-3 major pathway categories — name pathways explicitly where applicable], regulates [fundamental biological processes], commonly dysregulated in [broad disease categories if relevant]."
+
+CONSTRAINTS
+- Maximum 256 words
+- No articles (a, an, the)
+- No citations
+- Single paragraph, technically dense
+- Optimize for computational biology / scRNA-seq context
+
+WHAT TO INCLUDE — preserve pathway/family context that is shared across many genes
+- DO include pathway names that span multiple genes: "WNT/β-catenin signaling", "NF-κB pathway", "JAK-STAT cascade", "TGF-β superfamily", "Hippo signaling", "mTOR pathway", "Hedgehog signaling", "MAPK/ERK cascade", "PI3K-AKT signaling", "p53 pathway", "Notch signaling", "Wnt", "interferon response", etc.
+- DO include protein family at functional granularity: "receptor tyrosine kinase", "bHLH transcription factor", "Cullin-RING ligase", "GPCR", "nuclear hormone receptor", "AAA+ ATPase", "Ser/Thr phosphatase".
+- DO include subcellular localization, complex membership, and post-translational modification roles when relevant.
+- DO include disease categories with mechanistic specificity (e.g. "amplified in solid tumors and hematological malignancies").
+
+WHAT TO EXCLUDE — remove gene identity, not biological context
+- DO NOT include the GENE symbol given in the input, or any common alias for it.
+- DO NOT include the full gene name or common protein name.
+- DO NOT use unique identifying epithets ("the master regulator of X", "the canonical [process] driver").
+- DO NOT use highly-specific protein family names that uniquely identify this single gene.
+- AVOID highly specific disease names; use disease categories ("neurodegenerative disorders", not "Alzheimer's disease").
+- For multi-functional proteins, emphasize the PRIMARY known function.
+
+Pathway names like "WNT signaling" are SHARED context across many genes — keep them. Gene-unique identifiers like the gene symbol, full name, or "the X gene" — remove them.
+
+Generate ONLY the description text.
+"""

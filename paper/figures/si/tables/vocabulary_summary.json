@@ -1,0 +1,34 @@
+{
+ "production_model": "$EXPERT_ROOT/models/ExPert_v0.1.0/run_0/config/ExPert_v0/model/model.pt",
+ "trained_perturbations": 8964,
+ "vocabulary_rows": 19895,
+ "zero_shot_rows": 10931,
+ "zero_shot_rows_filled": 10931,
+ "zero_shot_scored": {
+  "perturbations": 9874,
+  "rule": ">= 5 cells in at least one screen of the zero-shot database (query capped at 25 cells)",
+  "per_screen_queries": 67888,
+  "fold_models_table_s5": {
+   "ID": {
+    "min": 9823,
+    "max": 9874,
+    "median": 9873.0
+   },
+   "OOD": {
+    "min": 413,
+    "max": 9273,
+    "median": 3791.0
+   }
+  }
+ },
+ "zero_shot_not_scored": {
+  "total": 1057,
+  "measured_below_min_cells": 2,
+  "not_measured_in_any_screen": 1055
+ },
+ "sources": {
+  "zs_adata": "$DL_ROOT/data/store_out/1e6bafc04836e06a/database_perturbed_zs.h5ad",
+  "zs_cache": "analysis_out/qcache/EFFGATE3_zs.npz",
+  "table_s5": "paper/figures/si/tables/Table_S5.csv"
+ }
+}
