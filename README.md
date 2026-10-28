@@ -46,9 +46,11 @@ mamba env create -f environment.yaml && mamba activate expert && pip install -e 
 
 ```python
 import scanpy as sc
+from huggingface_hub import snapshot_download
 from expert import ExPert
 
-model = ExPert.load("path/to/ExPert_v0.1.0")   # folder with model.pt + gene_embeddings.npz
+# v0.1.0 from https://huggingface.co/GoyalLab/ExPert (2.3 GB, cached after the first call)
+model = ExPert.load(snapshot_download("GoyalLab/ExPert", revision="v0.1.0"))
 
 query = sc.read_h5ad("query.h5ad")
 # X: raw counts; var_names: gene symbols (mouse symbols are mapped to human automatically)
@@ -78,6 +80,9 @@ Other useful calls:
   atlases).
 
 See `help(ExPert.predict)` for all options.
+
+Downloads are cached in `~/.cache/huggingface`; set `HF_HOME` to put them elsewhere. A local folder holding
+`model.pt` and `gene_embeddings.npz` works the same way: `ExPert.load("path/to/folder")`.
 
 ## Reproducing the paper
 

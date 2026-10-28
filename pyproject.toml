@@ -27,11 +27,12 @@ classifiers = [
   "Intended Audience :: Science/Research",
   "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
-# Core: train, load, predict(), get_prototypes(). Lower bounds = the versions the release was validated with
+# Core: train, load (local or from the Hugging Face Hub), predict(), get_prototypes(). Lower bounds = the versions the release was validated with
 # (environment.yaml); matplotlib / seaborn are imported by the model module itself.
 dependencies = [
   "anndata>=0.11",
   "h5py>=3.12",
+  "huggingface_hub>=0.25",
   "lightning>=2.4",
   "matplotlib>=3.9",
   "numpy>=1.26",
