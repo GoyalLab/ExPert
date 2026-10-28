@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: MIT
+#
+# ExPert: a contrastive perturbation-prediction model for single-cell data.
+#
+# Copyright (c) 2024-2026 Leon Schwartz
+# Northwestern University, Goyal Lab
+#
+# This file is part of the ExPert package and is released under the MIT
+# License. See the LICENSE file in the project root for the full text.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "expert-model"
+version = "0.1.0"
+description = "ExPert: a contrastive perturbation-prediction model for single-cell data."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Leon Schwartz" }]
+# Core: train, load, predict(), get_prototypes(). Lower bounds = the versions the release was validated with
+# (environment.yaml); matplotlib / seaborn are imported by the model module itself.
+dependencies = [
+  "anndata>=0.11",
+  "h5py>=3.12",
+  "lightning>=2.4",
+  "matplotlib>=3.9",
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "pyyaml>=6.0",
+  "rich>=13.9",
+  "scanpy>=1.10",
+  "scikit-learn>=1.5",
+  "scipy>=1.14",
+  "scvi-tools>=1.4.2",
+  "seaborn>=0.13",
+  "torch>=2.5",
+  "torchmetrics>=1.5",
+  "tqdm>=4.67",
+]
+
+[project.optional-dependencies]
+# Everything else: the training-time UMAP / enrichment plots, the paper's figure scripts (paper/), and the tests.
+all = [
+  "adjustText",
+  "gseapy",
+  "leidenalg",
+  "matplotlib-venn",
+  "natsort",
+  "nbformat",
+  "networkx",
+  "openpyxl",
+  "pillow",
+  "pydeseq2",
+  "pytest",
+  "python-igraph",
+  "requests",
+  "tensorboard",
+  "umap-learn",
+]
+
+[tool.setuptools.packages.find]
+include = ["expert*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --color=yes"
+# `pytest -m "not e2e"` runs only the seconds-long unit tests; the e2e ones train the toy v0.1.0 model on CPU.
+markers = [
+    "e2e: trains the toy v0.1.0 configuration on CPU (minutes)",
+]
